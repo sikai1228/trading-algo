@@ -29,6 +29,7 @@ from trumpbot.db.repositories import (
     insert_news_matches,
     insert_system_event,
     list_active_markets,
+    list_markets_for_matching,
     recent_news_events,
     upsert_subject,
 )
@@ -410,7 +411,11 @@ class MatcherWorker:
         events = fetch_news_events_without_matches(self._db, limit=self._batch_size)
         if not events:
             return 0
-        markets_rows = list_active_markets(self._db)
+        # Match against ALL markets with subject (not just active) so the
+        # observation period captures matches against settled markets too
+        # — those are how we calibrate matcher quality. The Phase-2
+        # decision engine will filter back to active before any trading.
+        markets_rows = list_markets_for_matching(self._db)
         contexts = [
             MarketContext(
                 ticker=row["ticker"],

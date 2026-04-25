@@ -75,6 +75,31 @@ DIRECT_VERBS: Final[tuple[str, ...]] = (
     "video-call",
     "videoconference",
     "video conference",
+    # Briefings: contract-relevant when both parties are present
+    # ("Powell briefed Trump on rates").
+    "briefed",
+    "briefing",
+    "briefing with",
+    # Meal meetings: explicitly listed in the contract as qualifying
+    # ("Working dinners, lunches, or other meal meetings"). Forms with
+    # and without "with" both common in real headlines; the proximity
+    # check anchors them to the subject so the bare forms don't run wild.
+    "dined",
+    "dined with",
+    "dinner",
+    "dinner with",
+    "had dinner",
+    "had dinner with",
+    "lunch",
+    "lunch with",
+    "lunched",
+    "lunched with",
+    "had lunch",
+    "had lunch with",
+    "breakfast",
+    "breakfast with",
+    "had breakfast",
+    "had breakfast with",
 )
 
 # Verbs that indicate a *mention* but not necessarily a conversation.

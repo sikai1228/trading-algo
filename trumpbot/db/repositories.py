@@ -178,6 +178,21 @@ def list_active_markets(db: Database) -> list[sqlite3.Row]:
     return list(conn.execute("SELECT * FROM markets WHERE status = 'active' ORDER BY ticker"))
 
 
+def list_markets_for_matching(db: Database) -> list[sqlite3.Row]:
+    """Markets the matcher should evaluate news against.
+
+    Distinct from :func:`list_active_markets` (which is the right query
+    for trading): the matcher includes ``settled`` and ``finalized``
+    markets too. During the observation period we want to know whether
+    the matcher *would have* produced a signal for a market that has
+    already resolved — that's how we calibrate matcher quality. The
+    decision-engine layer in Phase 2 filters back down to ``active``
+    before any trading.
+    """
+    conn = db.connect()
+    return list(conn.execute("SELECT * FROM markets WHERE subject IS NOT NULL ORDER BY ticker"))
+
+
 def get_market(db: Database, ticker: str) -> sqlite3.Row | None:
     conn = db.connect()
     row: sqlite3.Row | None = conn.execute(

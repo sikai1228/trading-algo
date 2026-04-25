@@ -88,3 +88,20 @@ logging:
 
 daemon:
   heartbeat_interval_sec: 60
+
+discovery:
+  # Monthly KXTRUMPMEET event auto-discovery. The service polls
+  # /events/{event_ticker} for the current and next calendar month
+  # every poll_interval_sec, upserts new markets, and writes
+  # snapshot artifacts to snapshot_dir. See trumpbot/discovery/.
+  series: "KXTRUMPMEET"
+  poll_interval_sec: 3600
+  backfill_months: 2
+  snapshot_dir: "data/markets"
+
+telegram:
+  # Phase 1 only sends one-way heads-up notifications (e.g. "new
+  # month detected"). Leave both empty to disable; the daemon runs
+  # without it. Bidirectional approval flow lands in Phase 3.
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_id: "${TELEGRAM_CHAT_ID}"

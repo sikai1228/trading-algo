@@ -35,6 +35,26 @@ class KalshiConfig(BaseModel):
     rate_limit_pct: float = 0.8
 
 
+class DiscoveryConfig(BaseModel):
+    """Monthly KXTRUMPMEET discovery loop."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    series: str = "KXTRUMPMEET"
+    poll_interval_sec: int = 3600  # 1 hour per the brief
+    backfill_months: int = 2
+    snapshot_dir: str = "data/markets"
+
+
+class TelegramConfig(BaseModel):
+    """Phase-1 Telegram heads-up notifier (one-way only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bot_token: str | None = None
+    chat_id: str | None = None
+
+
 class NewsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -89,6 +109,8 @@ class TrumpbotConfig(BaseModel):
     health: HealthConfig = Field(default_factory=lambda: HealthConfig())
     logging: LoggingConfig = Field(default_factory=lambda: LoggingConfig())
     daemon: DaemonConfig = Field(default_factory=lambda: DaemonConfig())
+    discovery: DiscoveryConfig = Field(default_factory=lambda: DiscoveryConfig())
+    telegram: TelegramConfig = Field(default_factory=lambda: TelegramConfig())
 
 
 def _expand_env(value: Any) -> Any:

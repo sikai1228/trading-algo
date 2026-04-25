@@ -93,6 +93,14 @@ class TestSignatureIncludesPathPrefix:
         assert "/trade-api/v2/markets" in msg
         assert msg.startswith("1700000000000GET/trade-api/v2/")
 
+    def test_events_endpoint_signing_pinned_vector(self) -> None:
+        """The monthly-discovery service hits GET /events/{event_ticker}.
+        Pin the exact signing string for KXTRUMPMEET-26APR so a future
+        path-construction change cannot silently break event discovery."""
+        signed_path = signed_resource_path("/events/KXTRUMPMEET-26APR")
+        msg = signing_message("1777151610000", "GET", signed_path)
+        assert msg == "1777151610000GET/trade-api/v2/events/KXTRUMPMEET-26APR"
+
     def test_rest_client_uses_signed_resource_path(self) -> None:
         """Source-level guard: ``client.py`` must call ``signed_resource_path``
         rather than inline the prefix."""

@@ -42,6 +42,7 @@ from trumpbot.news.matcher import MarketContext, NewsMatcher
 from trumpbot.news.rss import RSSPoller
 from trumpbot.news.truthsocial import TruthSocialScraper
 from trumpbot.news.twitter import TwitterScraper
+from trumpbot.notifications.telegram import TelegramNotifier
 from trumpbot.utils.logging import configure_logging, get_logger
 from trumpbot.utils.timeutil import utcnow_iso
 
@@ -92,14 +93,18 @@ async def _amain(config_path: Path) -> int:
         rate_limit_pct=cfg.kalshi.rate_limit_pct,
     )
     bus = EventBus()
+    telegram = TelegramNotifier(
+        bot_token=cfg.telegram.bot_token,
+        chat_id=cfg.telegram.chat_id,
+    )
     discovery = MarketDiscoveryService(
         client=rest_client,
         db=db,
-        target_series=cfg.kalshi.target_series,
-        extractor=extractor,
         event_bus=bus,
-        poll_interval_sec=cfg.kalshi.market_discovery_interval_sec,
-        backfill_days=cfg.kalshi.backfill_days,
+        telegram=telegram,
+        series=cfg.discovery.series,
+        poll_interval_sec=cfg.discovery.poll_interval_sec,
+        snapshot_dir=cfg.discovery.snapshot_dir,
     )
     ws_feed = KalshiWebSocketFeed(
         rest_client=rest_client,
@@ -178,6 +183,7 @@ async def _amain(config_path: Path) -> int:
         await twitter_scraper.stop()
         await truth_scraper.stop()
         await rest_client.aclose()
+        await telegram.aclose()
         await health.stop()
         insert_system_event(
             db,

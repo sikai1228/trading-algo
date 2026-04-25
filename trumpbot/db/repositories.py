@@ -45,23 +45,32 @@ class MarketRow:
     volume: int | None
     open_interest: int | None
     raw_json: dict[str, Any] | None = None
+    subject_full_name: str | None = None
 
 
 def upsert_market(db: Database, row: MarketRow) -> None:
-    """Insert or update a market by ticker."""
+    """Insert or update a market by ticker.
+
+    The discovery service must NOT call this for an existing market with
+    a non-empty ``resolution_rules`` field — those rules are the
+    contract for resolution and must be frozen at first write. Use
+    :func:`update_market_market_data` for routine price/status updates,
+    and gate ``upsert_market`` on
+    :func:`market_resolution_unchanged` for safety.
+    """
     sql = """
     INSERT INTO markets (
         ticker, series_ticker, event_ticker, title, subtitle,
-        yes_sub_title, no_sub_title, subject, resolution_rules,
-        approved_sources, open_ts, close_ts, expected_expiration_ts,
-        status, last_price_cents, volume, open_interest, raw_json,
-        created_at, updated_at
+        yes_sub_title, no_sub_title, subject, subject_full_name,
+        resolution_rules, approved_sources, open_ts, close_ts,
+        expected_expiration_ts, status, last_price_cents, volume,
+        open_interest, raw_json, created_at, updated_at
     ) VALUES (
         :ticker, :series_ticker, :event_ticker, :title, :subtitle,
-        :yes_sub_title, :no_sub_title, :subject, :resolution_rules,
-        :approved_sources, :open_ts, :close_ts, :expected_expiration_ts,
-        :status, :last_price_cents, :volume, :open_interest, :raw_json,
-        :now, :now
+        :yes_sub_title, :no_sub_title, :subject, :subject_full_name,
+        :resolution_rules, :approved_sources, :open_ts, :close_ts,
+        :expected_expiration_ts, :status, :last_price_cents, :volume,
+        :open_interest, :raw_json, :now, :now
     )
     ON CONFLICT(ticker) DO UPDATE SET
         series_ticker = excluded.series_ticker,
@@ -71,6 +80,7 @@ def upsert_market(db: Database, row: MarketRow) -> None:
         yes_sub_title = excluded.yes_sub_title,
         no_sub_title = excluded.no_sub_title,
         subject = excluded.subject,
+        subject_full_name = excluded.subject_full_name,
         resolution_rules = excluded.resolution_rules,
         approved_sources = excluded.approved_sources,
         open_ts = excluded.open_ts,
@@ -92,6 +102,7 @@ def upsert_market(db: Database, row: MarketRow) -> None:
         "yes_sub_title": row.yes_sub_title,
         "no_sub_title": row.no_sub_title,
         "subject": row.subject,
+        "subject_full_name": row.subject_full_name,
         "resolution_rules": row.resolution_rules,
         "approved_sources": json.dumps(row.approved_sources) if row.approved_sources else None,
         "open_ts": row.open_ts,
@@ -106,6 +117,60 @@ def upsert_market(db: Database, row: MarketRow) -> None:
     }
     with db.transaction() as conn:
         conn.execute(sql, params)
+
+
+def update_market_market_data(
+    db: Database,
+    *,
+    ticker: str,
+    last_price_cents: int | None,
+    volume: int | None,
+    open_interest: int | None,
+    status: str | None,
+) -> None:
+    """Update only the price/status/volume fields on an existing market.
+
+    Never touches ``title`` or ``resolution_rules`` — those are the
+    contract for the market and are frozen at first insert.
+    """
+    fields = []
+    params: dict[str, Any] = {"ticker": ticker, "now": utcnow_iso()}
+    if last_price_cents is not None:
+        fields.append("last_price_cents = :last_price_cents")
+        params["last_price_cents"] = last_price_cents
+    if volume is not None:
+        fields.append("volume = :volume")
+        params["volume"] = volume
+    if open_interest is not None:
+        fields.append("open_interest = :open_interest")
+        params["open_interest"] = open_interest
+    if status is not None:
+        fields.append("status = :status")
+        params["status"] = status
+    if not fields:
+        return
+    fields.append("updated_at = :now")
+    sql = f"UPDATE markets SET {', '.join(fields)} WHERE ticker = :ticker"
+    with db.transaction() as conn:
+        conn.execute(sql, params)
+
+
+def market_resolution_unchanged(
+    db: Database, *, ticker: str, title: str, resolution_rules: str
+) -> bool | None:
+    """Compare existing title + resolution_rules against incoming values.
+
+    Returns:
+        - ``True`` if the existing record matches both fields exactly.
+        - ``False`` if the existing record exists but at least one
+          field differs (the discovery service must NOT auto-update;
+          fire a critical alert for human review).
+        - ``None`` if no existing record (the caller is free to insert).
+    """
+    existing = get_market(db, ticker)
+    if existing is None:
+        return None
+    return bool(existing["title"] == title and existing["resolution_rules"] == resolution_rules)
 
 
 def list_active_markets(db: Database) -> list[sqlite3.Row]:
@@ -344,6 +409,83 @@ def recent_high_confidence_matches(
             (min_confidence, limit),
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Subjects
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SubjectRow:
+    """One row in the ``subjects`` table.
+
+    The discovery service writes ``auto_extracted=True``,
+    ``llm_enriched=False``, ``reviewed=False`` for every new subject
+    it discovers from a market title. Phase 2 will flip
+    ``llm_enriched`` after running enrichment, and a human review pass
+    flips ``reviewed``.
+    """
+
+    subject_key: str
+    full_name: str
+    aliases: list[str]
+    ticker_suffix: str | None = None
+    auto_extracted: bool = True
+    llm_enriched: bool = False
+    reviewed: bool = False
+
+
+def upsert_subject(db: Database, row: SubjectRow) -> None:
+    """Insert or merge a subject row.
+
+    Conflict resolution preserves operator intent: ``llm_enriched``,
+    ``reviewed``, and ``ticker_suffix`` are NOT overwritten by a
+    subsequent auto-discovery; ``aliases`` is unioned with the existing
+    list (so adding a fresh extraction never *removes* a manually-
+    added alias).
+    """
+    sql = """
+    INSERT INTO subjects (
+        subject_key, full_name, aliases, ticker_suffix,
+        auto_extracted, llm_enriched, reviewed, created_at, updated_at
+    ) VALUES (
+        :subject_key, :full_name, :aliases, :ticker_suffix,
+        :auto_extracted, :llm_enriched, :reviewed, :now, :now
+    )
+    ON CONFLICT(subject_key) DO UPDATE SET
+        full_name = excluded.full_name,
+        aliases = (
+            SELECT json_group_array(value)
+            FROM (
+                SELECT value FROM json_each(subjects.aliases)
+                UNION
+                SELECT value FROM json_each(excluded.aliases)
+            )
+        ),
+        auto_extracted = subjects.auto_extracted OR excluded.auto_extracted,
+        updated_at = excluded.updated_at
+    """
+    params = {
+        "subject_key": row.subject_key,
+        "full_name": row.full_name,
+        "aliases": json.dumps(row.aliases),
+        "ticker_suffix": row.ticker_suffix,
+        "auto_extracted": int(row.auto_extracted),
+        "llm_enriched": int(row.llm_enriched),
+        "reviewed": int(row.reviewed),
+        "now": utcnow_iso(),
+    }
+    with db.transaction() as conn:
+        conn.execute(sql, params)
+
+
+def get_subject(db: Database, subject_key: str) -> sqlite3.Row | None:
+    conn = db.connect()
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT * FROM subjects WHERE subject_key = ?", (subject_key,)
+    ).fetchone()
+    return row
 
 
 # ---------------------------------------------------------------------------

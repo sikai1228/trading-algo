@@ -1,149 +1,145 @@
-"""MarketDiscoveryService: poll Kalshi REST, persist target markets.
+"""MarketDiscoveryService — automated monthly KXTRUMPMEET discovery.
 
-Polls the configured target series every ``poll_interval_sec`` seconds.
-For each market with status='open' or 'settled' (within the lookback
-window for backfill), upserts into ``markets`` with the full resolution
-rules text and an extracted subject. Records system events for
-lifecycle transitions.
+Runs as one of the daemon's asyncio tasks. On every cycle:
+
+1. Compute the current month's event ticker and the next month's
+   event ticker from today's UTC date.
+2. Fetch each via :meth:`KalshiClient.get_event`. Empty events
+   (no markets yet) are silently skipped — the next month's event
+   typically isn't populated until a few days before its start.
+3. For each market:
+    - If new: extract the subject from the title, upsert into
+      ``subjects`` and ``markets``, fire a ``market_discovered``
+      event, and (if a brand-new event_ticker just appeared) send a
+      Telegram notification.
+    - If known: refresh price/status/volume only. The title and
+      ``resolution_rules`` are the contract for resolution and must
+      never be silently rewritten — if Kalshi changes either,
+      :func:`market_resolution_unchanged` returns False, the service
+      writes a critical ``resolution_rules_changed`` system event,
+      sends a Telegram alert, and skips the update.
+4. Write per-event snapshot artifacts to ``data/markets/`` (JSON +
+   Markdown summary) when the event has at least one market.
+5. From day-25 onward, additionally log whether next month's event
+   has opened.
+
+Errors during a fetch or persistence are caught per-event so one
+broken event never blocks the others. The service uses an explicit
+backoff (1m → 5m → 15m → 1h cap) on consecutive failures of the
+same event so a repeated 5xx doesn't spam Kalshi.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
-import re
-from datetime import timedelta
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any
 
 from trumpbot.db.connection import Database
 from trumpbot.db.repositories import (
     MarketRow,
-    get_market,
+    SubjectRow,
     insert_system_event,
+    market_resolution_unchanged,
+    update_market_market_data,
     upsert_market,
+    upsert_subject,
 )
-from trumpbot.discovery.subjects import SubjectExtractor
+from trumpbot.discovery.event_ticker import (
+    DEFAULT_SERIES,
+    EventTicker,
+    current_event_ticker,
+    is_late_month,
+    next_month_event_ticker,
+)
+from trumpbot.discovery.snapshots import MarketSummaryRow, write_snapshots
+from trumpbot.discovery.subject_extraction import (
+    ExtractedSubject,
+    ExtractionFailure,
+    extract_subject,
+)
 from trumpbot.events.bus import Event, EventBus
 from trumpbot.kalshi.client import KalshiClient
 from trumpbot.kalshi.exceptions import KalshiError, StateError
-from trumpbot.kalshi.schemas import KalshiMarket
+from trumpbot.kalshi.schemas import KalshiEventResponse, KalshiMarket
+from trumpbot.notifications.telegram import TelegramNotifier
 from trumpbot.utils.logging import get_logger
-from trumpbot.utils.timeutil import parse_iso, parse_iso_to_str, utcnow
+from trumpbot.utils.timeutil import parse_iso_to_str, utcnow
 
 log = get_logger(__name__)
 
-
-# Patterns used to extract the approved-source list from Kalshi resolution
-# rules text. Kalshi typically writes the source list inline in the rules,
-# e.g. "as confirmed by reports from Reuters, AP, or Bloomberg".
-_SOURCE_PATTERN = re.compile(
-    r"\b(reuters|ap|associated press|bloomberg|nyt|new york times|"
-    r"washington post|wapo|wall street journal|wsj|politico|axios|semafor|"
-    r"the information|cnn|fox news|msnbc|nbc|abc|cbs|whitehouse\.gov|"
-    r"state department|state\.gov|department of defense|defense\.gov|"
-    r"truth social|@realdonaldtrump|@whitehouse|@presssec|@potus|"
-    r"@secstate|@statedept|@deptofdefense)\b",
-    re.IGNORECASE,
-)
+COMPONENT = "market_discovery"
+DEFAULT_POLL_INTERVAL_SEC = 3600  # 1 hour
+BACKOFF_SCHEDULE_SEC = (60, 300, 900, 3600)  # 1m, 5m, 15m, 1h
 
 
-def _extract_approved_sources(rules_text: str) -> list[str]:
-    """Best-effort extraction of source mentions from resolution rules."""
-    found: list[str] = []
-    seen: set[str] = set()
-    for match in _SOURCE_PATTERN.findall(rules_text):
-        normalized = match.lower()
-        if normalized not in seen:
-            seen.add(normalized)
-            found.append(normalized)
-    return found
+@dataclass(frozen=True)
+class _PendingMarket:
+    """Internal: one market parsed out of a Kalshi event response."""
 
-
-def _resolution_text(market: KalshiMarket) -> str:
-    parts = [market.rules_primary or "", market.rules_secondary or ""]
-    return "\n\n".join(p for p in parts if p).strip()
-
-
-def _to_market_row(
-    market: KalshiMarket,
-    *,
-    extractor: SubjectExtractor,
-    series_ticker_default: str | None = None,
-) -> MarketRow:
-    rules = _resolution_text(market)
-    subject = extractor.extract(market.title, market.subtitle, market.yes_sub_title, rules)
-    sources = _extract_approved_sources(rules) if rules else []
-    open_ts = parse_iso_to_str(market.open_time)
-    close_ts = parse_iso_to_str(market.close_time)
-    expected_ts = parse_iso_to_str(market.expected_expiration_time)
-    raw = market.model_dump(mode="json")
-    return MarketRow(
-        ticker=market.ticker,
-        series_ticker=market.series_ticker or series_ticker_default or "",
-        event_ticker=market.event_ticker,
-        title=market.title,
-        subtitle=market.subtitle,
-        yes_sub_title=market.yes_sub_title,
-        no_sub_title=market.no_sub_title,
-        subject=subject,
-        resolution_rules=rules,
-        approved_sources=sources or None,
-        open_ts=open_ts or "",
-        close_ts=close_ts,
-        expected_expiration_ts=expected_ts,
-        status=market.status,
-        last_price_cents=market.last_price,
-        volume=market.volume,
-        open_interest=market.open_interest,
-        raw_json=raw,
-    )
+    market: KalshiMarket
+    extracted: ExtractedSubject
 
 
 class MarketDiscoveryService:
-    """Background poller that keeps the markets table in sync."""
+    """Polls Kalshi for the current and next monthly events."""
 
-    component = "market_discovery"
+    component = COMPONENT
 
     def __init__(
         self,
         *,
         client: KalshiClient,
         db: Database,
-        target_series: list[str],
-        extractor: SubjectExtractor,
         event_bus: EventBus,
-        poll_interval_sec: int = 300,
-        backfill_days: int = 60,
+        telegram: TelegramNotifier | None = None,
+        series: str = DEFAULT_SERIES,
+        poll_interval_sec: int = DEFAULT_POLL_INTERVAL_SEC,
+        snapshot_dir: Path | str = "data/markets",
+        clock: Any = None,
     ) -> None:
         self._client = client
         self._db = db
-        self._target_series = list(target_series)
-        self._extractor = extractor
-        self._event_bus = event_bus
+        self._bus = event_bus
+        self._telegram = telegram
+        self._series = series
         self._poll_interval = poll_interval_sec
-        self._backfill_days = backfill_days
+        self._snapshot_dir = Path(snapshot_dir)
+        # ``clock`` lets tests inject a deterministic ``today`` source.
+        self._clock = clock or _UtcDateClock()
         self._stop = asyncio.Event()
+        # Per-event-ticker consecutive failure counter for backoff.
+        self._failure_streak: dict[str, int] = {}
+        # Event tickers we've already announced via Telegram.
+        self._announced_events: set[str] = set()
+
+    # -- lifecycle -----------------------------------------------------
 
     async def run(self) -> None:
-        """Run the discovery loop until ``stop()`` is called."""
-        log.info("market_discovery_started", target_series=self._target_series)
-        await self.backfill()
+        log.info("market_discovery_started", series=self._series)
+        # Seed announcement cache from prior runs so we don't re-notify.
+        self._announced_events = self._already_seen_event_tickers()
         while not self._stop.is_set():
             try:
                 await self.poll_once()
             except StateError:
+                # State errors halt the strategy; re-raise so the
+                # daemon supervisor can take action.
                 raise
-            except KalshiError as exc:
-                log.error("market_discovery_kalshi_error", error=str(exc))
+            except Exception as exc:
+                log.error("market_discovery_cycle_failed", error=repr(exc))
                 insert_system_event(
                     self._db,
-                    event_type="kalshi_error",
+                    event_type="market_discovery_cycle_error",
                     severity="error",
                     component=self.component,
                     message=str(exc),
                 )
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._stop.wait(), timeout=self._poll_interval)
+            await self._sleep(self._poll_interval)
         log.info("market_discovery_stopped")
 
     def stop(self) -> None:
@@ -152,59 +148,402 @@ class MarketDiscoveryService:
     def stopped(self) -> bool:
         return self._stop.is_set()
 
-    async def backfill(self) -> None:
-        """One-shot scan over the past ``backfill_days`` for open + settled markets."""
-        cutoff = utcnow() - timedelta(days=self._backfill_days)
-        for series in self._target_series:
-            for status in ("open", "settled"):
-                markets = await self._client.iter_markets(series_ticker=series, status=status)
-                for market in markets:
-                    open_dt = parse_iso(market.open_time)
-                    if status == "settled" and open_dt is not None and open_dt < cutoff:
-                        continue
-                    await self._upsert_and_emit(market, series)
+    # -- main cycle ----------------------------------------------------
 
     async def poll_once(self) -> None:
-        """One pass over every target series for status='open'."""
-        for series in self._target_series:
-            markets = await self._client.iter_markets(series_ticker=series, status="open")
-            for market in markets:
-                await self._upsert_and_emit(market, series)
+        today = self._clock.today()
+        current = current_event_ticker(today, self._series)
+        next_month = next_month_event_ticker(today, self._series)
+        # Fetch each in turn; failures isolated per ticker.
+        await self._discover_event(current, today)
+        await self._discover_event(next_month, today)
+        if is_late_month(today):
+            self._log_next_month_status(next_month)
 
-    async def _upsert_and_emit(self, market: KalshiMarket, series_ticker: str) -> None:
-        existing = get_market(self._db, market.ticker)
-        existing_status = existing["status"] if existing is not None else None
-        row = _to_market_row(market, extractor=self._extractor, series_ticker_default=series_ticker)
-        upsert_market(self._db, row)
+    async def _discover_event(self, event_ticker: EventTicker, today: date) -> None:
+        ticker_str = str(event_ticker)
+        delay = self._backoff_for(ticker_str)
+        if delay > 0:
+            log.debug("market_discovery_backoff", event_ticker=ticker_str, wait_sec=delay)
+            await self._sleep(delay)
 
-        if existing_status is None:
-            await self._event_bus.publish(
-                Event(
-                    type="market_discovered",
-                    payload={"ticker": market.ticker, "subject": row.subject, "title": row.title},
+        try:
+            response = await self._client.get_event(ticker_str)
+        except KalshiError as exc:
+            self._record_failure(ticker_str, exc)
+            return
+        # Reset the failure counter on a successful fetch.
+        self._failure_streak.pop(ticker_str, None)
+
+        if not response.markets:
+            log.info("market_discovery_event_empty", event_ticker=ticker_str)
+            return
+
+        await self._persist_event(event_ticker, response, today)
+
+    async def _persist_event(
+        self,
+        event_ticker: EventTicker,
+        response: KalshiEventResponse,
+        today: date,
+    ) -> None:
+        ticker_str = str(event_ticker)
+        # Parse subjects up front so a single broken title doesn't block
+        # the others; we record the failure as a system event but keep
+        # going for the rest of the markets in the same event.
+        pending: list[_PendingMarket] = []
+        for market in response.markets:
+            try:
+                extracted = extract_subject(market.title)
+            except ExtractionFailure as exc:
+                insert_system_event(
+                    self._db,
+                    event_type="subject_extraction_failed",
+                    severity="warning",
+                    component=self.component,
+                    message=str(exc),
+                    detail={"ticker": market.ticker, "title": market.title},
                 )
-            )
-        elif existing_status != row.status:
+                log.warning(
+                    "subject_extraction_failed",
+                    ticker=market.ticker,
+                    title=market.title,
+                    error=str(exc),
+                )
+                continue
+            pending.append(_PendingMarket(market=market, extracted=extracted))
+
+        # Track which markets were brand-new this cycle.
+        new_market_count = 0
+        for pm in pending:
+            if await self._upsert_one(event_ticker, pm):
+                new_market_count += 1
+
+        # Snapshot artifacts (always for non-empty events).
+        resolution_rules = self._best_resolution_rules(pending)
+        if not resolution_rules:
+            # Critical: every market should carry resolution_rules. If
+            # none did, refuse to write the snapshot and alert.
             insert_system_event(
                 self._db,
-                event_type="market_status_changed",
+                event_type="resolution_rules_missing",
+                severity="critical",
+                component=self.component,
+                message=f"event {ticker_str} returned markets with no resolution rules",
+                detail={"event_ticker": ticker_str, "market_count": len(pending)},
+            )
+            await self._telegram_alert(
+                f"⚠️ {ticker_str} returned markets with no resolution rules. "
+                "Skipping snapshot write; manual review required."
+            )
+            return
+
+        rows = [
+            MarketSummaryRow(
+                ticker=pm.market.ticker,
+                subject_full_name=pm.extracted.full_name,
+                title=pm.market.title,
+            )
+            for pm in pending
+        ]
+        try:
+            json_path, md_path = write_snapshots(
+                snapshot_dir=self._snapshot_dir,
+                event_ticker=ticker_str,
+                raw_response=response.model_dump(mode="json"),
+                resolution_rules=resolution_rules,
+                markets=rows,
+            )
+            log.info(
+                "market_discovery_snapshot_written",
+                event_ticker=ticker_str,
+                json_path=str(json_path),
+                md_path=str(md_path),
+                market_count=len(rows),
+                new_markets=new_market_count,
+            )
+        except OSError as exc:
+            log.error("market_discovery_snapshot_failed", event_ticker=ticker_str, error=repr(exc))
+            insert_system_event(
+                self._db,
+                event_type="snapshot_write_failed",
+                severity="error",
+                component=self.component,
+                message=str(exc),
+                detail={"event_ticker": ticker_str},
+            )
+
+        # Telegram notification for first sighting of this event ticker.
+        if ticker_str not in self._announced_events and new_market_count > 0:
+            self._announced_events.add(ticker_str)
+            insert_system_event(
+                self._db,
+                event_type="new_event_detected",
                 severity="info",
                 component=self.component,
-                message=f"{market.ticker}: {existing_status} -> {row.status}",
-                detail={"ticker": market.ticker, "from": existing_status, "to": row.status},
+                message=f"new event ticker first seen: {ticker_str}",
+                detail={
+                    "event_ticker": ticker_str,
+                    "market_count": len(rows),
+                    "subjects": [r.subject_full_name for r in rows],
+                },
             )
-            await self._event_bus.publish(
+            subjects_preview = ", ".join(r.subject_full_name for r in rows[:6])
+            md_basename = ticker_str.lower().replace("-", "_")
+            await self._telegram_alert(
+                f"🔔 New month detected: {ticker_str} just opened.\n"
+                f"Discovered {len(rows)} markets. "
+                f"Subjects: {subjects_preview}"
+                + ("…" if len(rows) > 6 else "")
+                + f"\nSnapshot saved to data/markets/{md_basename}_summary.md"
+            )
+            await self._bus.publish(
                 Event(
-                    type="market_status_changed",
-                    payload={
-                        "ticker": market.ticker,
-                        "from": existing_status,
-                        "to": row.status,
-                    },
+                    type="new_event_detected",
+                    payload={"event_ticker": ticker_str, "market_count": len(rows)},
                 )
             )
 
+    async def _upsert_one(self, event_ticker: EventTicker, pm: _PendingMarket) -> bool:
+        """Insert or refresh one market. Returns True if it was new."""
+        market = pm.market
+        extracted = pm.extracted
+        rules = (market.rules_primary or "") + (
+            "\n\n" + market.rules_secondary if market.rules_secondary else ""
+        )
+        rules = rules.strip()
 
-def export_market_extractor_state(extractor: SubjectExtractor) -> str:
-    """Diagnostic helper: dump the alias dictionary as JSON."""
-    return json.dumps(extractor.aliases, indent=2, sort_keys=True)
+        # Reject markets with no resolution rules — the brief calls these
+        # "broken" and they must not be auto-inserted.
+        if not rules:
+            insert_system_event(
+                self._db,
+                event_type="resolution_rules_missing",
+                severity="critical",
+                component=self.component,
+                message=f"market {market.ticker} returned with no resolution rules",
+                detail={"ticker": market.ticker, "title": market.title},
+            )
+            await self._telegram_alert(
+                f"⚠️ Market {market.ticker} ({extracted.full_name}) returned with no "
+                "resolution rules. Not inserted."
+            )
+            return False
+
+        unchanged = market_resolution_unchanged(
+            self._db,
+            ticker=market.ticker,
+            title=market.title,
+            resolution_rules=rules,
+        )
+        if unchanged is False:
+            # Existing record, but title or resolution_rules differ.
+            insert_system_event(
+                self._db,
+                event_type="resolution_rules_changed",
+                severity="critical",
+                component=self.component,
+                message=f"market {market.ticker} title or resolution_rules changed mid-event",
+                detail={
+                    "ticker": market.ticker,
+                    "incoming_title": market.title,
+                    "incoming_rules_excerpt": rules[:500],
+                },
+            )
+            await self._telegram_alert(
+                f"⚠️ {market.ticker} title or resolution_rules changed mid-event. "
+                "Frozen original retained; manual review required."
+            )
+            # Do still update price/status/volume — those are not the contract.
+            update_market_market_data(
+                self._db,
+                ticker=market.ticker,
+                last_price_cents=market.last_price,
+                volume=market.volume,
+                open_interest=market.open_interest,
+                status=market.status,
+            )
+            return False
+
+        if unchanged is True:
+            update_market_market_data(
+                self._db,
+                ticker=market.ticker,
+                last_price_cents=market.last_price,
+                volume=market.volume,
+                open_interest=market.open_interest,
+                status=market.status,
+            )
+            return False
+
+        # Brand-new market. Upsert subject first, then market.
+        upsert_subject(
+            self._db,
+            SubjectRow(
+                subject_key=extracted.subject_key,
+                full_name=extracted.full_name,
+                aliases=_initial_aliases(extracted),
+                ticker_suffix=_ticker_suffix_from_market(market.ticker, str(event_ticker)),
+                auto_extracted=True,
+                llm_enriched=False,
+                reviewed=False,
+            ),
+        )
+        upsert_market(
+            self._db,
+            MarketRow(
+                ticker=market.ticker,
+                series_ticker=event_ticker.series,
+                event_ticker=str(event_ticker),
+                title=market.title,
+                subtitle=market.subtitle,
+                yes_sub_title=market.yes_sub_title,
+                no_sub_title=market.no_sub_title,
+                subject=extracted.subject_key,
+                subject_full_name=extracted.full_name,
+                resolution_rules=rules,
+                approved_sources=None,
+                open_ts=parse_iso_to_str(market.open_time) or "",
+                close_ts=parse_iso_to_str(market.close_time),
+                expected_expiration_ts=parse_iso_to_str(market.expected_expiration_time),
+                status=market.status,
+                last_price_cents=market.last_price,
+                volume=market.volume,
+                open_interest=market.open_interest,
+                raw_json=market.model_dump(mode="json"),
+            ),
+        )
+        await self._bus.publish(
+            Event(
+                type="market_discovered",
+                payload={
+                    "ticker": market.ticker,
+                    "subject_key": extracted.subject_key,
+                    "subject_full_name": extracted.full_name,
+                    "event_ticker": str(event_ticker),
+                },
+            )
+        )
+        return True
+
+    # -- helpers -------------------------------------------------------
+
+    def _best_resolution_rules(self, pending: Iterable[_PendingMarket]) -> str:
+        """All markets in a single Kalshi event share the same rules
+        text. We pick the first non-empty one and use it as the
+        canonical text for the event-level snapshot."""
+        for pm in pending:
+            primary = pm.market.rules_primary or ""
+            secondary = pm.market.rules_secondary or ""
+            combined = (primary + ("\n\n" + secondary if secondary else "")).strip()
+            if combined:
+                return combined
+        return ""
+
+    def _backoff_for(self, ticker_str: str) -> int:
+        streak = self._failure_streak.get(ticker_str, 0)
+        if streak == 0:
+            return 0
+        idx = min(streak - 1, len(BACKOFF_SCHEDULE_SEC) - 1)
+        return BACKOFF_SCHEDULE_SEC[idx]
+
+    def _record_failure(self, ticker_str: str, exc: Exception) -> None:
+        self._failure_streak[ticker_str] = self._failure_streak.get(ticker_str, 0) + 1
+        log.warning(
+            "market_discovery_fetch_failed",
+            event_ticker=ticker_str,
+            error=repr(exc),
+            consecutive_failures=self._failure_streak[ticker_str],
+        )
+        insert_system_event(
+            self._db,
+            event_type="event_fetch_failed",
+            severity="warning",
+            component=self.component,
+            message=f"failed to fetch {ticker_str}: {exc!r}",
+            detail={"event_ticker": ticker_str, "consecutive": self._failure_streak[ticker_str]},
+        )
+
+    def _log_next_month_status(self, next_event_ticker: EventTicker) -> None:
+        ticker_str = str(next_event_ticker)
+        if ticker_str in self._announced_events:
+            event_type = "next_month_event_opened"
+            message = f"next month's event {ticker_str} is open"
+        else:
+            event_type = "next_month_event_not_yet_open"
+            message = f"next month's event {ticker_str} not yet open"
+        insert_system_event(
+            self._db,
+            event_type=event_type,
+            severity="info",
+            component=self.component,
+            message=message,
+            detail={"event_ticker": ticker_str},
+        )
+
+    async def _telegram_alert(self, text: str) -> None:
+        if self._telegram is None:
+            return
+        await self._telegram.send(text)
+
+    async def _sleep(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+
+    def _already_seen_event_tickers(self) -> set[str]:
+        conn = self._db.connect()
+        rows = conn.execute(
+            "SELECT DISTINCT event_ticker FROM markets WHERE event_ticker IS NOT NULL"
+        ).fetchall()
+        return {r["event_ticker"] for r in rows}
+
+    # -- backfill -----------------------------------------------------
+
+    async def backfill(self, *, months: int = 2) -> None:
+        """One-shot fetch of the current month + ``months - 1`` prior months.
+
+        Used by the daemon at startup so a fresh deployment has historical
+        data immediately. Existing markets are left as-is (idempotent).
+        """
+        today = self._clock.today()
+        for offset in range(months):
+            target = today.replace(day=1) - timedelta(days=offset * 28)
+            target = target.replace(day=1)
+            event_ticker = EventTicker(series=self._series, year=target.year, month=target.month)
+            await self._discover_event(event_ticker, today)
+        # Always also probe the next month (it may already be open).
+        await self._discover_event(next_month_event_ticker(today, self._series), today)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _initial_aliases(extracted: ExtractedSubject) -> list[str]:
+    """Aliases stored on first discovery: full name + last name (deduped)."""
+    out = [extracted.full_name]
+    if extracted.last_name and extracted.last_name != extracted.full_name:
+        out.append(extracted.last_name)
+    return out
+
+
+def _ticker_suffix_from_market(market_ticker: str, event_ticker: str) -> str | None:
+    """Extract the per-person 4CHAR suffix from a market ticker.
+
+    ``market_ticker`` looks like ``KXTRUMPMEET-26APR-VPUT``; the suffix
+    is everything after the second dash (``VPUT``).
+    """
+    prefix = f"{event_ticker}-"
+    if not market_ticker.startswith(prefix):
+        return None
+    return market_ticker[len(prefix) :] or None
+
+
+class _UtcDateClock:
+    """Default clock: today's date in UTC."""
+
+    def today(self) -> date:
+        return utcnow().date()

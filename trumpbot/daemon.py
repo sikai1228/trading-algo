@@ -24,11 +24,13 @@ from trumpbot.config import TrumpbotConfig, load_config
 from trumpbot.db.connection import Database
 from trumpbot.db.repositories import (
     NewsMatchRow,
+    SubjectRow,
     fetch_news_events_without_matches,
     insert_news_matches,
     insert_system_event,
     list_active_markets,
     recent_news_events,
+    upsert_subject,
 )
 from trumpbot.discovery.service import MarketDiscoveryService
 from trumpbot.discovery.subjects import DEFAULT_SUBJECT_ALIASES, SubjectExtractor
@@ -43,6 +45,7 @@ from trumpbot.news.rss import RSSPoller
 from trumpbot.news.truthsocial import TruthSocialScraper
 from trumpbot.news.twitter import TwitterScraper
 from trumpbot.notifications.telegram import TelegramNotifier
+from trumpbot.platform_paths import current_platform_paths, resolve_path
 from trumpbot.utils.logging import configure_logging, get_logger
 from trumpbot.utils.timeutil import utcnow_iso
 
@@ -62,9 +65,21 @@ TASK_HEALTHY = Gauge("trumpbot_task_healthy", "1 if task healthy", ["task"])
 async def _amain(config_path: Path) -> int:
     cfg = load_config(config_path)
     configure_logging(cfg.logging.level)
-    log.info("trumpbot_starting", config_path=str(config_path))
+    paths = current_platform_paths()
+    log.info(
+        "trumpbot_starting",
+        config_path=str(config_path),
+        platform=paths.config_dir.parts[1] if len(paths.config_dir.parts) > 1 else "unknown",
+    )
 
-    db = Database(cfg.database.path)
+    # Resolve "auto" path sentinels against the per-OS defaults so the
+    # same config.yaml works on macOS and Linux without editing.
+    db_path = resolve_path(cfg.database.path, paths.database_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    private_key_path = resolve_path(cfg.kalshi.private_key_path, paths.private_key_path)
+    snapshot_dir = resolve_path(cfg.discovery.snapshot_dir, paths.snapshot_dir)
+
+    db = Database(db_path)
     db.connect()
     insert_system_event(
         db,
@@ -72,11 +87,25 @@ async def _amain(config_path: Path) -> int:
         severity="info",
         component="daemon",
         message="trumpbot daemon starting",
+        detail={
+            "platform": paths.config_dir.parts[1] if len(paths.config_dir.parts) > 1 else "unknown",
+            "database_path": str(db_path),
+        },
     )
+
+    # Idempotently seed the subjects table from the YAML so the matcher
+    # has metadata even before the discovery service has run.
+    initial_subjects_path = (
+        resolve_path(cfg.discovery.initial_subjects_path, paths.initial_subjects_path)
+        if cfg.discovery.initial_subjects_path
+        else None
+    )
+    if initial_subjects_path is not None:
+        _seed_subjects(db, initial_subjects_path)
 
     extractor = _load_extractor(cfg)
     private_key = load_private_key(
-        cfg.kalshi.private_key_path,
+        private_key_path,
         passphrase=(
             cfg.kalshi.private_key_passphrase.encode()
             if cfg.kalshi.private_key_passphrase
@@ -104,7 +133,7 @@ async def _amain(config_path: Path) -> int:
         telegram=telegram,
         series=cfg.discovery.series,
         poll_interval_sec=cfg.discovery.poll_interval_sec,
-        snapshot_dir=cfg.discovery.snapshot_dir,
+        snapshot_dir=snapshot_dir,
     )
     ws_feed = KalshiWebSocketFeed(
         rest_client=rest_client,
@@ -128,6 +157,11 @@ async def _amain(config_path: Path) -> int:
     bus.subscribe("news_event_ingested", _make_news_metric_handler())
     bus.subscribe("market_discovered", _make_market_metric_handler(db))
     bus.subscribe("market_status_changed", _make_market_metric_handler(db))
+    # Auto-subscribe the WS feed to every market the discovery service
+    # finds. Without this, a fresh deployment with no markets in the DB
+    # at startup time would never produce price snapshots — the smoke
+    # test specifically asserts at least one snapshot within 60 s.
+    bus.subscribe("market_discovered", _make_ws_subscribe_handler(ws_feed))
 
     health = HealthcheckServer(
         health_check=_make_health_check(ws_feed, discovery, matcher_worker),
@@ -229,6 +263,58 @@ def _make_market_metric_handler(db: Database) -> Callable[[Event], Awaitable[Non
         ACTIVE_MARKETS.set(len(list_active_markets(db)))
 
     return handle
+
+
+def _make_ws_subscribe_handler(
+    ws_feed: KalshiWebSocketFeed,
+) -> Callable[[Event], Awaitable[None]]:
+    """Subscribe the WebSocket feed to any newly-discovered market."""
+
+    async def handle(event: Event) -> None:
+        ticker = event.payload.get("ticker")
+        if isinstance(ticker, str):
+            await ws_feed.subscribe(ticker)
+
+    return handle
+
+
+def _seed_subjects(db: Database, path: Path) -> None:
+    """Idempotently upsert every subject defined in ``path`` (YAML)."""
+    if not path.is_file():
+        log.info("initial_subjects_not_found", path=str(path))
+        return
+    import yaml as _yaml
+
+    raw = _yaml.safe_load(path.read_text()) or {}
+    rows = raw.get("subjects") or []
+    if not isinstance(rows, list):
+        log.warning("initial_subjects_invalid_shape", path=str(path))
+        return
+    seeded = 0
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        subject_key = entry.get("subject_key")
+        full_name = entry.get("full_name")
+        aliases = entry.get("aliases") or []
+        if not isinstance(subject_key, str) or not isinstance(full_name, str):
+            continue
+        if not isinstance(aliases, list):
+            continue
+        upsert_subject(
+            db,
+            SubjectRow(
+                subject_key=subject_key,
+                full_name=full_name,
+                aliases=[str(a) for a in aliases],
+                ticker_suffix=None,
+                auto_extracted=False,
+                llm_enriched=False,
+                reviewed=False,
+            ),
+        )
+        seeded += 1
+    log.info("initial_subjects_seeded", path=str(path), count=seeded)
 
 
 def _make_health_check(

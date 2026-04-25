@@ -43,7 +43,10 @@ class DiscoveryConfig(BaseModel):
     series: str = "KXTRUMPMEET"
     poll_interval_sec: int = 3600  # 1 hour per the brief
     backfill_months: int = 2
-    snapshot_dir: str = "data/markets"
+    # ``"auto"`` resolves to the platform default at startup; see
+    # trumpbot.platform_paths.
+    snapshot_dir: str = "auto"
+    initial_subjects_path: str | None = "auto"
 
 
 class TelegramConfig(BaseModel):

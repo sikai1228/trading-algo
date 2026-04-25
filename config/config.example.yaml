@@ -1,18 +1,28 @@
-# Example trumpbot config. Copy to /etc/trumpbot/config.yaml and edit.
+# Example trumpbot config.
+#
+# Default install paths (resolved automatically when the field is "auto"):
+#   macOS  → ~/.config/trumpbot/config.yaml
+#   Linux  → /etc/trumpbot/config.yaml
+#
 # Environment placeholders ${VAR_NAME} are expanded at load time from
-# /etc/trumpbot/secrets.env (sourced by systemd via EnvironmentFile=).
+# the per-OS secrets.env (sourced by systemd or launchd).
+#
+# Any path field set to "auto" is resolved at startup against the
+# OS-appropriate default in trumpbot.platform_paths. The same example
+# therefore works on macOS and Linux without editing.
 
 kalshi:
   base_url: "https://api.elections.kalshi.com/trade-api/v2"
   ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
   api_key_id: "${KALSHI_API_KEY_ID}"
-  private_key_path: "/etc/trumpbot/kalshi_private.pem"
+  # "auto" → ~/.config/trumpbot/kalshi_private.pem (macOS) or
+  #          /etc/trumpbot/kalshi_private.pem (Linux).
+  private_key_path: "auto"
   private_key_passphrase: "${KALSHI_PRIVATE_KEY_PASSPHRASE}"
-  # Verify exact series tickers in the Kalshi platform before deployment.
+  # Phase 1 confirmed-active series. Other series can be added once their
+  # event-ticker pattern is verified.
   target_series:
-    - "KXTRUMPCALL"
     - "KXTRUMPMEET"
-    - "KXTRUMPMENTION"
   market_discovery_interval_sec: 300
   backfill_days: 60
   rate_per_sec: 100.0
@@ -69,14 +79,19 @@ news:
     - {name: "truth_social:@realDonaldTrump", type: "truth_social", handle: "realDonaldTrump", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
 
 matcher:
-  subject_aliases_path: "/etc/trumpbot/subject_aliases.yaml"
+  # "auto" → ~/.config/trumpbot/subject_aliases.yaml (macOS) or
+  #          /etc/trumpbot/subject_aliases.yaml (Linux). Optional.
+  subject_aliases_path: "auto"
   body_match_window_chars: 500
   verb_proximity_chars: 200
   poll_interval_sec: 5
   batch_size: 100
 
 database:
-  path: "/var/lib/trumpbot/trumpbot.db"
+  # "auto" →
+  #   ~/Library/Application Support/trumpbot/trumpbot.db (macOS)
+  #   /var/lib/trumpbot/trumpbot.db                       (Linux)
+  path: "auto"
 
 health:
   host: "127.0.0.1"
@@ -97,7 +112,16 @@ discovery:
   series: "KXTRUMPMEET"
   poll_interval_sec: 3600
   backfill_months: 2
-  snapshot_dir: "data/markets"
+  # "auto" →
+  #   ~/Library/Application Support/trumpbot/markets/ (macOS)
+  #   /var/lib/trumpbot/markets/                       (Linux)
+  snapshot_dir: "auto"
+  # Optional. If present, the daemon upserts every entry into the
+  # `subjects` table at startup so the matcher has a baseline of
+  # known names even before the first discovery cycle runs. The
+  # discovery service refines aliases with full-name forms from
+  # actual market titles. "auto" → look in the platform config dir.
+  initial_subjects_path: "auto"
 
 telegram:
   # Phase 1 only sends one-way heads-up notifications (e.g. "new

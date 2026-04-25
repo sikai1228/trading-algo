@@ -1,0 +1,88 @@
+# Initial subjects seed — confirmed active in KXTRUMPMEET-26APR (22 markets).
+#
+# Loaded by the daemon at startup and upserted into the `subjects`
+# table. The MarketDiscoveryService refines each subject when it
+# polls the actual event (filling in the ticker_suffix and any
+# additional aliases from the verbatim title).
+#
+# Aliases are pre-seeded as [full_name, last_name]. Phase 2 LLM
+# enrichment will add role/title aliases ("Russian President",
+# "Chinese President", etc.) and `upsert_subject` UNIONs new
+# aliases into the stored set so manual additions never get
+# overwritten.
+#
+# Edit this file to add or correct subjects, then restart the
+# daemon. Re-runs are idempotent.
+
+subjects:
+  - subject_key: vladimirputin
+    full_name: Vladimir Putin
+    aliases: [Vladimir Putin, Putin]
+  - subject_key: xijinping
+    full_name: Xi Jinping
+    aliases: [Xi Jinping, Xi]
+  - subject_key: narendramodi
+    full_name: Narendra Modi
+    aliases: [Narendra Modi, Modi]
+  - subject_key: benjaminnetanyahu
+    full_name: Benjamin Netanyahu
+    aliases: [Benjamin Netanyahu, Netanyahu, Bibi]
+  - subject_key: volodymyrzelenskyy
+    full_name: Volodymyr Zelenskyy
+    aliases: [Volodymyr Zelenskyy, Zelenskyy, Zelensky]
+  - subject_key: keirstarmer
+    full_name: Keir Starmer
+    aliases: [Keir Starmer, Starmer]
+  - subject_key: markcarney
+    full_name: Mark Carney
+    aliases: [Mark Carney, Carney]
+  - subject_key: rezapahlavi
+    full_name: Reza Pahlavi
+    aliases: [Reza Pahlavi, Pahlavi]
+  - subject_key: jensenhuang
+    full_name: Jensen Huang
+    aliases: [Jensen Huang, Huang]
+  - subject_key: hakeemjeffries
+    full_name: Hakeem Jeffries
+    aliases: [Hakeem Jeffries, Jeffries]
+  - subject_key: johncornyn
+    full_name: John Cornyn
+    aliases: [John Cornyn, Cornyn]
+  - subject_key: gavinnewsom
+    full_name: Gavin Newsom
+    aliases: [Gavin Newsom, Newsom]
+  - subject_key: zohranmamdani
+    full_name: Zohran Mamdani
+    aliases: [Zohran Mamdani, Mamdani]
+  - subject_key: mariacorinamachado
+    full_name: María Corina Machado
+    aliases: [María Corina Machado, Machado]
+  - subject_key: jeromepowell
+    full_name: Jerome Powell
+    aliases: [Jerome Powell, Powell, Jay Powell]
+  - subject_key: chuckschumer
+    full_name: Chuck Schumer
+    aliases: [Chuck Schumer, Schumer]
+  - subject_key: rondesantis
+    full_name: Ron DeSantis
+    aliases: [Ron DeSantis, DeSantis]
+  # "Rodriguez" was listed in the 26APR confirmed-subjects set without a
+  # first name. The discovery service will overwrite full_name + add
+  # aliases the first time it fetches the actual market title; until then
+  # we seed the placeholder so the matcher can still produce zero-conf
+  # rows for surveillance.
+  - subject_key: rodriguez
+    full_name: Rodriguez
+    aliases: [Rodriguez]
+  - subject_key: kenpaxton
+    full_name: Ken Paxton
+    aliases: [Ken Paxton, Paxton]
+  - subject_key: johnthune
+    full_name: John Thune
+    aliases: [John Thune, Thune]
+  - subject_key: kevinwarsh
+    full_name: Kevin Warsh
+    aliases: [Kevin Warsh, Warsh]
+  - subject_key: tigerwoods
+    full_name: Tiger Woods
+    aliases: [Tiger Woods, Woods]

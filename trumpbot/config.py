@@ -18,6 +18,10 @@ ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 class KalshiConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Production elections endpoints. Verified working 2026-04-25 via a
+    # signed /portfolio/balance call. The path segments after the host
+    # must match the constants in trumpbot.kalshi.auth (API_PATH_PREFIX
+    # and WS_AUTH_PATH); changing one without the other breaks signing.
     base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
     api_key_id: str

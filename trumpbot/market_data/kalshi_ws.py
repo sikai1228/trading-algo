@@ -35,7 +35,7 @@ from trumpbot.db.repositories import (
     insert_system_event,
 )
 from trumpbot.events.bus import Event, EventBus
-from trumpbot.kalshi.auth import build_auth_headers
+from trumpbot.kalshi.auth import WS_AUTH_PATH, build_auth_headers
 from trumpbot.kalshi.client import KalshiClient
 from trumpbot.market_data.base import MarketDataFeed
 from trumpbot.utils.logging import get_logger
@@ -43,7 +43,10 @@ from trumpbot.utils.timeutil import utcnow_iso
 
 log = get_logger(__name__)
 
-DEFAULT_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+# Production elections WebSocket. The path segment must match
+# ``WS_AUTH_PATH`` in trumpbot.kalshi.auth so that the URL Kalshi
+# receives and the path that gets signed are identical strings.
+DEFAULT_WS_URL = f"wss://api.elections.kalshi.com{WS_AUTH_PATH}"
 HEARTBEAT_INTERVAL_SEC = 25.0
 HEARTBEAT_TIMEOUT_SEC = 10.0
 RECONNECT_BACKOFFS_SEC = (1, 2, 4, 8, 16, 32, 60)
@@ -228,12 +231,14 @@ class KalshiWebSocketFeed(MarketDataFeed):
     # -- connection internals -------------------------------------------
 
     async def _connect_and_run(self) -> None:
-        sign_path = "/trade-api/ws/v2"
+        # WS handshake signs the WebSocket auth path. The constant lives
+        # in trumpbot.kalshi.auth so REST and WS path strings cannot
+        # drift apart; never inline the literal here.
         headers = build_auth_headers(
             api_key_id=self._api_key_id,
             private_key=self._private_key,
             method="GET",
-            path=sign_path,
+            path=WS_AUTH_PATH,
         ).as_dict()
 
         async with websockets.connect(

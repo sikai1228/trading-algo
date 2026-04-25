@@ -8,22 +8,13 @@ from typing import Any
 
 
 class NewsMonitor(ABC):
-    """Abstract source of normalized NewsEvent objects.
-
-    Concrete implementations (RSSPoller, TwitterFirehoseListener,
-    PaidNewsAPIClient) emit a unified stream of events; the decision engine
-    consumes from the aggregator without knowing which underlying source
-    produced any given event.
-    """
+    """Abstract source of normalized NewsEvent objects."""
 
     @abstractmethod
-    async def start(self) -> None:
-        """Begin polling or listening for news events."""
+    async def start(self) -> None: ...
 
     @abstractmethod
-    async def stop(self) -> None:
-        """Stop the monitor and release resources."""
+    async def stop(self) -> None: ...
 
     @abstractmethod
-    def events(self) -> AsyncIterator[Any]:
-        """Async iterator yielding normalized NewsEvent objects."""
+    def events(self) -> AsyncIterator[Any]: ...

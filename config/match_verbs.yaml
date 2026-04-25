@@ -1,0 +1,59 @@
+# Reference dump of the verb lists hardcoded in trumpbot.news.matcher.
+# This file is documentation only — the matcher does NOT load from here
+# in v1. Editing the lists requires a code change in matcher.py and a
+# corresponding test update. Pinning the verbs in code is intentional:
+# the test suite is the spec, so the verb list and the tests must move
+# together.
+
+direct_verbs:
+  - spoke / spoke with / spoke to
+  - talked / talked with / talked to
+  - met / met with / meeting with
+  - phone call / phone-call
+  - called / calls / phoned
+  - discussed / conversation / talks
+  - summit / bilateral / readout
+  - conferred / consulted / consulted with
+  - had a call / held a call / held talks / held a meeting
+  - sit down / sit-down / sat down / sat-down
+  - video call / video-call / videoconference / video conference
+
+mention_verbs:
+  - mentioned
+  - addressed
+  - referenced
+  - named
+  - praised / criticized / attacked
+  - responded to / reacted to
+
+indirect_verbs:
+  - sent a letter / wrote a letter / sent letter
+  - sent an envoy / sent envoy
+  - exchanged messages / exchanged letters
+  - communicated via / communicated through
+  - reached out via
+  - made contact
+  - passed a message
+  - via intermediary / via intermediaries
+  - through intermediary / through intermediaries
+  - through envoy / through an envoy / via envoy
+
+future_phrases:
+  - will meet / will speak / will call / will hold talks
+  - expected to {meet,speak,call}
+  - scheduled to {meet,speak,call} / scheduled a call
+  - plans to {meet,speak,call} / planning to meet
+  - may {meet,speak,call} / could {meet,speak,call}
+  - to meet / to speak with / to hold talks
+  - set to {meet,speak,call}
+  - agreed to {meet,speak,call}
+
+negation_phrases:
+  - did not / didn't {call,speak,meet,talk}
+  - no {call,meeting,conversation,contact}
+  - declined / refused to {speak,call,meet}
+  - denied / denied {calling,speaking,meeting,a call,any call}
+  - ruled out
+  - no plans / no plans to {call,meet,speak}
+  - has not / have not {spoken,called,met}
+  - without {speaking,meeting}

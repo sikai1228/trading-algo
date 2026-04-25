@@ -12,18 +12,32 @@ dependencies = [
     "structlog==24.4.0",
     "python-telegram-bot==21.10",
     "cryptography==44.0.0",
+    "beautifulsoup4==4.12.3",
+    "lxml==5.3.0",
+    "pyyaml==6.0.2",
+    "python-dateutil==2.9.0.post0",
+    "prometheus-client==0.21.1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest==8.3.4",
     "pytest-asyncio==0.25.0",
+    "pytest-cov==6.0.0",
+    "respx==0.22.0",
+    "freezegun==1.5.1",
     "mypy==1.14.1",
     "ruff==0.8.6",
     "black==24.10.0",
     "detect-secrets==1.5.0",
     "pre-commit==4.0.1",
+    "types-pyyaml==6.0.12.20240917",
+    "types-python-dateutil==2.9.0.20241003",
+    "types-beautifulsoup4==4.12.0.20241020",
 ]
+
+[project.scripts]
+trumpbot = "trumpbot.daemon:run"
 
 [build-system]
 requires = ["hatchling"]
@@ -38,7 +52,7 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
-ignore = []
+ignore = ["B008"]
 
 [tool.black]
 line-length = 100
@@ -54,7 +68,14 @@ disallow_incomplete_defs = true
 no_implicit_optional = true
 files = ["trumpbot", "tests"]
 
+[[tool.mypy.overrides]]
+module = ["feedparser.*", "prometheus_client.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:pydantic._internal._config",
+]

@@ -1,0 +1,115 @@
+# Subject -> alias list. Used by both the discovery subject extractor
+# and the news matcher. Edit freely; restart the daemon to pick up
+# changes.
+putin:
+  - "putin"
+  - "vladimir putin"
+  - "russian president"
+  - "president of russia"
+  - "kremlin chief"
+xi:
+  - "xi jinping"
+  - "xi"
+  - "chinese president"
+  - "president of china"
+  - "general secretary xi"
+netanyahu:
+  - "netanyahu"
+  - "bibi"
+  - "israeli prime minister"
+  - "prime minister of israel"
+  - "israeli pm"
+zelensky:
+  - "zelensky"
+  - "zelenskyy"
+  - "ukrainian president"
+  - "president of ukraine"
+macron:
+  - "macron"
+  - "emmanuel macron"
+  - "french president"
+  - "president of france"
+merz:
+  - "merz"
+  - "friedrich merz"
+  - "german chancellor"
+  - "chancellor of germany"
+starmer:
+  - "starmer"
+  - "keir starmer"
+  - "british prime minister"
+  - "prime minister of the united kingdom"
+  - "uk prime minister"
+  - "uk pm"
+modi:
+  - "modi"
+  - "narendra modi"
+  - "indian prime minister"
+  - "prime minister of india"
+"kim jong un":
+  - "kim jong un"
+  - "kim jong-un"
+  - "north korean leader"
+  - "leader of north korea"
+  - "dprk leader"
+mbs:
+  - "mbs"
+  - "mohammed bin salman"
+  - "crown prince of saudi arabia"
+  - "saudi crown prince"
+sisi:
+  - "sisi"
+  - "abdel fattah el-sisi"
+  - "egyptian president"
+  - "president of egypt"
+erdogan:
+  - "erdogan"
+  - "recep tayyip erdogan"
+  - "turkish president"
+  - "president of turkey"
+meloni:
+  - "meloni"
+  - "giorgia meloni"
+  - "italian prime minister"
+  - "prime minister of italy"
+orban:
+  - "orban"
+  - "viktor orban"
+  - "hungarian prime minister"
+  - "prime minister of hungary"
+milei:
+  - "milei"
+  - "javier milei"
+  - "argentine president"
+  - "president of argentina"
+lula:
+  - "lula"
+  - "luiz inacio lula da silva"
+  - "brazilian president"
+  - "president of brazil"
+sheinbaum:
+  - "sheinbaum"
+  - "claudia sheinbaum"
+  - "mexican president"
+  - "president of mexico"
+carney:
+  - "carney"
+  - "mark carney"
+  - "canadian prime minister"
+  - "prime minister of canada"
+ishiba:
+  - "ishiba"
+  - "shigeru ishiba"
+  - "japanese prime minister"
+  - "prime minister of japan"
+lai:
+  - "lai ching-te"
+  - "lai ching te"
+  - "william lai"
+  - "taiwanese president"
+  - "president of taiwan"
+prabowo:
+  - "prabowo"
+  - "prabowo subianto"
+  - "indonesian president"
+  - "president of indonesia"

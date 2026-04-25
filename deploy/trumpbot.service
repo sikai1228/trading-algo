@@ -10,16 +10,21 @@ User=trumpbot
 Group=trumpbot
 WorkingDirectory=/opt/trumpbot
 EnvironmentFile=/etc/trumpbot/secrets.env
-ExecStart=/opt/trumpbot/.venv/bin/python -m trumpbot
+Environment=TRUMPBOT_CONFIG=/etc/trumpbot/config.yaml
+ExecStart=/opt/trumpbot/.venv/bin/python -m trumpbot --config /etc/trumpbot/config.yaml
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
 StartLimitBurst=10
 StartLimitIntervalSec=120
 
-# Logging: stdout/stderr captured by journald.
+# Logging.
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=trumpbot
+
+# Resource limits (CLAUDE.md "Backend Infrastructure").
+MemoryMax=2G
+CPUQuota=80%
 
 # Hardening.
 NoNewPrivileges=true

@@ -423,9 +423,20 @@ class MatcherWorker:
         ]
         if not contexts:
             return len(events)
+
+        # Build a fresh matcher each batch with aliases pulled from the
+        # subjects table merged on top of DEFAULT_SUBJECT_ALIASES. Without
+        # this, the discovery service's "vladimirputin" subject_keys
+        # never resolve to alias lists and every match returns
+        # confidence=0 / "unknown_subject". This is the bridge between
+        # the Phase-1 discovery-side keys (long form) and the matcher's
+        # original short-form keys.
+        merged_aliases = self._build_merged_aliases()
+        matcher = NewsMatcher(extractor=SubjectExtractor(aliases=merged_aliases))
+
         rows: list[NewsMatchRow] = []
         for evt in events:
-            results = self._matcher.match(
+            results = matcher.match(
                 headline=evt["headline"],
                 body=evt["body_excerpt"],
                 markets=contexts,
@@ -446,6 +457,12 @@ class MatcherWorker:
                 MATCHES_WRITTEN.labels(confidence_bucket=bucket).inc()
         insert_news_matches(self._db, rows)
         return len(events)
+
+    def _build_merged_aliases(self) -> dict[str, list[str]]:
+        """Discovery-service subjects layered on top of DEFAULT_SUBJECT_ALIASES."""
+        from trumpbot.db.repositories import subjects_alias_map
+
+        return {**DEFAULT_SUBJECT_ALIASES, **subjects_alias_map(self._db)}
 
 
 def _bucket(confidence: float) -> str:

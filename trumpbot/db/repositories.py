@@ -488,6 +488,34 @@ def get_subject(db: Database, subject_key: str) -> sqlite3.Row | None:
     return row
 
 
+def list_subjects(db: Database) -> list[sqlite3.Row]:
+    """All rows in the subjects table.
+
+    Used by the matcher worker each batch to build a
+    ``{subject_key: [aliases]}`` dict that mirrors the discovery
+    service's view of who's currently in the markets. Cheap query
+    against a small table (~22 rows in Phase 1).
+    """
+    conn = db.connect()
+    return list(conn.execute("SELECT * FROM subjects ORDER BY subject_key"))
+
+
+def subjects_alias_map(db: Database) -> dict[str, list[str]]:
+    """Return ``{subject_key: aliases_list}`` ready to feed a SubjectExtractor."""
+    out: dict[str, list[str]] = {}
+    for row in list_subjects(db):
+        try:
+            aliases = json.loads(row["aliases"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(aliases, list):
+            continue
+        cleaned = [str(a) for a in aliases if isinstance(a, str) and a]
+        if cleaned:
+            out[row["subject_key"]] = cleaned
+    return out
+
+
 # ---------------------------------------------------------------------------
 # System events
 # ---------------------------------------------------------------------------

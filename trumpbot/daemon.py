@@ -387,14 +387,41 @@ class HeartbeatLogger:
                 continue
 
     def _emit(self) -> None:
+        conn = self._db.connect()
         active = list_active_markets(self._db)
+        total_markets = conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
         recent = recent_news_events(self._db, limit=1)
         last_news_ts = recent[0]["detected_ts"] if recent else None
+        # News events ingested in the last 60 seconds.
+        news_60s = conn.execute(
+            "SELECT COUNT(*) FROM news_events WHERE detected_ts >= datetime('now', '-60 seconds')"
+        ).fetchone()[0]
+        # Pending matcher backlog: news events without any match rows yet.
+        backlog = conn.execute(
+            """
+            SELECT COUNT(*) FROM news_events n
+            LEFT JOIN news_market_matches m ON m.news_event_id = n.id
+            WHERE m.id IS NULL
+            """
+        ).fetchone()[0]
+        # Last successful RSS poll per source — derived from latest detected_ts
+        # for any event from that source. Approximation; the daemon does not
+        # currently track per-source poll completions explicitly.
+        last_poll_per_source = {
+            r["source"]: r["last_ts"]
+            for r in conn.execute(
+                "SELECT source, MAX(detected_ts) AS last_ts FROM news_events GROUP BY source"
+            )
+        }
         log.info(
             "heartbeat",
             uptime_sec=int(time.time() - self._started_at),
             active_markets=len(active),
+            total_markets=total_markets,
             last_news_ts=last_news_ts,
+            news_events_last_60s=news_60s,
+            matcher_backlog=backlog,
+            last_poll_per_source=last_poll_per_source,
             ts=utcnow_iso(),
         )
 

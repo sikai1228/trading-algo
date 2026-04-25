@@ -103,6 +103,9 @@ async def test_429_does_not_persist(tmp_db: Database) -> None:
     # rate-limit backoff (5 * poll_interval = 300s).
     orig = asyncio.sleep
     try:
+        # Monkeypatch asyncio.sleep to avoid a real 5-minute 429 backoff;
+        # the lambda signature differs from sleep's but mypy can't model
+        # this short-lived patch.
         asyncio.sleep = lambda *_a, **_k: orig(0)  # type: ignore[assignment]
         await poller._poll_source(source)
     finally:

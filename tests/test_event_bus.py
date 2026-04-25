@@ -59,6 +59,8 @@ class TestEventBus:
         seen: list[Awaitable[None]] = []
 
         async def cb(event: Event) -> None:
+            # `seen` is typed list[Awaitable] for the test signature but we
+            # just want to count invocations; mypy can't see this is fine.
             seen.append(event)  # type: ignore[arg-type]
 
         bus.subscribe("e", cb)

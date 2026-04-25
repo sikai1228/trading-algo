@@ -155,6 +155,96 @@ async def _amain(config_path: Path) -> int:
     )
     heartbeat = HeartbeatLogger(db=db, interval_sec=cfg.daemon.heartbeat_interval_sec)
 
+    # ---- Phase 2 decision layer ----
+    from trumpbot.approval.gate import ApprovalGate, ApprovalGateConfig
+    from trumpbot.approval.telegram_bot import TelegramApprovalBot
+    from trumpbot.decision.engine import DecisionConfig as DecCfg
+    from trumpbot.decision.engine import DecisionEngine
+    from trumpbot.decision.loops import (
+        decision_loop,
+        position_marking_loop,
+        reentry_loop,
+        stop_loss_loop,
+    )
+    from trumpbot.execution.dry_run import DryRunExecutor, Quote
+    from trumpbot.risk.manager import RiskConfig as RskCfg
+    from trumpbot.risk.manager import RiskManager
+
+    decision_engine = DecisionEngine(
+        DecCfg(
+            llm_confidence_threshold=cfg.decision.llm_confidence_threshold,
+            max_buy_price_cents=cfg.decision.max_buy_price_cents,
+            position_size_base_pct=cfg.decision.position_size_base_pct,
+            position_size_cap_first_30_days_pct=cfg.decision.position_size_cap_first_30_days_pct,
+            position_size_cap_after_30_days_pct=cfg.decision.position_size_cap_after_30_days_pct,
+            total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
+            stop_loss_drop_cents=cfg.decision.stop_loss_drop_cents,
+            minimum_position_size_pct=cfg.decision.minimum_position_size_pct,
+        )
+    )
+    risk_manager = RiskManager(
+        db=db,
+        config=RskCfg(
+            enabled=cfg.risk.enabled,
+            max_buy_price_cents=cfg.decision.max_buy_price_cents,
+            total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
+            position_size_cap_first_30_days_pct=cfg.decision.position_size_cap_first_30_days_pct,
+            position_size_cap_after_30_days_pct=cfg.decision.position_size_cap_after_30_days_pct,
+            halted=cfg.risk.halted,
+        ),
+    )
+
+    # Telegram bot — Phase 2 needs the approval flow. Falls back to a
+    # stub requester if no token is configured (the loops will record
+    # "send_failed" expirations rather than crashing).
+    telegram_bot: TelegramApprovalBot | None = None
+    requester: object
+    if cfg.telegram.bot_token and cfg.telegram.chat_id:
+        telegram_bot = TelegramApprovalBot(
+            bot_token=cfg.telegram.bot_token, chat_id=cfg.telegram.chat_id
+        )
+        await telegram_bot.start()
+        requester = telegram_bot
+    else:
+        # No-op requester so the gate is callable in headless setups.
+        from trumpbot.approval.gate import ApprovalRequester
+
+        class _StubRequester(ApprovalRequester):
+            chat_id = None
+
+            async def send_request(
+                self, *, intent_id: str, intent_type: str, message_text: str
+            ) -> int:
+                raise RuntimeError("Telegram not configured")
+
+            async def await_response(
+                self, *, intent_id: str, timeout_sec: int | None
+            ) -> tuple[str, str]:
+                return ("expired", "timeout")
+
+        requester = _StubRequester()
+
+    approval_gate = ApprovalGate(
+        db=db,
+        config=ApprovalGateConfig(
+            mode=cfg.approval.mode,
+            entry_timeout_sec=cfg.approval.entry_timeout_sec,
+            stop_loss_timeout_sec=cfg.approval.stop_loss_timeout_sec,
+            reentry_timeout_sec=cfg.approval.reentry_timeout_sec,
+        ),
+        requester=requester,  # type: ignore[arg-type]
+    )
+
+    def _orderbook(ticker: str) -> Quote:
+        # Read from the WS feed's in-memory book if available; fall back
+        # to (None, None) if the ticker isn't subscribed.
+        book = ws_feed._books.get(ticker)  # direct internal read
+        if book is None:
+            return Quote(yes_bid_cents=None, yes_ask_cents=None)
+        return Quote(yes_bid_cents=book.best_yes_bid(), yes_ask_cents=book.best_yes_ask())
+
+    dry_run_executor = DryRunExecutor(db=db, orderbook_fn=_orderbook)
+
     bus.subscribe("news_event_ingested", _make_news_metric_handler())
     bus.subscribe("market_discovered", _make_market_metric_handler(db))
     bus.subscribe("market_status_changed", _make_market_metric_handler(db))
@@ -189,6 +279,71 @@ async def _amain(config_path: Path) -> int:
         "kalshi_ws": asyncio.create_task(_supervised(ws_feed.run, "kalshi_ws", critical=True)),
         "matcher": asyncio.create_task(_supervised(matcher_worker.run, "matcher", critical=False)),
         "heartbeat": asyncio.create_task(_supervised(heartbeat.run, "heartbeat", critical=False)),
+        "decision_loop": asyncio.create_task(
+            _supervised(
+                lambda: decision_loop(
+                    db=db,
+                    engine=decision_engine,
+                    risk=risk_manager,
+                    gate=approval_gate,
+                    executor=dry_run_executor,
+                    orderbook=_orderbook,
+                    starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    live_started_at=cfg.execution.live_trading_started_at,
+                    poll_interval_sec=cfg.decision.decision_loop_interval_sec,
+                    stop_event=stop_event,
+                ),
+                "decision_loop",
+                critical=False,
+            )
+        ),
+        "stop_loss_loop": asyncio.create_task(
+            _supervised(
+                lambda: stop_loss_loop(
+                    db=db,
+                    engine=decision_engine,
+                    risk=risk_manager,
+                    gate=approval_gate,
+                    executor=dry_run_executor,
+                    orderbook=_orderbook,
+                    starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    live_started_at=cfg.execution.live_trading_started_at,
+                    poll_interval_sec=cfg.decision.stop_loss_loop_interval_sec,
+                    stop_event=stop_event,
+                ),
+                "stop_loss_loop",
+                critical=False,
+            )
+        ),
+        "position_marking_loop": asyncio.create_task(
+            _supervised(
+                lambda: position_marking_loop(
+                    executor=dry_run_executor,
+                    poll_interval_sec=cfg.decision.position_marking_loop_interval_sec,
+                    stop_event=stop_event,
+                ),
+                "position_marking_loop",
+                critical=False,
+            )
+        ),
+        "reentry_loop": asyncio.create_task(
+            _supervised(
+                lambda: reentry_loop(
+                    db=db,
+                    engine=decision_engine,
+                    risk=risk_manager,
+                    gate=approval_gate,
+                    executor=dry_run_executor,
+                    orderbook=_orderbook,
+                    starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    live_started_at=cfg.execution.live_trading_started_at,
+                    poll_interval_sec=cfg.decision.reentry_loop_interval_sec,
+                    stop_event=stop_event,
+                ),
+                "reentry_loop",
+                critical=False,
+            )
+        ),
     }
 
     log.info("trumpbot_started", task_count=len(tasks))
@@ -219,6 +374,8 @@ async def _amain(config_path: Path) -> int:
         await truth_scraper.stop()
         await rest_client.aclose()
         await telegram.aclose()
+        if telegram_bot is not None:
+            await telegram_bot.stop()
         await health.stop()
         insert_system_event(
             db,

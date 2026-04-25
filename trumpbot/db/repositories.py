@@ -561,3 +561,218 @@ def insert_system_event(
                 utcnow_iso(),
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: trades, risk_decisions, telegram_approvals
+# ---------------------------------------------------------------------------
+
+
+def insert_risk_decision(
+    db: Database,
+    *,
+    intent_type: str,
+    intent_json: str,
+    decision: str,
+    rejection_reason: str | None,
+    rule_fired: str | None,
+    reasoning_text: str,
+) -> int:
+    sql = """
+    INSERT INTO risk_decisions (
+        intent_type, intent_json, decision, rejection_reason,
+        rule_fired, reasoning_text, decided_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    with db.transaction() as conn:
+        cur = conn.execute(
+            sql,
+            (
+                intent_type,
+                intent_json,
+                decision,
+                rejection_reason,
+                rule_fired,
+                reasoning_text,
+                utcnow_iso(),
+            ),
+        )
+        last_id: int | None = cur.lastrowid
+        assert last_id is not None
+        return last_id
+
+
+def insert_telegram_approval(
+    db: Database,
+    *,
+    intent_type: str,
+    intent_json: str,
+    message_text: str,
+    chat_id: str | None,
+    expires_at: str | None,
+) -> int:
+    sql = """
+    INSERT INTO telegram_approvals (
+        intent_type, intent_json, message_text,
+        telegram_chat_id, expires_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    """
+    with db.transaction() as conn:
+        cur = conn.execute(
+            sql,
+            (
+                intent_type,
+                intent_json,
+                message_text,
+                chat_id,
+                expires_at,
+                utcnow_iso(),
+            ),
+        )
+        last_id: int | None = cur.lastrowid
+        assert last_id is not None
+        return last_id
+
+
+def update_telegram_approval(
+    db: Database,
+    *,
+    approval_id: int,
+    decision: str,
+    decision_source: str,
+    telegram_message_id: int | None = None,
+) -> None:
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            UPDATE telegram_approvals
+               SET decision = ?, decision_source = ?, decided_at = ?,
+                   telegram_message_id = COALESCE(?, telegram_message_id)
+             WHERE id = ?
+            """,
+            (decision, decision_source, utcnow_iso(), telegram_message_id, approval_id),
+        )
+
+
+@dataclass(frozen=True)
+class TradeInsertRow:
+    ticker: str
+    status: str
+    entry_price_cents: int
+    quantity: int
+    cost_basis_usd_cents: int
+    triggering_match_id: int
+    triggering_intent_json: str
+    risk_decision_id: int
+    approval_id: int | None
+    is_reentry: bool
+    prior_trade_id: int | None
+    reasoning_text: str
+    entered_at: str
+
+
+def insert_trade(db: Database, row: TradeInsertRow) -> int:
+    sql = """
+    INSERT INTO trades (
+        ticker, side, action, status,
+        entry_price_cents, quantity, cost_basis_usd_cents,
+        triggering_match_id, triggering_intent_json,
+        risk_decision_id, approval_id, is_reentry, prior_trade_id,
+        reasoning_text, entered_at, created_at
+    ) VALUES (
+        :ticker, 'yes', 'buy', :status,
+        :entry_price_cents, :quantity, :cost_basis_usd_cents,
+        :triggering_match_id, :triggering_intent_json,
+        :risk_decision_id, :approval_id, :is_reentry, :prior_trade_id,
+        :reasoning_text, :entered_at, :now
+    )
+    """
+    params = {
+        **row.__dict__,
+        "is_reentry": int(row.is_reentry),
+        "now": utcnow_iso(),
+    }
+    with db.transaction() as conn:
+        cur = conn.execute(sql, params)
+        last_id: int | None = cur.lastrowid
+        assert last_id is not None
+        return last_id
+
+
+def list_open_trades(db: Database) -> list[sqlite3.Row]:
+    conn = db.connect()
+    return list(
+        conn.execute("SELECT * FROM trades WHERE status IN ('dry_run', 'live') ORDER BY entered_at")
+    )
+
+
+def get_open_trade_for_ticker(db: Database, ticker: str) -> sqlite3.Row | None:
+    conn = db.connect()
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT * FROM trades WHERE ticker = ? AND status IN ('dry_run', 'live') "
+        "ORDER BY entered_at DESC LIMIT 1",
+        (ticker,),
+    ).fetchone()
+    return row
+
+
+def get_last_closed_trade_for_ticker(db: Database, ticker: str) -> sqlite3.Row | None:
+    conn = db.connect()
+    row: sqlite3.Row | None = conn.execute(
+        """
+        SELECT * FROM trades
+         WHERE ticker = ?
+           AND status IN (
+               'dry_run_closed_stop', 'dry_run_closed_resolved',
+               'live_closed_stop', 'live_closed_resolved'
+           )
+         ORDER BY exited_at DESC
+         LIMIT 1
+        """,
+        (ticker,),
+    ).fetchone()
+    return row
+
+
+def update_trade_marks(
+    db: Database, *, trade_id: int, current_value_usd_cents: int, unrealized_pnl_usd_cents: int
+) -> None:
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            UPDATE trades
+               SET unrealized_pnl_usd_cents = ?, last_marked_at = ?
+             WHERE id = ?
+            """,
+            (unrealized_pnl_usd_cents, utcnow_iso(), trade_id),
+        )
+
+
+def close_trade(
+    db: Database,
+    *,
+    trade_id: int,
+    new_status: str,
+    exit_price_cents: int,
+    realized_pnl_usd_cents: int,
+    exited_at: str,
+) -> None:
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            UPDATE trades
+               SET status = ?, exit_price_cents = ?,
+                   realized_pnl_usd_cents = ?, exited_at = ?
+             WHERE id = ?
+            """,
+            (new_status, exit_price_cents, realized_pnl_usd_cents, exited_at, trade_id),
+        )
+
+
+def total_open_position_cost_cents(db: Database) -> int:
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(cost_basis_usd_cents), 0) "
+        "FROM trades WHERE status IN ('dry_run', 'live')"
+    ).fetchone()
+    return int(row[0])

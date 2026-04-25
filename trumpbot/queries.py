@@ -124,16 +124,15 @@ def _open_readonly(db_path: Path | str) -> Iterator[sqlite3.Connection]:
 
 
 def get_open_positions(db_path: Path | str) -> list[Position]:
-    """Trades currently open (status='open' or 'partially_filled')."""
+    """Trades currently open (status='dry_run' or 'live')."""
     with _open_readonly(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT id, ticker, side, requested_quantity, target_price_cents,
-                   current_market_value, unrealized_pnl_cents,
-                   submitted_at, filled_at
+            SELECT id, ticker, side, quantity, entry_price_cents,
+                   unrealized_pnl_usd_cents, entered_at, last_marked_at
             FROM trades
-            WHERE status IN ('open', 'partially_filled')
-            ORDER BY submitted_at DESC
+            WHERE status IN ('dry_run', 'live')
+            ORDER BY entered_at DESC
             """
         ).fetchall()
     return [
@@ -141,12 +140,12 @@ def get_open_positions(db_path: Path | str) -> list[Position]:
             trade_id=r["id"],
             ticker=r["ticker"],
             side=r["side"],
-            quantity=r["requested_quantity"],
-            entry_price_cents=r["target_price_cents"],
-            current_market_value_cents=r["current_market_value"],
-            unrealized_pnl_cents=r["unrealized_pnl_cents"],
-            submitted_at=r["submitted_at"] or "",
-            filled_at=r["filled_at"],
+            quantity=r["quantity"],
+            entry_price_cents=r["entry_price_cents"],
+            current_market_value_cents=None,
+            unrealized_pnl_cents=r["unrealized_pnl_usd_cents"],
+            submitted_at=r["entered_at"] or "",
+            filled_at=r["entered_at"],
         )
         for r in rows
     ]
@@ -156,8 +155,8 @@ def get_position_pnl(db_path: Path | str, trade_id: int) -> PnLBreakdown | None:
     with _open_readonly(db_path) as conn:
         r = conn.execute(
             """
-            SELECT id, realized_pnl_cents, unrealized_pnl_cents,
-                   fill_price_cents, current_market_value
+            SELECT id, realized_pnl_usd_cents, unrealized_pnl_usd_cents,
+                   entry_price_cents, exit_price_cents
             FROM trades
             WHERE id = ?
             """,
@@ -167,10 +166,10 @@ def get_position_pnl(db_path: Path | str, trade_id: int) -> PnLBreakdown | None:
         return None
     return PnLBreakdown(
         trade_id=r["id"],
-        realized_pnl_cents=r["realized_pnl_cents"] or 0,
-        unrealized_pnl_cents=r["unrealized_pnl_cents"] or 0,
-        fill_price_cents=r["fill_price_cents"],
-        current_market_value_cents=r["current_market_value"],
+        realized_pnl_cents=r["realized_pnl_usd_cents"] or 0,
+        unrealized_pnl_cents=r["unrealized_pnl_usd_cents"] or 0,
+        fill_price_cents=r["entry_price_cents"],
+        current_market_value_cents=None,
     )
 
 
@@ -239,11 +238,11 @@ def get_daily_pnl(db_path: Path | str, day: date) -> DailyPnL:
         r = conn.execute(
             """
             SELECT
-              COALESCE(SUM(realized_pnl_cents), 0) AS realized,
-              COALESCE(SUM(unrealized_pnl_cents), 0) AS unrealized,
+              COALESCE(SUM(realized_pnl_usd_cents), 0) AS realized,
+              COALESCE(SUM(unrealized_pnl_usd_cents), 0) AS unrealized,
               COUNT(*) AS trade_count
             FROM trades
-            WHERE substr(submitted_at, 1, 10) = ?
+            WHERE substr(entered_at, 1, 10) = ?
             """,
             (day_str,),
         ).fetchone()
@@ -262,12 +261,12 @@ def get_strategy_performance(db_path: Path | str, start_ts: str, end_ts: str) ->
             """
             SELECT
               COUNT(*) AS total_trades,
-              COALESCE(SUM(CASE WHEN realized_pnl_cents > 0 THEN 1 ELSE 0 END), 0) AS wins,
-              COALESCE(SUM(CASE WHEN realized_pnl_cents < 0 THEN 1 ELSE 0 END), 0) AS losses,
-              COALESCE(SUM(realized_pnl_cents), 0) AS realized,
-              COALESCE(SUM(unrealized_pnl_cents), 0) AS unrealized
+              COALESCE(SUM(CASE WHEN realized_pnl_usd_cents > 0 THEN 1 ELSE 0 END), 0) AS wins,
+              COALESCE(SUM(CASE WHEN realized_pnl_usd_cents < 0 THEN 1 ELSE 0 END), 0) AS losses,
+              COALESCE(SUM(realized_pnl_usd_cents), 0) AS realized,
+              COALESCE(SUM(unrealized_pnl_usd_cents), 0) AS unrealized
             FROM trades
-            WHERE submitted_at >= ? AND submitted_at <= ?
+            WHERE entered_at >= ? AND entered_at <= ?
             """,
             (start_ts, end_ts),
         ).fetchone()

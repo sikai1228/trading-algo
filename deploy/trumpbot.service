@@ -1,0 +1,44 @@
+[Unit]
+Description=Trumpbot Kalshi prediction-market trading bot
+Documentation=https://github.com/sikai1228/trading-algo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trumpbot
+Group=trumpbot
+WorkingDirectory=/opt/trumpbot
+EnvironmentFile=/etc/trumpbot/secrets.env
+ExecStart=/opt/trumpbot/.venv/bin/python -m trumpbot
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+# Logging: stdout/stderr captured by journald.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trumpbot
+
+# Hardening.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/trumpbot /var/log/trumpbot
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

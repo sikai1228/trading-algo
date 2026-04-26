@@ -102,8 +102,17 @@ emits a `RiskApprovedOrder` for the close.
   - **entry**: 180 s (signal goes stale fast)
   - **stop-loss**: no timeout
   - **re-entry**: no timeout
-- Records every decision into `telegram_approvals` (decision_source ∈
-  `telegram_approve` / `telegram_reject` / `timeout` / `send_failed`)
+- Records every decision into `telegram_approvals`. Two columns split
+  the outcome from how it arrived:
+  - `decision` ∈ `approved` / `rejected` / `expired`
+  - `decision_source` ∈ `telegram_button` (user tapped the inline
+    keyboard) / `telegram_command` (reserved for the Phase 3
+    `/approve <id>` flow) / `timeout` (no response within the per-
+    intent window). On a Telegram send-failure the gate currently
+    records `decision="expired"` + `decision_source="timeout"` and
+    surfaces the actual error via structlog at `approval_send_failed`
+    — promoting that to a dedicated `send_failed` source value is a
+    Phase 3 follow-up.
 
 ### Execution — `DryRunExecutor`
 

@@ -57,9 +57,16 @@ class RiskState:
 
 
 class RiskManager:
-    """The single chokepoint."""
+    """The single chokepoint.
 
-    def __init__(self, *, db: Database, config: RiskConfig) -> None:
+    ``db`` is optional. Pass ``None`` from the backtester (or any
+    read-only context) to skip writing to ``risk_decisions``; the in-
+    memory check chain still runs and the returned ``RiskApprovedOrder``
+    still carries a sentinel ``risk_decision_id`` of ``0`` so the
+    downstream type contract is unchanged.
+    """
+
+    def __init__(self, *, db: Database | None, config: RiskConfig) -> None:
         self._db = db
         self._cfg = config
 
@@ -237,6 +244,9 @@ class RiskManager:
         rule_fired: str | None,
         reasoning_text: str,
     ) -> int:
+        # Read-only mode (backtester): skip persistence, return sentinel.
+        if self._db is None:
+            return 0
         from trumpbot.db.repositories import insert_risk_decision
 
         return insert_risk_decision(

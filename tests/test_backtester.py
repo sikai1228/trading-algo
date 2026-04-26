@@ -126,3 +126,109 @@ def test_backtester_uses_same_decision_engine_class() -> None:
 
     bt = B(db_path="/dev/null", starting_bankroll_usd=1.0)
     assert isinstance(bt._engine, ProdEngine)
+
+
+def test_backtester_uses_same_risk_manager_class() -> None:
+    """Pin: the backtester also runs the production RiskManager (no
+    shadow logic for sizing caps / exposure caps), with db=None so the
+    audit table isn't polluted from a backtest run."""
+    from trumpbot.backtest.replay import Backtester as B
+    from trumpbot.risk.manager import RiskManager as ProdRisk
+
+    bt = B(db_path="/dev/null", starting_bankroll_usd=1.0)
+    assert isinstance(bt._risk, ProdRisk)
+    # Read-only mode: no DB handle.
+    assert bt._risk._db is None  # pinning the contract
+
+
+def test_backtester_skips_risk_rejected_intents(tmp_path: Path) -> None:
+    """When the risk manager rejects (here: halted=True), the backtester
+    does NOT record a trade and increments risk_rejections.
+
+    Using ``halted`` is the cleanest way to force a risk-only rejection
+    in test, because most other rejection causes (price ceiling, sizing
+    floor) are also enforced inside the engine and would short-circuit
+    before the risk gate ever runs.
+    """
+    from trumpbot.risk.manager import RiskConfig
+
+    db_path = _seed(tmp_path)
+    bt = Backtester(
+        db_path=db_path,
+        starting_bankroll_usd=500.0,
+        risk_config=RiskConfig(halted=True),
+    )
+    result = bt.run(start_ts="2026-04-01T00:00:00Z", end_ts="2026-04-30T23:59:59Z")
+    assert result.total_trades == 0
+    assert result.risk_rejections == 1
+
+
+def test_backtester_emits_sharpe_and_max_drawdown(tmp_path: Path) -> None:
+    """BacktestResult exposes sharpe_ratio and max_drawdown_usd_cents
+    fields (zero for the trivial single-trade fixture)."""
+    db_path = _seed(tmp_path)
+    bt = Backtester(db_path=db_path, starting_bankroll_usd=500.0)
+    result = bt.run(start_ts="2026-04-01T00:00:00Z", end_ts="2026-04-30T23:59:59Z")
+    # Single positive-P&L trade → variance is zero → Sharpe is 0.0.
+    assert result.sharpe_ratio == 0.0
+    # Single-trade equity curve only goes up → max drawdown is 0.
+    assert result.max_drawdown_usd_cents == 0
+
+
+def test_backtester_populates_by_source_breakdown(tmp_path: Path) -> None:
+    """by_source_breakdown is populated from news_events.source via the
+    JOIN in _fetch_matches; counts and P&L sums match by_subject."""
+    db_path = _seed(tmp_path)
+    bt = Backtester(db_path=db_path, starting_bankroll_usd=500.0)
+    result = bt.run(start_ts="2026-04-01T00:00:00Z", end_ts="2026-04-30T23:59:59Z")
+    assert result.by_source  # not empty
+    # The fixture's only news_event has source='ap_via_gnews'.
+    assert "ap_via_gnews" in result.by_source
+    assert result.by_source["ap_via_gnews"]["trades"] == 1
+    # Sum across sources equals total_trades.
+    assert sum(v["trades"] for v in result.by_source.values()) == result.total_trades
+    # Sum of P&L across sources equals total realized.
+    assert (
+        sum(v["realized_pnl_usd_cents"] for v in result.by_source.values())
+        == result.total_realized_pnl_usd_cents
+    )
+
+
+def test_max_drawdown_helper_handles_peak_and_trough() -> None:
+    """Equity curve +100, +50, -200 → peak 150, trough -50, max
+    drawdown 200 from the running max."""
+    from trumpbot.backtest.replay import BacktestTrade, _max_drawdown_usd_cents
+
+    trades = [
+        BacktestTrade(
+            ticker="X",
+            entered_at="2026-04-01T00:00:00Z",
+            exit_at=f"2026-04-0{i+1}T00:00:00Z",
+            entry_price_cents=50,
+            exit_price_cents=50,
+            quantity=1,
+            realized_pnl_usd_cents=p,
+        )
+        for i, p in enumerate([100, 50, -200])
+    ]
+    # Cumulative: 100, 150, -50. Peak 150. Trough -50. Drawdown 200.
+    assert _max_drawdown_usd_cents(trades) == 200
+
+
+def test_sharpe_helper_handles_no_variance() -> None:
+    """Sharpe is 0.0 when the daily P&L series has zero variance."""
+    from trumpbot.backtest.replay import BacktestTrade, _annualized_sharpe
+
+    same = [
+        BacktestTrade(
+            ticker="X",
+            entered_at="2026-04-01T00:00:00Z",
+            exit_at=f"2026-04-0{i+1}T00:00:00Z",
+            entry_price_cents=50,
+            exit_price_cents=60,
+            quantity=1,
+            realized_pnl_usd_cents=10,
+        )
+        for i in range(3)
+    ]
+    assert _annualized_sharpe(same) == 0.0

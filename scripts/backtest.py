@@ -61,6 +61,16 @@ def main() -> int:
     print(f"  avg entry price:     {result.average_entry_price_cents}c")
     print(f"  avg exit price:      {result.average_exit_price_cents}c")
     print(f"  avg hold time:       {result.average_hold_time_hours:.1f}h")
+    print(f"  Sharpe (annualized): {result.sharpe_ratio:.2f}")
+    print(f"  max drawdown:        ${result.max_drawdown_usd_cents/100:.2f}")
+    print(f"  risk rejections:     {result.risk_rejections}")
+    if result.by_source:
+        print("  by source:")
+        for source, agg in sorted(result.by_source.items()):
+            print(
+                f"    {source:<25s} trades={agg['trades']:>3} "
+                f"P&L=${agg['realized_pnl_usd_cents']/100:+.2f}"
+            )
     print(line)
 
     if args.csv:

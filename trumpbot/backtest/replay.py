@@ -3,14 +3,19 @@ SAME DecisionEngine + RiskManager that runs in production.
 
 Critical invariant: this module imports those classes directly. There
 is no parallel "backtest engine"; the only place a strategy rule lives
-is in :class:`DecisionEngine`. If the rule changes, the backtest result
-changes accordingly.
+is in :class:`DecisionEngine` and :class:`RiskManager`. If a rule
+changes, the backtest result changes accordingly.
 
-Phase 2 backtester is intentionally minimal:
-- Auto-approves every risk-approved order (no human in backtest)
+Phase 2 backtester:
+- Runs every engine intent through :class:`RiskManager` (with
+  ``db=None`` so the audit table isn't written from a backtest run);
+  rejected intents are skipped, adjusted-quantity approvals respected
+- Auto-approves the gate stage (no Telegram in backtest)
 - Uses the closest price_snapshot to the match's classified_at_ts
-- Closes positions on stop-loss trigger or market resolution (YES @ 100¢, NO @ 0¢)
-- Reports total trades, win/loss/win-rate, realized + unrealized P&L
+- Closes positions on stop-loss trigger or market resolution
+  (YES @ 100¢, NO @ 0¢)
+- Reports total trades, win/loss/win-rate, realized + unrealized P&L,
+  per-day Sharpe, max drawdown, by-subject and by-source breakdowns
 
 Slippage modeling, fees, partial fills, and P&L attribution are all
 Phase 3+ (out of scope per CLAUDE.md).
@@ -19,6 +24,7 @@ Phase 3+ (out of scope per CLAUDE.md).
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
@@ -35,7 +41,8 @@ from trumpbot.decision.engine import (
     MatchSnapshot,
     Position,
 )
-from trumpbot.types.intents import StopLossIntent
+from trumpbot.risk.manager import RiskConfig, RiskManager, RiskState
+from trumpbot.types.intents import RiskRejection, StopLossIntent
 
 
 @dataclass
@@ -48,7 +55,13 @@ class BacktestTrade:
     exit_price_cents: int | None = None
     realized_pnl_usd_cents: int = 0
     triggering_match_id: int = 0
+    triggering_subject: str | None = None
+    """Subject key the match resolved to (e.g. 'putin'). Powers
+    by_subject_breakdown."""
+
     triggering_source: str | None = None
+    """Name of the news source (e.g. 'reuters', 'ap_via_gnews').
+    Powers by_source_breakdown."""
 
 
 @dataclass
@@ -64,6 +77,17 @@ class BacktestResult:
     average_entry_price_cents: int = 0
     average_exit_price_cents: int = 0
     average_hold_time_hours: float = 0.0
+    sharpe_ratio: float = 0.0
+    """Annualized Sharpe of the daily P&L series, rf=0. Returns 0.0
+    when there is no variance (degenerate case)."""
+
+    max_drawdown_usd_cents: int = 0
+    """Worst peak-to-trough decline in the running equity curve, in
+    USDCents. Always non-negative."""
+
+    risk_rejections: int = 0
+    """Number of intents the risk manager rejected during the run."""
+
     trade_log: list[BacktestTrade] = field(default_factory=list)
     by_subject: dict[str, dict[str, Any]] = field(default_factory=dict)
     by_source: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -78,10 +102,25 @@ class Backtester:
         db_path: Path | str,
         config: DecisionConfig | None = None,
         starting_bankroll_usd: float = 500.0,
+        risk_config: RiskConfig | None = None,
     ) -> None:
         self._db_path = Path(db_path)
         self._cfg = config or DecisionConfig()
+        # Mirror the engine config into a RiskConfig with the same caps
+        # so production and backtest share the same numbers.
+        self._risk_cfg = risk_config or RiskConfig(
+            enabled=True,
+            max_buy_price_cents=self._cfg.max_buy_price_cents,
+            total_exposure_cap_pct=self._cfg.total_exposure_cap_pct,
+            position_size_cap_first_30_days_pct=(self._cfg.position_size_cap_first_30_days_pct),
+            position_size_cap_after_30_days_pct=(self._cfg.position_size_cap_after_30_days_pct),
+            halted=False,
+        )
         self._engine = DecisionEngine(self._cfg)
+        # db=None → RiskManager runs the in-memory check chain but does
+        # NOT persist risk_decisions; backtests must not pollute the
+        # production audit table.
+        self._risk = RiskManager(db=None, config=self._risk_cfg)
         self._bankroll_cents = int(round(starting_bankroll_usd * 100))
 
     def run(self, *, start_ts: str, end_ts: str) -> BacktestResult:
@@ -126,14 +165,25 @@ class Backtester:
                 intent = self._engine.evaluate_news_match(snap, market_state, None, bankroll)
                 if intent is None:
                     continue
-                # Auto-approve in backtest.
+                # Run the production RiskManager. Skip the trade on
+                # rejection; honour adjusted_quantity on approval.
+                risk_state = RiskState(
+                    bankroll=bankroll,
+                    open_position_tickers=frozenset(open_positions.keys()),
+                )
+                approved = self._risk.evaluate(intent, risk_state)
+                if isinstance(approved, RiskRejection):
+                    result.risk_rejections += 1
+                    continue
+                actual_qty = approved.adjusted_quantity or intent.target_quantity
                 trade = BacktestTrade(
                     ticker=ticker,
                     entered_at=row["created_at"],
                     entry_price_cents=intent.target_price_cents,
-                    quantity=intent.target_quantity,
+                    quantity=actual_qty,
                     triggering_match_id=intent.triggering_match_id,
-                    triggering_source=row["matched_subject"],
+                    triggering_subject=row["matched_subject"],
+                    triggering_source=_row_source_name(row),
                 )
                 open_positions[ticker] = trade
                 next_trade_id += 1
@@ -172,10 +222,12 @@ class Backtester:
     def _fetch_matches(
         self, conn: sqlite3.Connection, start_ts: str, end_ts: str
     ) -> Iterable[sqlite3.Row]:
+        # JOIN to news_events so by_source_breakdown can be populated.
         return conn.execute(
             """
-            SELECT m.*
+            SELECT m.*, e.source AS source_name, e.is_kalshi_approved AS is_kalshi_approved
             FROM news_market_matches m
+            LEFT JOIN news_events e ON e.id = m.news_event_id
             WHERE m.confidence >= ?
               AND m.created_at >= ?
               AND m.created_at <= ?
@@ -283,7 +335,8 @@ class Backtester:
                             continue
                 if hold_hours:
                     result.average_hold_time_hours = sum(hold_hours) / len(hold_hours)
-        # By-subject and by-source breakdowns
+
+        # ---- by-subject + by-source breakdowns ----
         by_subject: dict[str, dict[str, int]] = defaultdict(
             lambda: {"trades": 0, "realized_pnl_usd_cents": 0}
         )
@@ -291,11 +344,18 @@ class Backtester:
             lambda: {"trades": 0, "realized_pnl_usd_cents": 0}
         )
         for t in result.trade_log:
-            subject = t.triggering_source or "unknown"
-            by_subject[subject]["trades"] += 1
-            by_subject[subject]["realized_pnl_usd_cents"] += t.realized_pnl_usd_cents
+            subject_key = t.triggering_subject or "unknown"
+            by_subject[subject_key]["trades"] += 1
+            by_subject[subject_key]["realized_pnl_usd_cents"] += t.realized_pnl_usd_cents
+            source_key = t.triggering_source or "unknown"
+            by_source[source_key]["trades"] += 1
+            by_source[source_key]["realized_pnl_usd_cents"] += t.realized_pnl_usd_cents
         result.by_subject = dict(by_subject)
         result.by_source = dict(by_source)
+
+        # ---- Sharpe + max drawdown over daily P&L ----
+        result.sharpe_ratio = _annualized_sharpe(result.trade_log)
+        result.max_drawdown_usd_cents = _max_drawdown_usd_cents(result.trade_log)
 
     # -- output --------------------------------------------------------
 
@@ -330,3 +390,82 @@ class Backtester:
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _row_source_name(row: sqlite3.Row) -> str | None:
+    """Safely read the JOIN-ed news_events.source column off a Row.
+
+    The column may be absent in pathological fixtures (older snapshots
+    of the schema, malformed replays). Default to None — the
+    aggregator buckets None as 'unknown'.
+    """
+    try:
+        value = row["source_name"]
+    except (IndexError, KeyError):
+        return None
+    return str(value) if value is not None else None
+
+
+# ---------------------------------------------------------------------------
+# Performance metrics
+# ---------------------------------------------------------------------------
+
+
+def _annualized_sharpe(trades: list[BacktestTrade]) -> float:
+    """Annualized Sharpe of the per-day realized P&L series, rf=0.
+
+    Returns 0.0 if there is no variance (fewer than 2 distinct days, or
+    every day has the same P&L). 252 trading-days/year is the
+    convention; we use 365 here because political-prediction markets
+    don't observe market closures.
+    """
+    daily = _daily_pnl_series(trades)
+    if len(daily) < 2:
+        return 0.0
+    mean = sum(daily) / len(daily)
+    variance = sum((d - mean) ** 2 for d in daily) / (len(daily) - 1)
+    if variance <= 0:
+        return 0.0
+    std = math.sqrt(variance)
+    return (mean / std) * math.sqrt(365.0)
+
+
+def _max_drawdown_usd_cents(trades: list[BacktestTrade]) -> int:
+    """Worst peak-to-trough decline of the running equity curve.
+
+    Equity at time t = cumulative realized P&L through t. We walk the
+    trade log in close-time order, track the running max, and return the
+    largest drop below it. Always >= 0.
+    """
+    closed = [t for t in trades if t.exit_at is not None]
+    if not closed:
+        return 0
+    closed.sort(key=lambda t: t.exit_at or "")
+    running = 0
+    peak = 0
+    worst = 0
+    for t in closed:
+        running += t.realized_pnl_usd_cents
+        if running > peak:
+            peak = running
+        drawdown = peak - running
+        if drawdown > worst:
+            worst = drawdown
+    return worst
+
+
+def _daily_pnl_series(trades: list[BacktestTrade]) -> list[int]:
+    """Sum realized P&L per UTC day for closed trades. Days with no
+    closed trade contribute 0 only if they fall between days that did
+    (so the series doesn't have artificial gaps that would skew variance)."""
+    closed = [t for t in trades if t.exit_at and t.exit_price_cents is not None]
+    if not closed:
+        return []
+    by_day: dict[str, int] = defaultdict(int)
+    for t in closed:
+        try:
+            day = datetime.fromisoformat((t.exit_at or "").replace("Z", "+00:00")).date()
+        except ValueError:
+            continue
+        by_day[day.isoformat()] += t.realized_pnl_usd_cents
+    return [by_day[d] for d in sorted(by_day.keys())]

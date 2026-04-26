@@ -21,7 +21,7 @@ trumpbot/
   health/          Localhost /health + /metrics HTTP server
   utils/           timeutil, url canonicalization, structlog setup
   config.py        Pydantic-validated YAML config loader
-  daemon.py        Top-level orchestrator + MatcherWorker + HeartbeatLogger
+  daemon.py        Top-level orchestrator + MatcherWorker
   __main__.py      `python -m trumpbot`
 
 config/
@@ -112,8 +112,10 @@ The daemon starts the following concurrent tasks:
 4. **TwitterScraper** — one task per handle (requires bearer token; otherwise no-op).
 5. **TruthSocialScraper** — polls @realDonaldTrump.
 6. **MatcherWorker** — consumes new news events, runs the matcher against active markets.
-7. **HeartbeatLogger** — logs one-line state every 60 seconds.
-8. **HealthcheckServer** — `127.0.0.1:9090/health` and `/metrics` (Prometheus).
+7. **HealthcheckServer** — `127.0.0.1:9090/health` and `/metrics` (Prometheus).
+   (Phase 4 Part 2.10 removed the `HeartbeatLogger`; the healthcheck endpoint
+   is the machine-readable liveness probe, the daily digest covers the
+   operator-facing "is it alive?" question.)
 
 SIGTERM/SIGINT trigger graceful shutdown.
 

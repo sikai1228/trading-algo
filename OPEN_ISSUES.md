@@ -49,9 +49,11 @@ the file/function involved, and a one-line action note.
   risk caps) plus the hardcoded approval-mode check. Async-loop
   dependency made the Telegram check awkward to add.
 - **Fix sketch:** wire an `asyncio.run(...)` block that sends
-  `/heartbeat` synthetically and waits for the bot's reply.
-- **Mitigation today:** runbook step "send `/heartbeat` from your
-  phone, confirm reply" before flipping to live.
+  `/status` synthetically and waits for the bot's reply.
+- **Mitigation today:** runbook step "send `/status` from your
+  phone, confirm reply" before flipping to live. (Phase 4 Part
+  2.10 removed `/heartbeat`; `/status` covers the on-demand
+  liveness check now.)
 
 ### 4. `import_kalshi_1099.py` discrepancies don't auto-Telegram
 

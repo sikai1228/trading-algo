@@ -14,7 +14,8 @@ Surface:
   non-allowlisted chats are silently dropped.
 - Outbound silent / audible messages: :meth:`send_text` accepts a
   ``silent`` flag wired to Telegram's ``disable_notification``. Used by
-  :class:`AlertDispatcher`, the heartbeat loop, and the daily digest.
+  :class:`AlertDispatcher` and the daily digest. (Phase 4 Part 2.10
+  removed the periodic heartbeat that was the third caller.)
 
 The bot validates ``chat_id`` against the allowlist (single chat in
 v1) on every inbound update; mismatches log a warning and return
@@ -211,10 +212,9 @@ class TelegramApprovalBot:
 
     async def send_text(self, text: str, *, silent: bool = True) -> None:
         """Send a one-way message to the allowlisted chat. Used by
-        :class:`AlertDispatcher`, the heartbeat loop, the daily digest,
-        and the settlement notifier. ``silent`` maps to Telegram's
-        ``disable_notification``; per spec, only critical alerts pass
-        ``silent=False``."""
+        :class:`AlertDispatcher`, the daily digest, and the settlement
+        notifier. ``silent`` maps to Telegram's ``disable_notification``;
+        per spec, only critical alerts pass ``silent=False``."""
         if self._app is None:
             raise RuntimeError("TelegramApprovalBot.start() has not been called")
         await self._app.bot.send_message(  # type: ignore[attr-defined]

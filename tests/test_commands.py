@@ -87,7 +87,6 @@ class TestDispatch:
             "history",
             "spend",
             "mode",
-            "heartbeat",
             "help",
         ):
             assert dispatch(name) is not None
@@ -201,11 +200,9 @@ class TestReadOnlyCommands:
 
 
 class TestSimpleCommands:
-    @pytest.mark.asyncio
-    async def test_heartbeat_returns_alive(self, tmp_path: Path) -> None:
-        db = _db(tmp_path)
-        out = await dispatch("heartbeat")(_ctx(db))  # type: ignore[misc]
-        assert "alive" in out.text
+    # Phase 4 Part 2.10 — test_heartbeat_returns_alive REMOVED with
+    # the /heartbeat command. See tests/test_no_heartbeat.py for the
+    # regression test pinning the surface stays gone.
 
     @pytest.mark.asyncio
     async def test_help_lists_commands(self, tmp_path: Path) -> None:
@@ -213,6 +210,8 @@ class TestSimpleCommands:
         out = await dispatch("help")(_ctx(db))  # type: ignore[misc]
         for c in ("/status", "/halt", "/resume"):
             assert c in out.text
+        # Heartbeat is gone (Phase 4 Part 2.10).
+        assert "/heartbeat" not in out.text
 
     @pytest.mark.asyncio
     async def test_mode_shows_dry_run(self, tmp_path: Path) -> None:

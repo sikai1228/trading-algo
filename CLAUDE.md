@@ -37,13 +37,16 @@ far:
   dry-run.
 - **Phase 3 Part 2** — operational features. Telegram command
   surface (`/status`, `/positions`, `/halt`, `/resume`, `/why`,
-  `/history`, `/heartbeat`, `/spend`, `/mode`). Scheduled messages
-  (heartbeat, daily digest, settlement notifications, source-health
-  alerts). Categorized alert system (critical/warning/info).
-  LLM-based subject-alias enrichment when new markets are
-  discovered. (Phase 4 Part 2.9 removed the per-ticker `/snooze`
-  and `/unsnooze` commands; `/halt` + `/resume` are the sole
-  operator override.)
+  `/history`, `/spend`, `/mode`). Scheduled messages (daily
+  digest, settlement notifications, source-health alerts).
+  Categorized alert system (critical/warning/info). LLM-based
+  subject-alias enrichment when new markets are discovered.
+  (Phase 4 Part 2.9 removed the per-ticker `/snooze` and
+  `/unsnooze` commands; `/halt` + `/resume` are the sole operator
+  override. Phase 4 Part 2.10 removed the periodic heartbeat
+  notification and the `/heartbeat` command; the morning daily
+  digest is the regular status notification, `/status` is on
+  demand.)
 
 ---
 
@@ -298,8 +301,8 @@ NOT construct strings inline. The grep test in CI enforces this.
 from trumpbot.notifications.templates import render_template
 
 rendered = render_template(
-    "heartbeat_periodic",
-    {"time_et": "14:23 ET", "open_count": 3, ...}
+    "daily_digest",
+    {"date": "2026-04-26", "closed_count": 5, ...}
 )
 await telegram_bot.send_text(rendered.text, silent=not rendered.audible)
 ```
@@ -316,9 +319,9 @@ await telegram_bot.send_text(rendered.text, silent=not rendered.audible)
 
 **Adding a new template:**
 1. Add an entry to `TEMPLATE_CATALOG` with `category` (one of:
-   `heartbeat`, `digest`, `trade_proposal`, `trade_outcome`,
-   `alert_critical`, `alert_warning`, `alert_info`, `command_reply`),
-   `audible` (only `True` for `alert_critical_*`), and `format` string.
+   `digest`, `trade_proposal`, `trade_outcome`, `alert_critical`,
+   `alert_warning`, `alert_info`, `command_reply`), `audible`
+   (only `True` for `alert_critical_*`), and `format` string.
 2. Document available fields in a comment above the template.
 3. Add a unit test rendering it.
 4. Update `scripts/preview_templates.py`'s `_SAMPLES` dict if you
@@ -362,12 +365,12 @@ severity, and sends to Telegram with the template's audibility.
 - `/halt` — pause new trade proposals (sets
   `system_state.halt_flag = 'true'`)
 - `/resume` — resume new trade proposals
-- `/heartbeat` — quick liveness check
 - `/help` — full command list
 
-(Phase 4 Part 2.9 removed `/snooze` and `/unsnooze`. The per-ticker
-silence didn't earn its operational complexity; `/halt` + `/resume`
-are the global override the operator uses.)
+(Phase 4 Part 2.9 removed `/snooze` and `/unsnooze`; `/halt` +
+`/resume` are the global override the operator uses. Phase 4 Part
+2.10 removed `/heartbeat`; `/status` covers on-demand liveness with
+richer information.)
 
 Validation: messages from non-allowlisted chat IDs are silently
 dropped with a warning log. Commands rate-limit at 30/min/chat
@@ -383,8 +386,9 @@ the user must still be able to approve emergency exits.
 
 ### Scheduled loops (in addition to the four Phase 2 decision loops)
 
-- `heartbeat_loop` — 15 min (configurable). Sends one-line
-  `heartbeat_periodic` to Telegram.
+(Phase 4 Part 2.10 removed `heartbeat_loop`; the morning daily
+digest is the regular status notification, `/status` is on demand.)
+
 - `daily_digest_loop` — once per day at `notifications.digest_hour_utc`
   (default 12 UTC = 8 AM ET in standard time). Renders `daily_digest`.
 - `settlement_notification_loop` — 5 min. Detects markets that resolved
@@ -1331,6 +1335,130 @@ trail; nothing to preserve).
 
 ---
 
+## Phase 4 Part 2.10 — heartbeat removed
+
+The periodic heartbeat is gone. The morning daily digest is the
+regular status notification; `/status` is on demand. Two
+heartbeat layers were removed in this PR:
+
+### What was removed
+
+1. **`HeartbeatLogger` class in `trumpbot/daemon.py`.** Wrote a
+   structured-log "heartbeat" event every 60 seconds with active
+   markets, ingested news count, matcher backlog, and per-source
+   poll timestamps. Added log noise without earning its keep —
+   the healthcheck endpoint (`/healthz` on port 9090) is the
+   machine-readable liveness probe; the daily digest covers
+   anything an operator would actually look at.
+
+2. **`heartbeat_loop` in `trumpbot/notifications/scheduled.py`.**
+   Sent the `heartbeat_periodic` Telegram template every N minutes
+   (default 60, aligned to wall-clock hour). Removed along with
+   `_build_heartbeat_data` and `_seconds_until_next_aligned_tick`.
+   The morning daily digest is the regular status notification now.
+
+3. **`/heartbeat` Telegram command + `handle_heartbeat` handler.**
+   `/status` answers the on-demand "is it alive?" question with
+   richer information.
+
+4. **`heartbeat_periodic` and `command_reply_heartbeat` templates**
+   are gone from `TEMPLATE_CATALOG`. The `heartbeat` value was
+   removed from the `Category` Literal in `templates.py`.
+
+5. **`Last heartbeat: ... (heartbeat_age ago)` line** dropped
+   from the `command_reply_status` template. The reply still
+   shows `Daemon uptime: ...`, which is the relevant liveness
+   indicator now.
+
+6. **Config fields:**
+   - `notifications.heartbeat_interval_minutes` (controlled
+     `heartbeat_loop` cadence)
+   - `daemon.heartbeat_interval_sec` (controlled
+     `HeartbeatLogger` cadence)
+
+   Both Pydantic sections (`NotificationsConfig`, `DaemonConfig`)
+   switched to `extra="ignore"` so legacy YAMLs with the old keys
+   load silently.
+
+7. **Wording cleanup in `_ALERT_WARNING_DB_SLOW`** — "Heartbeat
+   query took ..." became "Diagnostic query took ..." since the
+   only writer of that "heartbeat query" was the now-removed
+   `HeartbeatLogger`.
+
+### What stays
+
+- `daily_digest_loop` and the `daily_digest` template
+- `monthly_tax_digest_loop` and `monthly_tax_digest` template
+- `/status` command (the on-demand replacement for `/heartbeat`)
+- `/halt`, `/resume`, settlement notifications, alert system
+- The Kalshi WebSocket protocol-level ping/pong (`KalshiWS._heartbeat`)
+  — that's transport-layer keepalive, not user-facing
+
+### Operator-facing impact
+
+- No more `✓ HH:MM | open: N | today: ...` Telegram pings.
+- `/heartbeat` returns the unknown-command reply.
+- `/status` reply no longer shows "Last heartbeat" / "heartbeat_age";
+  it shows "Daemon uptime" instead.
+- Existing `~/.config/trumpbot/config.yaml` files keep working
+  whether or not they still contain `heartbeat_interval_minutes:` /
+  `heartbeat_interval_sec:` — those keys are silently ignored.
+- The structured stdout log loses the "heartbeat" event every 60s.
+  `journalctl`/`tail -f` against the daemon's stdout is now
+  quieter; use the `/healthz` HTTP endpoint or the daily digest
+  for liveness indication.
+
+### Tests
+
+`tests/test_no_heartbeat.py` is the new regression file. Pins:
+
+- Dispatcher returns `None` for `/heartbeat`
+- `HeartbeatLogger`, `heartbeat_loop`, `_build_heartbeat_data`,
+  `_seconds_until_next_aligned_tick`, `handle_heartbeat` all
+  un-importable
+- `heartbeat_periodic` and `command_reply_heartbeat` not in the
+  catalog
+- `heartbeat` not in any template's category
+- `/status` rendered text contains no "Last heartbeat" / "heartbeat_age"
+  line
+- `/help` rendered text does not list `/heartbeat`
+- `heartbeat_interval_minutes` not in `NotificationsConfig.model_fields`
+- `heartbeat_interval_sec` not in `DaemonConfig.model_fields`
+- A YAML carrying both legacy keys still loads (the silent-ignore
+  behavior must not flip back to `extra="forbid"`)
+- Source inspection on `daemon._amain` rejects any `tasks["heartbeat":]`
+  / `HeartbeatLogger(` / `heartbeat.run` / `heartbeat.stop()` /
+  `heartbeat_loop(` substring
+
+### File map for Phase 4 Part 2.10
+
+- `tests/test_no_heartbeat.py` (new — regression)
+- `tests/test_halt.py`, `tests/test_commands.py`,
+  `tests/test_templates.py`, `tests/test_alerts.py`,
+  `tests/test_scheduled.py` — heartbeat sections deleted, /help
+  + /status assertions updated
+- `trumpbot/daemon.py` — `HeartbeatLogger` class deleted, task
+  registration + shutdown call removed
+- `trumpbot/notifications/scheduled.py` — `heartbeat_loop`,
+  `_build_heartbeat_data`, `_seconds_until_next_aligned_tick`
+  removed; `__all__` updated
+- `trumpbot/notifications/commands.py` — `handle_heartbeat`
+  removed, dispatch entry removed, `last_heartbeat` /
+  `heartbeat_age` fields dropped from `/status` data dict
+- `trumpbot/notifications/templates.py` — `_HEARTBEAT_PERIODIC`
+  and `_COMMAND_REPLY_HEARTBEAT` templates removed; `heartbeat`
+  removed from `Category` Literal; `Last heartbeat:` line dropped
+  from `_COMMAND_REPLY_STATUS`; `/heartbeat` line dropped from
+  `_COMMAND_REPLY_HELP`; `_ALERT_WARNING_DB_SLOW` text wording
+  fixed to no longer say "Heartbeat query"
+- `trumpbot/config.py` — `heartbeat_interval_minutes` removed
+  from `NotificationsConfig`, `heartbeat_interval_sec` removed
+  from `DaemonConfig`, both switched to `extra="ignore"`
+- `config/config.example.yaml` — heartbeat fields commented out
+- `scripts/preview_templates.py` — sample data refreshed
+
+---
+
 ## Phase 4 deployment readiness
 
 Phase 4 Part 1 + Part 2.1 are verified end-to-end. The combined
@@ -1345,7 +1473,7 @@ To go live:
    must pass.
 2. Deposit ≥ $100 on Kalshi.
 3. Verify production credentials in `~/.config/trumpbot/secrets.env`.
-4. Send `/heartbeat` to the bot from your phone, confirm reply.
+4. Send `/status` to the bot from your phone, confirm reply.
 5. Edit `cfg.execution.mode = "live"` in `config.yaml`.
 6. `deploy/setup_macos.sh` to redeploy.
 7. Watch `~/Library/Logs/trumpbot/stdout.log` for the

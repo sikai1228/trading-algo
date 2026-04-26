@@ -115,7 +115,9 @@ logging:
   format: "json"
 
 daemon:
-  heartbeat_interval_sec: 60
+  # Phase 4 Part 2.10 — `heartbeat_interval_sec` was REMOVED with
+  # the HeartbeatLogger. Section retained as a placeholder for
+  # future daemon-level knobs; legacy keys are silently ignored.
 
 discovery:
   # Monthly KXTRUMPMEET event auto-discovery. The service polls
@@ -212,10 +214,11 @@ bankroll:
 # ----- Phase 3 Part 2: operational features -----------------------------
 
 notifications:
-  # Send a one-line ✓ heartbeat to Telegram every N minutes, ALIGNED
-  # to the wall-clock hour boundary. Default 60 → fires at HH:00 of
-  # every hour. If set to 15 it would fire at :00 / :15 / :30 / :45.
-  heartbeat_interval_minutes: 60
+  # Phase 4 Part 2.10 — `heartbeat_interval_minutes` was REMOVED.
+  # The morning daily digest is the regular status notification;
+  # /status answers the on-demand "is it alive?" question. Legacy
+  # keys are silently ignored.
+
   # Daily-digest fires once at this UTC hour (12 UTC ≈ 8 AM ET in
   # standard time; 13 UTC ≈ 9 AM ET in daylight time).
   digest_hour_utc: 12

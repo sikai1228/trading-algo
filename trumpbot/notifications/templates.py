@@ -24,12 +24,14 @@ template entry. Calling :func:`render_template` with extra fields is
 fine (they're ignored by ``.format``); calling with a missing field
 raises :class:`KeyError`, surfacing the bug at the boundary.
 
-Adding a template: pick a category (``heartbeat`` / ``digest`` /
-``trade_outcome`` / ``trade_proposal`` / ``alert_critical`` /
-``alert_warning`` / ``alert_info`` / ``command_reply``), set audibility
-(``True`` only for ``alert_critical``; everything else silent), write
-the format string. Add a unit test rendering it with a sample data
-dict.
+Adding a template: pick a category (``digest`` / ``trade_outcome``
+/ ``trade_proposal`` / ``alert_critical`` / ``alert_warning`` /
+``alert_info`` / ``command_reply``), set audibility (``True`` only
+for ``alert_critical``; everything else silent), write the format
+string. Add a unit test rendering it with a sample data dict.
+
+(Phase 4 Part 2.10 removed the ``heartbeat`` category along with
+the periodic-heartbeat templates.)
 """
 
 from __future__ import annotations
@@ -38,7 +40,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 Category = Literal[
-    "heartbeat",
     "digest",
     "trade_outcome",
     "trade_proposal",
@@ -100,19 +101,11 @@ def render_template(name: str, data: dict[str, Any]) -> RenderedMessage:
 
 
 # ---------------------------------------------------------------------------
-# Heartbeat + digest
+# Daily digest
 # ---------------------------------------------------------------------------
-
-_HEARTBEAT_PERIODIC = MessageTemplate(
-    category="heartbeat",
-    audible=False,
-    # fields: time_et, open_count, today_pnl, llm_today, llm_cap,
-    #         sources_active, sources_total
-    format=(
-        "✓ {time_et} | open: {open_count} | today: {today_pnl} | "
-        "LLM: {llm_today}/{llm_cap} | sources: {sources_active}/{sources_total}"
-    ),
-)
+# Phase 4 Part 2.10 — _HEARTBEAT_PERIODIC and the ``heartbeat``
+# category were REMOVED. The morning daily digest is the regular
+# status notification now.
 
 _DAILY_DIGEST = MessageTemplate(
     category="digest",
@@ -388,8 +381,8 @@ _ALERT_WARNING_DB_SLOW = MessageTemplate(
     audible=False,
     # fields: query_duration, threshold
     format=(
-        "⚠️ Database performance degraded performance degraded\n\n"
-        "Heartbeat query took {query_duration} (threshold {threshold})\n"
+        "⚠️ Database performance degraded\n\n"
+        "Diagnostic query took {query_duration} (threshold {threshold})\n"
         "This may indicate index issue or disk pressure.\n\n"
         "Run `python -m scripts.db_diagnose` for detail."
     ),
@@ -533,8 +526,10 @@ _COMMAND_REPLY_STATUS = MessageTemplate(
     # fields: execution_mode, approval_mode, halt_status,
     #         bankroll, deposit_status, open_count, unrealized_pnl,
     #         today_pnl, month_pnl, sources_active, sources_total,
-    #         llm_mtd, llm_cap, llm_pct, last_heartbeat, heartbeat_age,
-    #         uptime
+    #         llm_mtd, llm_cap, llm_pct, uptime
+    # Phase 4 Part 2.10 — last_heartbeat / heartbeat_age dropped
+    # along with the heartbeat loop. ``uptime`` is the relevant
+    # liveness indicator now.
     format=(
         "🤖 Bot Status\n\n"
         "Mode: {execution_mode} | approval: {approval_mode}\n"
@@ -545,7 +540,6 @@ _COMMAND_REPLY_STATUS = MessageTemplate(
         "This month: {month_pnl} realized\n\n"
         "System: {sources_active}/{sources_total} sources active\n"
         "LLM spend MTD: {llm_mtd} / {llm_cap} ({llm_pct})\n\n"
-        "Last heartbeat: {last_heartbeat} ({heartbeat_age} ago)\n"
         "Daemon uptime: {uptime}"
     ),
 )
@@ -659,12 +653,9 @@ _COMMAND_REPLY_RESUME = MessageTemplate(
 # were REMOVED with the /snooze and /unsnooze commands. /halt + /resume
 # are the global override; per-ticker snooze is gone.
 
-_COMMAND_REPLY_HEARTBEAT = MessageTemplate(
-    category="command_reply",
-    audible=False,
-    # fields: time_et
-    format="✓ {time_et} | I'm alive",
-)
+# Phase 4 Part 2.10 — _COMMAND_REPLY_HEARTBEAT was REMOVED with the
+# /heartbeat command. /status answers the on-demand "is it alive?"
+# question with richer information.
 
 _COMMAND_REPLY_SPEND = MessageTemplate(
     category="command_reply",
@@ -708,7 +699,6 @@ _COMMAND_REPLY_HELP = MessageTemplate(
         "  /mode                         current execution + approval mode\n"
         "  /halt                         pause new trade proposals\n"
         "  /resume                       resume new trade proposals\n"
-        "  /heartbeat                    quick liveness check\n"
         "  /shadow_report [Nd]           auto-approve simulation (default 7d)\n"
         "  /reconcile_resolve <trade_id> acknowledge a reconcile drift row\n"
         "  /tax_summary [year]           year-to-date realized gains / losses\n"
@@ -1000,8 +990,7 @@ _MONTHLY_TAX_DIGEST = MessageTemplate(
 # ---------------------------------------------------------------------------
 
 TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
-    # Heartbeat + digest
-    "heartbeat_periodic": _HEARTBEAT_PERIODIC,
+    # Daily digest
     "daily_digest": _DAILY_DIGEST,
     # Trade proposals (the approval-flow messages)
     "trade_proposal_entry": _TRADE_PROPOSAL_ENTRY,
@@ -1042,7 +1031,6 @@ TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
     "command_reply_history": _COMMAND_REPLY_HISTORY,
     "command_reply_halt": _COMMAND_REPLY_HALT,
     "command_reply_resume": _COMMAND_REPLY_RESUME,
-    "command_reply_heartbeat": _COMMAND_REPLY_HEARTBEAT,
     "command_reply_spend": _COMMAND_REPLY_SPEND,
     "command_reply_mode": _COMMAND_REPLY_MODE,
     "command_reply_help": _COMMAND_REPLY_HELP,

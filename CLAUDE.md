@@ -51,12 +51,23 @@ A news match becomes a buy intent **only if all** of:
 **Sizing**:
 
 - Base: `8% × confidence` of total bankroll
-- Cap: `2%` during the **first 30 days** of live trading; `10%` thereafter
-  (live-trading window driven by `bankroll.live_trading_started_at`; if
-  None, the conservative first-30-days cap applies)
-- Floor: `1%` of bankroll
+- Cap: **fixed dollar amount**, default `$20.00` per trade
+  (`decision.position_size_cap_usd_cents = 2000`). The user controls
+  strategy exposure by managing the deposit on Kalshi rather than via
+  percentage knobs that ramp on a date.
 - Quantity: `floor(target_size_usd_cents / yes_ask_cents)`; if the result is
   zero, the intent is dropped
+- No date-based cap ramping. No `live_trading_started_at` field.
+
+**Why a fixed dollar cap.** A percentage cap conflates two unrelated
+controls — "how much of my Kalshi balance is at risk per trade" and
+"how aggressively does the strategy size on signal strength." With a
+fixed cap, those two are orthogonal: signal strength (confidence)
+scales the target up to the ceiling, and the user adjusts strategy
+exposure by depositing more or less on Kalshi. Bankroll still
+governs the **30 % total-exposure cap** across all open positions
+and is referenced in reasoning text, but no longer dictates per-
+trade sizing.
 
 ### Stop-loss rules — `DecisionEngine.evaluate_stop_loss`
 
@@ -87,8 +98,10 @@ buy intents (entry/reentry), it runs in this order:
 3. **Price ceiling** — `yes_ask_cents <= max_buy_price_cents`
 4. **Bankroll** — proposed cost <= `available_bankroll_usd_cents`
 5. **Total exposure cap** — proposed cost + open exposure <= `30%` of bankroll
-6. **Per-trade size cap** — proposed cost <= per-window cap (2% / 10%); the
-   manager may **adjust the quantity downward** to fit, then re-check
+6. **Per-trade size cap** — proposed cost <= `position_size_cap_usd_cents`
+   (fixed dollar, default $20.00); the manager may **adjust the
+   quantity downward** to fit, then re-check. Rejects only if the cap is
+   so tight even one contract doesn't fit (`size_cap_below_one_contract`).
 
 For stop-loss intents, the gate confirms the position is still open and
 emits a `RiskApprovedOrder` for the close.

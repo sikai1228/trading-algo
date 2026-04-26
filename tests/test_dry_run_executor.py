@@ -80,7 +80,7 @@ def _seed_match(db: Database) -> int:
 def _approve(db: Database, intent: TradeIntent | StopLossIntent) -> RiskApprovedOrder:
     rm = RiskManager(db=db, config=RiskConfig())
     state = RiskState(
-        bankroll=BankrollState(50000, 0, None),
+        bankroll=BankrollState(50000, 0),
         open_position_tickers=(
             frozenset({intent.ticker}) if isinstance(intent, StopLossIntent) else frozenset()
         ),

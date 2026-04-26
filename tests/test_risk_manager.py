@@ -6,7 +6,6 @@ from rejections (cap reduces quantity, doesn't reject)."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -34,12 +33,10 @@ def _bankroll(
     *,
     bankroll_usd_cents: int = 50000,
     open_position_cost_usd_cents: int = 0,
-    live_started: datetime | None = None,
 ) -> BankrollState:
     return BankrollState(
         bankroll_usd_cents=bankroll_usd_cents,
         open_position_cost_usd_cents=open_position_cost_usd_cents,
-        live_trading_started_at=live_started,
     )
 
 
@@ -177,30 +174,47 @@ class TestRejections:
         assert out.reason == "exposure_cap_exceeded"
 
     def test_size_cap_engages_with_quantity_adjustment(self, tmp_path: Path) -> None:
-        # First-30-days cap binds — engine should APPROVE with adjusted_quantity.
+        """Fixed $20 cap binds — risk APPROVES with adjusted_quantity.
+
+        $30 intent (60 contracts at 50c) > $20 cap → reduces qty to
+        $20/50c = 40 contracts."""
         rm = RiskManager(db=_db(tmp_path), config=RiskConfig())
-        live = datetime.now(UTC) - timedelta(days=10)
         out = rm.evaluate(
-            _intent(target_price_cents=50, target_quantity=20),  # $10
-            _state(bankroll=_bankroll(bankroll_usd_cents=10000, live_started=live)),
+            _intent(target_price_cents=50, target_quantity=60),  # $30
+            _state(bankroll=_bankroll(bankroll_usd_cents=50000)),  # $500
         )
-        # 2% of $100 bankroll = $2 cap. $2 / 50¢ = 4 contracts.
         assert isinstance(out, RiskApprovedOrder)
-        assert out.adjusted_quantity == 4
+        assert out.adjusted_quantity == 40
 
     def test_size_cap_below_one_contract_rejects(self, tmp_path: Path) -> None:
-        rm = RiskManager(db=_db(tmp_path), config=RiskConfig())
-        live = datetime.now(UTC) - timedelta(days=1)
-        # Bankroll $20 (2000 cents). Per-trade cap 2% = 40¢ < one
-        # contract at 80¢. Use a 5-contract intent ($4) so the
-        # exposure cap (30% x $20 = $6) doesn't preempt the
-        # per-trade-size guard.
+        """Cap so tight that even one contract doesn't fit. Use a custom
+        config with a $0.50 cap and an 80c intent — 50/80 = 0 contracts
+        → reject."""
+        rm = RiskManager(
+            db=_db(tmp_path),
+            config=RiskConfig(position_size_cap_usd_cents=50),  # $0.50 cap
+        )
         out = rm.evaluate(
             _intent(target_price_cents=80, target_quantity=5),  # $4
-            _state(bankroll=_bankroll(bankroll_usd_cents=2000, live_started=live)),
+            _state(bankroll=_bankroll(bankroll_usd_cents=50000)),
         )
         assert isinstance(out, RiskRejection)
         assert out.reason == "size_cap_below_one_contract"
+
+    def test_size_cap_value_read_from_config(self, tmp_path: Path) -> None:
+        """Override `position_size_cap_usd_cents` and confirm the
+        adjustment math respects it. $50 cap, $30 intent (60 contracts
+        at 50c) → no adjustment because $30 < $50."""
+        rm = RiskManager(
+            db=_db(tmp_path),
+            config=RiskConfig(position_size_cap_usd_cents=5000),  # $50 cap
+        )
+        out = rm.evaluate(
+            _intent(target_price_cents=50, target_quantity=60),  # $30
+            _state(bankroll=_bankroll(bankroll_usd_cents=50000)),
+        )
+        assert isinstance(out, RiskApprovedOrder)
+        assert out.adjusted_quantity is None  # cap not engaged
 
     def test_stop_loss_position_not_open(self, tmp_path: Path) -> None:
         rm = RiskManager(db=_db(tmp_path), config=RiskConfig())

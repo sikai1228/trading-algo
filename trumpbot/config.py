@@ -70,11 +70,13 @@ class DecisionPhaseConfig(BaseModel):
     llm_confidence_threshold: float = 0.85
     max_buy_price_cents: int = 80
     position_size_base_pct: float = 0.08
-    position_size_cap_first_30_days_pct: float = 0.02
-    position_size_cap_after_30_days_pct: float = 0.10
+    position_size_cap_usd_cents: int = 2000
+    """Hard fixed-dollar cap on per-trade size, in USDCents. Default
+    $20.00 = 2000c. The user controls strategy exposure by managing
+    the deposit on Kalshi rather than via percentage caps."""
+
     total_exposure_cap_pct: float = 0.30
     stop_loss_drop_cents: int = 50
-    minimum_position_size_pct: float = 0.01
     decision_loop_interval_sec: int = 10
     stop_loss_loop_interval_sec: int = 60
     position_marking_loop_interval_sec: int = 60
@@ -101,9 +103,6 @@ class ExecutionPhaseConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: str = "dry_run"
-    live_trading_started_at: str | None = None
-    """ISO-8601 UTC timestamp when live trading started (drives the
-    30-day position-cap window)."""
 
 
 class BankrollConfig(BaseModel):

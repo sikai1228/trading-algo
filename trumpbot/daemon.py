@@ -175,11 +175,9 @@ async def _amain(config_path: Path) -> int:
             llm_confidence_threshold=cfg.decision.llm_confidence_threshold,
             max_buy_price_cents=cfg.decision.max_buy_price_cents,
             position_size_base_pct=cfg.decision.position_size_base_pct,
-            position_size_cap_first_30_days_pct=cfg.decision.position_size_cap_first_30_days_pct,
-            position_size_cap_after_30_days_pct=cfg.decision.position_size_cap_after_30_days_pct,
+            position_size_cap_usd_cents=cfg.decision.position_size_cap_usd_cents,
             total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
             stop_loss_drop_cents=cfg.decision.stop_loss_drop_cents,
-            minimum_position_size_pct=cfg.decision.minimum_position_size_pct,
         )
     )
     risk_manager = RiskManager(
@@ -188,8 +186,7 @@ async def _amain(config_path: Path) -> int:
             enabled=cfg.risk.enabled,
             max_buy_price_cents=cfg.decision.max_buy_price_cents,
             total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
-            position_size_cap_first_30_days_pct=cfg.decision.position_size_cap_first_30_days_pct,
-            position_size_cap_after_30_days_pct=cfg.decision.position_size_cap_after_30_days_pct,
+            position_size_cap_usd_cents=cfg.decision.position_size_cap_usd_cents,
             halted=cfg.risk.halted,
         ),
     )
@@ -289,7 +286,6 @@ async def _amain(config_path: Path) -> int:
                     executor=dry_run_executor,
                     orderbook=_orderbook,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
-                    live_started_at=cfg.execution.live_trading_started_at,
                     poll_interval_sec=cfg.decision.decision_loop_interval_sec,
                     stop_event=stop_event,
                 ),
@@ -307,7 +303,6 @@ async def _amain(config_path: Path) -> int:
                     executor=dry_run_executor,
                     orderbook=_orderbook,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
-                    live_started_at=cfg.execution.live_trading_started_at,
                     poll_interval_sec=cfg.decision.stop_loss_loop_interval_sec,
                     stop_event=stop_event,
                 ),
@@ -336,7 +331,6 @@ async def _amain(config_path: Path) -> int:
                     executor=dry_run_executor,
                     orderbook=_orderbook,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
-                    live_started_at=cfg.execution.live_trading_started_at,
                     poll_interval_sec=cfg.decision.reentry_loop_interval_sec,
                     stop_event=stop_event,
                 ),

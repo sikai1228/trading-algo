@@ -112,8 +112,7 @@ class Backtester:
             enabled=True,
             max_buy_price_cents=self._cfg.max_buy_price_cents,
             total_exposure_cap_pct=self._cfg.total_exposure_cap_pct,
-            position_size_cap_first_30_days_pct=(self._cfg.position_size_cap_first_30_days_pct),
-            position_size_cap_after_30_days_pct=(self._cfg.position_size_cap_after_30_days_pct),
+            position_size_cap_usd_cents=self._cfg.position_size_cap_usd_cents,
             halted=False,
         )
         self._engine = DecisionEngine(self._cfg)
@@ -160,7 +159,6 @@ class Backtester:
                     open_position_cost_usd_cents=sum(
                         t.entry_price_cents * t.quantity for t in open_positions.values()
                     ),
-                    live_trading_started_at=None,
                 )
                 intent = self._engine.evaluate_news_match(snap, market_state, None, bankroll)
                 if intent is None:

@@ -7,8 +7,6 @@ threshold drifts.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-
 from trumpbot.decision.engine import (
     BankrollState,
     DecisionConfig,
@@ -55,12 +53,10 @@ def _bankroll(
     *,
     bankroll_usd_cents: int = 50000,
     open_position_cost_usd_cents: int = 0,
-    live_started: datetime | None = None,
 ) -> BankrollState:
     return BankrollState(
         bankroll_usd_cents=bankroll_usd_cents,
         open_position_cost_usd_cents=open_position_cost_usd_cents,
-        live_trading_started_at=live_started,
     )
 
 
@@ -141,33 +137,61 @@ class TestEvaluateNewsMatch:
             is None
         )
 
-    def test_first_30_days_cap_engaged(self) -> None:
-        # Live started 5 days ago: 2% cap binds.
-        live = datetime.now(UTC) - timedelta(days=5)
-        bank = _bankroll(bankroll_usd_cents=100000, live_started=live)
-        intent = _engine().evaluate_news_match(_match(confidence=0.9), _market(), None, bank)
+    def test_fixed_cap_engages_when_target_above_20_dollars(self) -> None:
+        """$500 bankroll x 8% x 0.95 = $38 unconstrained → cap to $20.
+        At 50c/contract that's 40 contracts ($20.00) exactly."""
+        bank = _bankroll(bankroll_usd_cents=50000)
+        intent = _engine().evaluate_news_match(_match(confidence=0.95), _market(), None, bank)
         assert intent is not None
-        # 2% of $1000 = $20 cap; at 50¢/contract = 40 contracts.
+        assert intent.target_size_usd_cents == 2000
         assert intent.target_quantity == 40
 
-    def test_after_30_days_cap_relaxes_to_10pct(self) -> None:
-        live = datetime.now(UTC) - timedelta(days=60)
-        bank = _bankroll(bankroll_usd_cents=100000, live_started=live)
-        intent = _engine().evaluate_news_match(_match(confidence=0.9), _market(), None, bank)
-        assert intent is not None
-        # base 8% x 0.9 = 7.2% ; cap 10%. 7.2% of $1000 = $72 → 144 @ 50c.
-        assert intent.target_quantity == 144
+    def test_fixed_cap_not_engaged_when_target_below_cap(self) -> None:
+        """$200 bankroll x 8% x 0.5 = $8 unconstrained → cap NOT engaged.
+        $8 / 50c = 16 contracts ($8.00).
 
-    def test_minimum_one_percent_floor(self) -> None:
-        # At a low confidence (just above threshold) the base 8% x 0.85 =
-        # 6.8% is above the 1% floor, so the floor doesn't bind here.
-        # But on an extremely small bankroll the cap forces below the
-        # floor, so the floor should rescue us. Confirm with a tiny
-        # bankroll that the engine still emits a 1-contract intent.
-        bank = _bankroll(bankroll_usd_cents=10000)
-        intent = _engine().evaluate_news_match(_match(confidence=0.85), _market(), None, bank)
+        Note: confidence=0.5 is below the LLM threshold (0.85), so the
+        engine would normally drop the match before sizing. We override
+        the threshold here to isolate the sizing behavior."""
+        from trumpbot.decision.engine import DecisionConfig
+
+        eng = DecisionEngine(DecisionConfig(llm_confidence_threshold=0.5))
+        bank = _bankroll(bankroll_usd_cents=20000)
+        intent = eng.evaluate_news_match(_match(confidence=0.5), _market(), None, bank)
         assert intent is not None
-        assert intent.target_quantity >= 1
+        assert intent.target_size_usd_cents == 800
+        assert intent.target_quantity == 16
+
+    def test_cap_value_read_from_config(self) -> None:
+        """Override `position_size_cap_usd_cents` and confirm the
+        engine respects it. $500 x 8% x 0.95 = $38 → cap at $10 = 1000c
+        → 20 contracts at 50c."""
+        from trumpbot.decision.engine import DecisionConfig
+
+        eng = DecisionEngine(DecisionConfig(position_size_cap_usd_cents=1000))
+        bank = _bankroll(bankroll_usd_cents=50000)
+        intent = eng.evaluate_news_match(_match(confidence=0.95), _market(), None, bank)
+        assert intent is not None
+        assert intent.target_size_usd_cents == 1000
+        assert intent.target_quantity == 20
+
+    def test_reasoning_text_says_cap_engaged_when_engaged(self) -> None:
+        bank = _bankroll(bankroll_usd_cents=50000)
+        intent = _engine().evaluate_news_match(_match(confidence=0.95), _market(), None, bank)
+        assert intent is not None
+        # When the cap is engaged the text cites the unconstrained
+        # confidence-scaled target ($38) and the $20 cap.
+        assert "capped at fixed $20.00" in intent.reasoning_text
+        assert "$38" in intent.reasoning_text
+
+    def test_reasoning_text_says_under_cap_when_not_engaged(self) -> None:
+        from trumpbot.decision.engine import DecisionConfig
+
+        eng = DecisionEngine(DecisionConfig(llm_confidence_threshold=0.5))
+        bank = _bankroll(bankroll_usd_cents=20000)
+        intent = eng.evaluate_news_match(_match(confidence=0.5), _market(), None, bank)
+        assert intent is not None
+        assert "under $20.00 cap" in intent.reasoning_text
 
     def test_below_one_contract_returns_none(self) -> None:
         # $5 bankroll cannot afford a single contract at 80¢.
@@ -202,7 +226,8 @@ class TestEvaluateNewsMatch:
         assert "reuters_via_gnews" in text
         assert "0.9" in text
         assert "80c" in text
-        assert "% of bankroll" in text
+        # Sizing rationale always quotes the dollar cap.
+        assert "$20.00" in text
 
 
 # ---------------------------------------------------------------------------

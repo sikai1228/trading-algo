@@ -14,10 +14,9 @@ so the audit trail is complete.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
 from trumpbot.db.connection import Database
-from trumpbot.decision.engine import BankrollState, _within_first_30_days
+from trumpbot.decision.engine import BankrollState
 from trumpbot.types.intents import (
     RISK_APPROVAL_TOKEN,
     AnyIntent,
@@ -36,13 +35,17 @@ class RiskConfig:
     ``halted`` is the stub for the Phase-3 ``/halt`` command. Phase 2
     leaves it False; setting it True makes every check fail with
     ``trading_halted`` and is how Phase 3 will plug in the kill switch.
+
+    The per-trade size cap is a fixed dollar amount
+    (``position_size_cap_usd_cents``), default $20.00 = 2000c. The user
+    controls strategy exposure by managing the deposit on Kalshi rather
+    than via percentage caps that ramp on a date.
     """
 
     enabled: bool = True
     max_buy_price_cents: int = 80
     total_exposure_cap_pct: float = 0.30
-    position_size_cap_first_30_days_pct: float = 0.02
-    position_size_cap_after_30_days_pct: float = 0.10
+    position_size_cap_usd_cents: int = 2000
     halted: bool = False
 
 
@@ -124,16 +127,11 @@ class RiskManager:
                 "total_exposure_cap_pct",
             )
 
-        # 3. Per-trade size cap (engages adjustment, does not reject)
+        # 3. Per-trade size cap (fixed dollar amount; engages adjustment,
+        # does not reject unless the cap is too tight for one contract).
         adjusted_quantity: int | None = None
         adjustment_reason: str | None = None
-        live_started = state.bankroll.live_trading_started_at
-        per_trade_cap_pct = (
-            self._cfg.position_size_cap_first_30_days_pct
-            if _within_first_30_days(_now_for_state(state), live_started)
-            else self._cfg.position_size_cap_after_30_days_pct
-        )
-        per_trade_cap_cents = int(state.bankroll.bankroll_usd_cents * per_trade_cap_pct)
+        per_trade_cap_cents = self._cfg.position_size_cap_usd_cents
         if intent.target_size_usd_cents > per_trade_cap_cents:
             new_qty = per_trade_cap_cents // intent.target_price_cents
             if new_qty < 1:
@@ -143,11 +141,11 @@ class RiskManager:
                     "size_cap_below_one_contract",
                     f"per-trade cap ${per_trade_cap_cents/100:.2f} less than one "
                     f"contract at {intent.target_price_cents}c",
-                    "position_size_cap",
+                    "position_size_cap_usd_cents",
                 )
             adjustment_reason = (
-                f"per-trade cap reduced quantity from {intent.target_quantity} to "
-                f"{new_qty} (cap {per_trade_cap_pct*100:.0f}% of bankroll)"
+                f"fixed-dollar cap reduced quantity from {intent.target_quantity} to "
+                f"{new_qty} (cap ${per_trade_cap_cents/100:.2f})"
             )
             adjusted_quantity = new_qty
 
@@ -258,12 +256,6 @@ class RiskManager:
             rule_fired=rule_fired,
             reasoning_text=reasoning_text,
         )
-
-
-def _now_for_state(state: RiskState) -> datetime:
-    """Tz-aware now. Hook for tests to inject a frozen clock if needed."""
-    del state  # unused now; retained for future test hookability
-    return datetime.now(UTC)
 
 
 __all__ = ["RiskConfig", "RiskManager", "RiskState"]

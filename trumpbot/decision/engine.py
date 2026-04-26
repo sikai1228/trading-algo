@@ -16,7 +16,7 @@ test suite and the rules section together.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from trumpbot.types.intents import (
     ReentryIntent,
@@ -32,12 +32,14 @@ class DecisionConfig:
     llm_confidence_threshold: float = 0.85
     max_buy_price_cents: int = 80
     position_size_base_pct: float = 0.08
-    position_size_cap_first_30_days_pct: float = 0.02
-    position_size_cap_after_30_days_pct: float = 0.10
+    position_size_cap_usd_cents: int = 2000
+    """Hard fixed-dollar cap on per-trade size, in USDCents. Default
+    $20.00 = 2000c. Replaces the previous time-windowed percentage cap;
+    the user controls strategy exposure by managing the deposit on
+    Kalshi rather than via per-trade percentage knobs."""
+
     total_exposure_cap_pct: float = 0.30
     stop_loss_drop_cents: int = 50
-    minimum_position_size_pct: float = 0.01
-    """Minimum percent of bankroll. Floor for confidence-scaled sizing."""
 
 
 @dataclass(frozen=True)
@@ -90,7 +92,14 @@ class Position:
 
 @dataclass(frozen=True)
 class BankrollState:
-    """Snapshot of bankroll + open exposure at evaluation time."""
+    """Snapshot of bankroll + open exposure at evaluation time.
+
+    The fixed-dollar cap migration removed the ``live_trading_started_at``
+    field — there's no longer a time-based switch. Bankroll still
+    governs the 30 % total exposure cap and is referenced in the
+    reasoning text, but per-trade sizing is dictated by
+    :attr:`DecisionConfig.position_size_cap_usd_cents`.
+    """
 
     bankroll_usd_cents: int
     """Total starting bankroll, in USDCents."""
@@ -98,24 +107,10 @@ class BankrollState:
     open_position_cost_usd_cents: int
     """Sum of cost_basis across all open positions."""
 
-    live_trading_started_at: datetime | None
-    """When live trading began. Drives the 30-day position cap window.
-
-    None means live trading hasn't started, so the conservative
-    first-30-days cap applies.
-    """
-
     @property
     def available_bankroll_usd_cents(self) -> int:
         """Bankroll minus already-deployed cost basis."""
         return max(0, self.bankroll_usd_cents - self.open_position_cost_usd_cents)
-
-
-def _within_first_30_days(now_utc: datetime, started_at: datetime | None) -> bool:
-    if started_at is None:
-        return True
-    delta = now_utc - started_at
-    return delta < timedelta(days=30)
 
 
 class DecisionEngine:
@@ -144,9 +139,12 @@ class DecisionEngine:
         """Return a :class:`TradeIntent` or ``None`` per the strategy rules.
 
         See ``CLAUDE.md`` §"Phase 2 Strategy Rules" for the canonical
-        spec these checks implement.
+        spec these checks implement. ``now_utc`` is retained for
+        backwards compatibility with callers (and for future
+        timestamp-aware checks); the fixed-cap migration removed the
+        only place it was actually used.
         """
-        now = now_utc or datetime.now(UTC)
+        del now_utc  # currently unused after the fixed-cap migration
 
         # Rule 1 — confidence threshold
         if match.confidence < self._cfg.llm_confidence_threshold:
@@ -179,17 +177,15 @@ class DecisionEngine:
         if market_state.yes_ask_cents > self._cfg.max_buy_price_cents:
             return None
 
-        # Rule 6/7/8 — confidence-scaled sizing with cap and floor
-        target_pct = self._cfg.position_size_base_pct * (match.confidence / 1.0)
-        cap_pct = (
-            self._cfg.position_size_cap_first_30_days_pct
-            if _within_first_30_days(now, bankroll.live_trading_started_at)
-            else self._cfg.position_size_cap_after_30_days_pct
-        )
-        sized_pct = min(target_pct, cap_pct)
-        sized_pct = max(sized_pct, self._cfg.minimum_position_size_pct)
-
-        target_size_usd_cents = int(round(bankroll.bankroll_usd_cents * sized_pct))
+        # Rule 6/7/8 — confidence-scaled sizing capped at a fixed
+        # dollar amount (default $20.00). Integer-cents arithmetic
+        # everywhere; the only float is the percentage used to size
+        # against bankroll, and we round once to int cents at the
+        # boundary so there's no float drift.
+        target_pct = self._cfg.position_size_base_pct * match.confidence
+        unconstrained_size_cents = int(round(bankroll.bankroll_usd_cents * target_pct))
+        cap_engaged = unconstrained_size_cents > self._cfg.position_size_cap_usd_cents
+        target_size_usd_cents = min(unconstrained_size_cents, self._cfg.position_size_cap_usd_cents)
 
         # Rule 9/10 — convert to integer contracts at the ask
         ask = market_state.yes_ask_cents
@@ -203,8 +199,10 @@ class DecisionEngine:
         reasoning = _build_entry_reasoning(
             match=match,
             market_state=market_state,
-            target_pct=sized_pct,
-            cap_pct=cap_pct,
+            target_pct=target_pct,
+            unconstrained_size_cents=unconstrained_size_cents,
+            cap_cents=self._cfg.position_size_cap_usd_cents,
+            cap_engaged=cap_engaged,
             target_quantity=target_quantity,
             cost_cents=actual_cost_cents,
             bankroll=bankroll,
@@ -378,24 +376,41 @@ def _build_entry_reasoning(
     match: MatchSnapshot,
     market_state: MarketState,
     target_pct: float,
-    cap_pct: float,
+    unconstrained_size_cents: int,
+    cap_cents: int,
+    cap_engaged: bool,
     target_quantity: int,
     cost_cents: int,
     bankroll: BankrollState,
 ) -> str:
     """Multi-line human-readable rationale for the future Telegram message
-    and the trades.reasoning_text audit row."""
-    pct_of_bankroll = cost_cents / bankroll.bankroll_usd_cents if bankroll.bankroll_usd_cents else 0
-    pct_str = f"{pct_of_bankroll * 100:.1f}%"
+    and the trades.reasoning_text audit row.
+
+    The size justification line distinguishes the two cases: cap engaged
+    vs cap not engaged. The format matches the spec in CLAUDE.md
+    §"Phase 2 strategy rules — sizing".
+    """
+    if cap_engaged:
+        size_line = (
+            f"Position size: ${cost_cents / 100:.2f} "
+            f"({target_quantity} contracts at {market_state.yes_ask_cents}c each). "
+            f"Confidence-scaled target was ${unconstrained_size_cents / 100:.2f} "
+            f"but capped at fixed ${cap_cents / 100:.2f} limit per "
+            f"config.position_size_cap_usd."
+        )
+    else:
+        size_line = (
+            f"Position size: ${cost_cents / 100:.2f} "
+            f"({target_quantity} contracts at {market_state.yes_ask_cents}c each). "
+            f"Confidence-scaled at {target_pct * 100:.1f}% of bankroll, "
+            f"under ${cap_cents / 100:.2f} cap."
+        )
     lines = [
         f"Source {match.source_name} (weight={match.source_weight}) classified an article "
         f"matching {match.ticker} at confidence {match.confidence:.2f}, with "
         f"interaction_occurred=true.",
         f"Current YES ask is {market_state.yes_ask_cents}c (max-buy ceiling 80c).",
-        f"Confidence-scaled position: {target_pct * 100:.1f}% of bankroll, capped at "
-        f"{cap_pct * 100:.1f}% by the live-trading window cap.",
-        f"Resulting order: {target_quantity} contracts at {market_state.yes_ask_cents}c, "
-        f"cost basis ${cost_cents / 100:.2f} ({pct_str} of bankroll).",
+        size_line,
     ]
     return "\n".join(lines)
 

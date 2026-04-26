@@ -37,20 +37,16 @@ from trumpbot.execution.dry_run import DryRunExecutor, Quote
 from trumpbot.risk.manager import RiskManager, RiskState
 from trumpbot.types.intents import RiskApprovedOrder, RiskRejection
 from trumpbot.utils.logging import get_logger
-from trumpbot.utils.timeutil import parse_iso
 
 log = get_logger(__name__)
 
 OrderbookFn = Callable[[str], Quote]
 
 
-def _bankroll_state(
-    db: Database, *, starting_amount_usd: float, live_started_at: str | None
-) -> BankrollState:
+def _bankroll_state(db: Database, *, starting_amount_usd: float) -> BankrollState:
     return BankrollState(
         bankroll_usd_cents=int(round(starting_amount_usd * 100)),
         open_position_cost_usd_cents=total_open_position_cost_cents(db),
-        live_trading_started_at=parse_iso(live_started_at),
     )
 
 
@@ -68,7 +64,6 @@ async def decision_loop(
     executor: DryRunExecutor,
     orderbook: OrderbookFn,
     starting_amount_usd: float,
-    live_started_at: str | None,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
 ) -> None:
@@ -84,7 +79,6 @@ async def decision_loop(
                 executor=executor,
                 orderbook=orderbook,
                 starting_amount_usd=starting_amount_usd,
-                live_started_at=live_started_at,
             )
         except asyncio.CancelledError:
             raise
@@ -111,7 +105,6 @@ async def _run_decision_cycle(
     executor: DryRunExecutor,
     orderbook: OrderbookFn,
     starting_amount_usd: float,
-    live_started_at: str | None,
 ) -> None:
     matches = _fetch_unevaluated_matches(db)
     if not matches:
@@ -123,9 +116,7 @@ async def _run_decision_cycle(
             continue
         position_row = get_open_trade_for_ticker(db, ticker)
         position = _row_to_position(position_row)
-        bankroll = _bankroll_state(
-            db, starting_amount_usd=starting_amount_usd, live_started_at=live_started_at
-        )
+        bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
         snap = _row_to_snapshot(match, market_row)
         market_state = _market_state(orderbook, ticker)
         intent = engine.evaluate_news_match(snap, market_state, position, bankroll)
@@ -158,7 +149,6 @@ async def stop_loss_loop(
     executor: DryRunExecutor,
     orderbook: OrderbookFn,
     starting_amount_usd: float,
-    live_started_at: str | None,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
 ) -> None:
@@ -179,11 +169,7 @@ async def stop_loss_loop(
                 stop_intent = engine.evaluate_stop_loss(position, market_state)
                 if stop_intent is None:
                     continue
-                bankroll = _bankroll_state(
-                    db,
-                    starting_amount_usd=starting_amount_usd,
-                    live_started_at=live_started_at,
-                )
+                bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
                 state = RiskState(bankroll=bankroll, open_position_tickers=_open_tickers(db))
                 decision = risk.evaluate(stop_intent, state)
                 if isinstance(decision, RiskRejection):
@@ -237,7 +223,6 @@ async def reentry_loop(
     executor: DryRunExecutor,
     orderbook: OrderbookFn,
     starting_amount_usd: float,
-    live_started_at: str | None,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
 ) -> None:
@@ -259,11 +244,7 @@ async def reentry_loop(
                     continue
                 snap = _row_to_snapshot(match, market_row)
                 market_state = _market_state(orderbook, ticker)
-                bankroll = _bankroll_state(
-                    db,
-                    starting_amount_usd=starting_amount_usd,
-                    live_started_at=live_started_at,
-                )
+                bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
                 prior_position = _row_to_position(prior_row)
                 if prior_position is None:
                     continue

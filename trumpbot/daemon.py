@@ -212,6 +212,10 @@ async def _amain(config_path: Path) -> int:
 
     telegram_bot: TelegramApprovalBot | None = None
     requester: object
+    # Phase 4 Part 2.1 — exports live next to the database so the
+    # operator can browse / commit them with the rest of the
+    # persistent state.
+    exports_dir = db_path.parent / "exports"
     if cfg.telegram.bot_token and cfg.telegram.chat_id:
         telegram_bot = TelegramApprovalBot(
             bot_token=cfg.telegram.bot_token,
@@ -219,6 +223,8 @@ async def _amain(config_path: Path) -> int:
             db=db,
             cost_guard=cost_guard,
             bankroll_usd_cents=int(round(cfg.bankroll.starting_amount_usd * 100)),
+            exports_dir=exports_dir,
+            default_export_format=cfg.tax_tracking.default_export_format,
         )
         await telegram_bot.start()
         requester = telegram_bot
@@ -484,6 +490,7 @@ async def _amain(config_path: Path) -> int:
         from trumpbot.notifications.scheduled import (
             daily_digest_loop,
             heartbeat_loop,
+            monthly_tax_digest_loop,
             settlement_notification_loop,
             source_health_loop,
         )
@@ -543,6 +550,24 @@ async def _amain(config_path: Path) -> int:
                 critical=False,
             )
         )
+        # Phase 4 Part 2.1 — monthly tax digest. Off by default if the
+        # operator disables it in config; per-trade tax columns are
+        # populated regardless.
+        if cfg.tax_tracking.monthly_digest_enabled:
+            tasks["monthly_tax_digest_loop"] = asyncio.create_task(
+                _supervised(
+                    lambda: monthly_tax_digest_loop(
+                        db=db,
+                        send_text=_send_text,
+                        exports_dir=exports_dir,
+                        fire_day=cfg.tax_tracking.monthly_digest_day,
+                        fire_time_et=cfg.tax_tracking.monthly_digest_time_et,
+                        stop_event=stop_event,
+                    ),
+                    "monthly_tax_digest_loop",
+                    critical=False,
+                )
+            )
 
     # ---- Phase 4 Part 1: live-mode side tasks ------------------------
     # Bankroll sync + settlement detector run only in live mode (they

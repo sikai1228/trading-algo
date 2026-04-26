@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
+from pathlib import Path
 
 from trumpbot.db.connection import Database
 from trumpbot.notifications.commands import (
@@ -75,6 +76,8 @@ class TelegramApprovalBot:
         bankroll_usd_cents: int = 50000,
         sources_total: int = 0,
         rate_limit_per_minute: int = 30,
+        exports_dir: Path | None = None,
+        default_export_format: str = "csv",
     ) -> None:
         self._token = bot_token
         self.chat_id = chat_id
@@ -96,6 +99,9 @@ class TelegramApprovalBot:
         self._sources_total = sources_total
         self._sources_active = sources_total
         self._rate_limiter = CommandRateLimiter(max_per_minute=rate_limit_per_minute)
+        # Phase 4 Part 2.1: tax exports need a writable directory.
+        self._exports_dir = exports_dir
+        self._default_export_format = default_export_format
         from datetime import UTC, datetime
 
         self._daemon_started_at = datetime.now(UTC)
@@ -280,6 +286,8 @@ class TelegramApprovalBot:
             daemon_started_at=self._daemon_started_at,
             sources_total=self._sources_total,
             sources_active=self._sources_active,
+            exports_dir=self._exports_dir,
+            default_export_format=self._default_export_format,
         )
         try:
             rendered = await handler(ctx)

@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from trumpbot.db.connection import Database
@@ -459,10 +460,267 @@ def _humanize_duration(td: timedelta) -> str:
 _ = (get_source_status, get_system_state, list_active_snoozed_markets)
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 Part 2.1 — monthly tax digest
+# ---------------------------------------------------------------------------
+
+
+_ET_TZ = "America/New_York"
+
+
+def _seconds_until_next_monthly_tick(
+    *,
+    fire_day: int,
+    fire_time_et: str,
+    now: datetime | None = None,
+) -> float:
+    """Compute the seconds-from-now until the next monthly digest tick.
+
+    ``fire_day`` is the calendar day of the month (1..28 to be safe
+    across all months). ``fire_time_et`` is ``HH:MM`` local Eastern
+    Time. We compute everything in ET and convert to UTC for the
+    sleep duration, so EST/EDT transitions don't drift the firing
+    time.
+    """
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo(_ET_TZ)
+    now_et = (now or datetime.now(UTC)).astimezone(et)
+    hh, mm = (int(x) for x in fire_time_et.split(":"))
+
+    def _candidate(year: int, month: int) -> datetime:
+        # Clamp fire_day to month's actual length; e.g. day=31 in Feb
+        # rolls back to the 28th/29th. We never overshoot to next month.
+        import calendar
+
+        last_day = calendar.monthrange(year, month)[1]
+        day = min(fire_day, last_day)
+        return datetime(year, month, day, hh, mm, tzinfo=et)
+
+    candidate = _candidate(now_et.year, now_et.month)
+    if candidate <= now_et:
+        # Roll to next month.
+        next_month = now_et.month + 1
+        next_year = now_et.year
+        if next_month > 12:
+            next_month = 1
+            next_year += 1
+        candidate = _candidate(next_year, next_month)
+    return (candidate - now_et).total_seconds()
+
+
+def _previous_month_bounds(*, now: datetime | None = None) -> tuple[date, date, str, int, int]:
+    """Return ``(month_start, month_end_inclusive, month_name, year, month_index)``
+    for the calendar month before ``now``.
+
+    Used so the digest fired on the 1st of N covers month N-1 in full.
+    """
+    n = (now or datetime.now(UTC)).date()
+    # First day of current month → step back one day → that's last
+    # day of previous month.
+    first_of_current = n.replace(day=1)
+    prev_end = first_of_current - timedelta(days=1)
+    prev_start = prev_end.replace(day=1)
+    month_name = prev_start.strftime("%B")
+    return prev_start, prev_end, month_name, prev_start.year, prev_start.month
+
+
+async def monthly_tax_digest_loop(
+    *,
+    db: Database,
+    send_text: SendTextFn,
+    exports_dir: Path | None,
+    fire_day: int = 1,
+    fire_time_et: str = "09:00",
+    stop_event: asyncio.Event,
+) -> None:
+    """Send the ``monthly_tax_digest`` template once per month at
+    ``fire_day`` of the month, ``fire_time_et`` Eastern. Also writes
+    ``data/exports/monthly/YYYY-MM.csv`` with the previous month's
+    full trade log so the operator has the per-trade detail right
+    next to the digest.
+
+    Idempotent: if the daemon restarts between sleep and fire, the
+    next iteration computes the same target time and sleeps again.
+    Worst case (daemon down across the firing instant) the digest
+    silently skips that month — committed CSVs in
+    ``data/exports/monthly/`` cover the audit trail regardless.
+    """
+    from pathlib import Path as _Path
+
+    from trumpbot.exports.tax_exports import (
+        TaxExporter,
+        _bare_dollars,
+        _dollars_str,
+        write_export,
+    )
+
+    component = "monthly_tax_digest_loop"
+    log.info(
+        f"{component}_started",
+        fire_day=fire_day,
+        fire_time_et=fire_time_et,
+    )
+    while not stop_event.is_set():
+        try:
+            sleep_for = _seconds_until_next_monthly_tick(
+                fire_day=fire_day, fire_time_et=fire_time_et
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
+                break
+            except TimeoutError:
+                pass
+
+            (
+                _prev_start,
+                prev_end,
+                month_name,
+                prev_year,
+                prev_month,
+            ) = _previous_month_bounds()
+
+            # Pull aggregate stats from the previous month's tax_year +
+            # disposed_date filter. Reuse TaxExporter where possible
+            # for shape consistency with /tax_summary.
+            exporter = TaxExporter(db)
+            month_rows = list(
+                db.connect().execute(
+                    """
+                    SELECT t.*, m.title AS market_title
+                      FROM trades t
+                      LEFT JOIN markets m ON m.ticker = t.ticker
+                     WHERE t.tax_year = ?
+                       AND substr(t.disposed_date, 6, 2) = ?
+                     ORDER BY t.disposed_date
+                    """,
+                    (prev_year, f"{prev_month:02d}"),
+                )
+            )
+            count = len(month_rows)
+            wins = sum(1 for r in month_rows if int(r["realized_gain_loss_cents"] or 0) > 0)
+            losses = count - wins
+            win_rate = int(round(100 * wins / count)) if count else 0
+            pnl_cents = sum(int(r["realized_gain_loss_cents"] or 0) for r in month_rows)
+            fees = sum(
+                int(r["entry_fees_cents"] or 0) + int(r["exit_fees_cents"] or 0) for r in month_rows
+            )
+            slip = sum(int(r["slippage_cents"] or 0) for r in month_rows)
+            largest_gain = 0
+            largest_gain_t = "-"
+            largest_loss = 0
+            largest_loss_t = "-"
+            for r in month_rows:
+                gl = int(r["realized_gain_loss_cents"] or 0)
+                if gl > largest_gain:
+                    largest_gain = gl
+                    largest_gain_t = r["ticker"]
+                if gl < -largest_loss:
+                    largest_loss = -gl
+                    largest_loss_t = r["ticker"]
+            holding = [r["holding_period_days"] for r in month_rows if r["holding_period_days"]]
+            avg_holding = int(round(sum(holding) / len(holding))) if holding else 0
+            ytd_summary = exporter.export_yearly_summary(prev_year)
+
+            # Save monthly CSV — use the same columns as /tax_export csv
+            # but scoped to the month. Easiest: re-run the trade log
+            # builder filtered to month-of-disposal.
+            month_str = f"{prev_year}-{prev_month:02d}"
+            base_dir = exports_dir or _Path("data/exports")
+            csv_path = base_dir / "monthly" / f"{month_str}.csv"
+            # The /tax_export csv path covers a full year. For the
+            # monthly file, write a trimmed variant — same columns,
+            # filtered to disposed_date in the month.
+            month_csv = _build_monthly_csv(month_rows)
+            write_export(csv_path, month_csv)
+
+            data = {
+                "month_name": month_name,
+                "year": prev_year,
+                "count": count,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": win_rate,
+                "pnl": _dollars_str(pnl_cents),
+                "fees": _dollars_str(fees),
+                "slippage": _dollars_str(slip),
+                "largest_gain": _bare_dollars(largest_gain),
+                "largest_gain_ticker": largest_gain_t,
+                "largest_loss": _bare_dollars(largest_loss),
+                "largest_loss_ticker": largest_loss_t,
+                "avg_holding_days": avg_holding,
+                "month": f"{prev_month:02d}",
+                "ytd_pnl": _dollars_str(ytd_summary.net_pnl_cents),
+            }
+            rendered = render_template("monthly_tax_digest", data)
+            await send_text(rendered.text, True)
+            log.info(f"{component}_fired", month=month_str, csv=str(csv_path))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover -- defensive
+            log.error(f"{component}_error", error=repr(exc))
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=3600)
+    log.info(f"{component}_stopped")
+
+
+def _build_monthly_csv(rows: list[Any]) -> str:
+    """Same CSV columns as TaxExporter._trade_log_csv, filtered to the
+    rows the caller already pre-fetched (one calendar month)."""
+    import csv as _csv
+    import io as _io
+
+    from trumpbot.exports.tax_exports import (
+        _bare_dollars,
+        _market_description,
+        _resolution_outcome,
+    )
+
+    buf = _io.StringIO()
+    w = _csv.writer(buf, quoting=_csv.QUOTE_MINIMAL, lineterminator="\n")
+    w.writerow(
+        [
+            "trade_id",
+            "ticker",
+            "market_description",
+            "acquired_date",
+            "disposed_date",
+            "holding_period_days",
+            "quantity",
+            "acquisition_cost_usd",
+            "disposal_proceeds_usd",
+            "realized_gain_loss_usd",
+            "status",
+            "resolution_outcome",
+            "notes",
+        ]
+    )
+    for r in rows:
+        w.writerow(
+            [
+                r["id"],
+                r["ticker"],
+                _market_description(r, r["market_title"]),
+                r["acquired_date"] or "",
+                r["disposed_date"] or "",
+                r["holding_period_days"] if r["holding_period_days"] is not None else "",
+                r["quantity"],
+                _bare_dollars(r["acquisition_cost_cents"]),
+                _bare_dollars(r["disposal_proceeds_cents"]),
+                _bare_dollars(r["realized_gain_loss_cents"]),
+                r["status"],
+                _resolution_outcome(r["status"]),
+                (r["reasoning_text"] or "").replace("\n", " ")[:400],
+            ]
+        )
+    return buf.getvalue()
+
+
 __all__ = [
     "SendTextFn",
     "daily_digest_loop",
     "heartbeat_loop",
+    "monthly_tax_digest_loop",
     "settlement_notification_loop",
     "source_health_loop",
 ]

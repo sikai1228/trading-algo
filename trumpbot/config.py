@@ -154,6 +154,40 @@ class NotificationsConfig(BaseModel):
     rate_limit_commands_per_minute: int = 30
 
 
+class TaxTrackingConfig(BaseModel):
+    """Phase 4 Part 2.1 — tax tracking knobs.
+
+    All amounts in the bot already use integer cents; this config is
+    pure metadata about WHEN exports run and HOW the operator wants
+    them formatted.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    """Master switch. Off → no monthly digest loop is started, but
+    the tax columns are still populated on every trade lifecycle."""
+
+    user_tax_year_start: str = "01-01"
+    """MM-DD that opens the operator's tax year. Almost always
+    01-01 (US calendar year). Configurable for non-US filers or
+    fiscal-year operators down the road."""
+
+    default_export_format: str = "csv"
+    """One of csv / json / form_8949. /tax_export uses this when the
+    user omits the format argument."""
+
+    monthly_digest_enabled: bool = True
+    """If False, the monthly_tax_digest_loop task is not started."""
+
+    monthly_digest_day: int = 1
+    """Calendar day of the month the digest fires."""
+
+    monthly_digest_time_et: str = "09:00"
+    """HH:MM local Eastern Time the digest fires. ET is the
+    operator's display timezone (CLAUDE.md macOS deployment notes)."""
+
+
 class AliasEnrichmentConfig(BaseModel):
     """LLM-enrichment knobs. ``monthly_cap_usd_cents`` doubles as the
     cap for the future classifier -- one budget for all Anthropic
@@ -233,6 +267,8 @@ class TrumpbotConfig(BaseModel):
     # Phase 3 Part 2.
     notifications: NotificationsConfig = Field(default_factory=lambda: NotificationsConfig())
     alias_enrichment: AliasEnrichmentConfig = Field(default_factory=lambda: AliasEnrichmentConfig())
+    # Phase 4 Part 2.1 — tax tracking + exports.
+    tax_tracking: TaxTrackingConfig = Field(default_factory=lambda: TaxTrackingConfig())
 
 
 def _expand_env(value: Any) -> Any:

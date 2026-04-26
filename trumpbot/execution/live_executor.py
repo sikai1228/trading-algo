@@ -192,6 +192,7 @@ class KalshiExecutor:
             exit_price_cents=payoff_cents,
             realized_pnl_usd_cents=realized,
             exited_at=_utcnow_iso(),
+            exit_fees_cents=0,  # Kalshi fee formula returns 0 at p=0 / p=100
         )
         return ExecutionResult(
             trade_id=row["id"],
@@ -578,8 +579,13 @@ class KalshiExecutor:
                 notes=f"stop-loss FOK kill: status={order.status}",
             )
 
+        from trumpbot.execution.fees import calculate_exit_fee_cents
+
         actual_exit_price = order.avg_fill_price or bid
-        proceeds = actual_exit_price * filled
+        # Phase 4 Part 2.1: track exit fee on the close so the
+        # disposal_proceeds_cents reflects net proceeds.
+        exit_fees = calculate_exit_fee_cents(actual_exit_price, filled)
+        proceeds = actual_exit_price * filled - exit_fees
         realized = proceeds - intent.cost_basis_usd_cents
         close_trade(
             self._db,
@@ -588,6 +594,7 @@ class KalshiExecutor:
             exit_price_cents=actual_exit_price,
             realized_pnl_usd_cents=realized,
             exited_at=_utcnow_iso(),
+            exit_fees_cents=exit_fees,
         )
         log.info(
             "kalshi_executor_stop_loss_filled",

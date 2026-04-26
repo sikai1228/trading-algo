@@ -29,17 +29,24 @@ the credentials + network + Kalshi auth are working end-to-end.
     <key>Label</key>
     <string>com.trumpbot.daemon</string>
 
+    <!-- Wrapper script sources ~/.config/trumpbot/secrets.env so the
+         daemon's config-loader env-var substitution gets populated.
+         launchd doesn't read the user's shell profile or ~/.config
+         dotfiles. Without this wrapper, TELEGRAM_BOT_TOKEN /
+         ANTHROPIC_API_KEY / KALSHI_API_KEY_ID etc. arrive as empty
+         strings, the Telegram bot doesn't start, and /commands fall
+         silently into Telegram's queue. -->
+    <!-- Wrapper lives under ~/Library/Application Support/ (NOT
+         ~/Desktop/) because macOS TCC restricts launchd-spawned
+         processes from reading Desktop / Documents / Downloads
+         without "Full Disk Access" entitlement. The daemon's
+         WorkingDirectory still points at the repo on Desktop, but
+         launchd only needs to be able to EXEC the wrapper here.
+         deploy/setup_macos.sh copies the wrapper into place. -->
     <key>ProgramArguments</key>
     <array>
-        <string>__HOME__/.local/bin/uv</string>
-        <string>run</string>
-        <string>--directory</string>
-        <string>__HOME__/Desktop/Auto Trading</string>
-        <string>python</string>
-        <string>-m</string>
-        <string>trumpbot</string>
-        <string>--config</string>
-        <string>__HOME__/.config/trumpbot/config.yaml</string>
+        <string>/bin/zsh</string>
+        <string>__HOME__/Library/Application Support/trumpbot/bin/run_trumpbot.sh</string>
     </array>
 
     <key>EnvironmentVariables</key>

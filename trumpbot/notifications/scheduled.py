@@ -118,8 +118,10 @@ def _build_heartbeat_data(
     else:
         llm_today = f"${cost_guard.month_to_date_cents() / 100:.2f}"
         llm_cap = f"${cost_guard.monthly_cap_usd_cents / 100:.2f}"
+    from zoneinfo import ZoneInfo
+
     return {
-        "time_et": datetime.now(UTC).strftime("%H:%M UTC"),
+        "time_et": datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).strftime("%H:%M ET"),
         "open_count": len(open_trades),
         "today_pnl": _signed(int(today_realized)),
         "llm_today": llm_today,
@@ -389,6 +391,9 @@ async def source_health_loop(
 async def _check_source_health(
     db: Database, dispatcher: AlertDispatcher, threshold_minutes: int
 ) -> None:
+    from zoneinfo import ZoneInfo
+
+    _ET = ZoneInfo("America/New_York")
     rows = list_source_status(db)
     threshold = timedelta(minutes=threshold_minutes)
     now = datetime.now(UTC)
@@ -410,7 +415,7 @@ async def _check_source_health(
                 template_name="alert_info_source_recovered",
                 data={
                     "source_name": r.source_name,
-                    "time_et": now.strftime("%H:%M UTC"),
+                    "time_et": now.astimezone(_ET).strftime("%H:%M ET"),
                     "outage_duration": outage,
                 },
             )
@@ -421,7 +426,7 @@ async def _check_source_health(
                 template_name="alert_warning_source_down",
                 data={
                     "source_name": r.source_name,
-                    "last_success_et": last_poll.replace("T", " ").replace("Z", " UTC")[:19],
+                    "last_success_et": last_dt.astimezone(_ET).strftime("%Y-%m-%d %H:%M ET"),
                     "duration_min": int(gap.total_seconds() // 60),
                     "attempt_summary": (f"failed for {int(gap.total_seconds() // 60)} min"),
                     "active_count": active,

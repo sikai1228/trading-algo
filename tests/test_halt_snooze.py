@@ -201,3 +201,32 @@ async def test_decision_cycle_no_op_when_halted(tmp_path: Path) -> None:
     )
     # Halted -> engine never consulted.
     assert engine.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Stop-loss bypass — Phase 3 Part 2 spec calls this out explicitly.
+# Snooze and halt block NEW entries; stop-losses on existing positions
+# must still fire so the user can approve emergency exits.
+# ---------------------------------------------------------------------------
+
+
+def test_stop_loss_loop_does_not_check_halt_or_snooze() -> None:
+    """The stop_loss_loop body must not call _is_halted or
+    is_market_snoozed -- the spec is explicit that stop-losses
+    bypass both flags. This is a structural test against the
+    decision/loops.py source so a future refactor that adds the
+    check fails loudly."""
+    import inspect
+
+    from trumpbot.decision import loops
+
+    src = inspect.getsource(loops.stop_loss_loop)
+    assert "_is_halted" not in src, (
+        "stop_loss_loop must NOT gate on /halt -- emergency exits must "
+        "always reach the user. Remove the _is_halted check."
+    )
+    assert "is_market_snoozed" not in src, (
+        "stop_loss_loop must NOT gate on /snooze -- snoozes block new "
+        "entries, not stop-losses on existing positions. Remove the "
+        "is_market_snoozed check."
+    )

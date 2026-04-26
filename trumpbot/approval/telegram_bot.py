@@ -227,6 +227,23 @@ class TelegramApprovalBot:
             return
         if msg.chat.id != self._chat_id_int:
             log.warning("telegram_command_from_unauthorized_chat", chat_id=msg.chat.id)
+            # Phase 3 Part 2 spec: write a system_events row so the
+            # operational audit log has a record of the rejection,
+            # not just the structlog stream.
+            if self._db is not None:
+                from trumpbot.db.repositories import insert_system_event
+
+                insert_system_event(
+                    self._db,
+                    event_type="unauthorized_command",
+                    severity="warning",
+                    component="telegram_bot",
+                    message=(
+                        f"command from unauthorized chat_id={msg.chat.id}; "
+                        f"text={(msg.text or '')[:120]!r}"
+                    ),
+                    detail={"chat_id": msg.chat.id, "text": (msg.text or "")[:120]},
+                )
             return
         if not self._rate_limiter.check(msg.chat.id):
             log.warning("telegram_command_rate_limited", chat_id=msg.chat.id)

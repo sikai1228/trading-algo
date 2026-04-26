@@ -90,10 +90,27 @@ def _stop_loss_data(intent: StopLossIntent) -> dict[str, object]:
 
 
 def _proposal_body_data(intent: TradeIntent | ReentryIntent, qty: int) -> dict[str, object]:
-    """Shared sub-template data for entry / re-entry templates."""
+    """Shared sub-template data for entry / re-entry templates.
+
+    Phase 4 Part 2.6: cap_two now references the live orderbook
+    instead of historical volume; the template surfaces both the
+    contract count cap_two would allow and the total available
+    contracts under the price ceiling.
+    """
+    # `available_contracts` isn't on the intent — derive it from the
+    # walk's levels_consumed plus the cap-two contract count when we
+    # can; fall back to "?" when the intent's `levels_consumed` was
+    # synthesized in a test fixture (no walk depth recorded).
+    available_contracts: int | str
+    if intent.levels_consumed:
+        available_contracts = sum(q for _p, q in intent.levels_consumed)
+    else:
+        available_contracts = "?"
     return {
         "cap_one_dollars": f"${intent.cap_one_value_cents / 100:.2f}",
         "cap_two_dollars": f"${intent.cap_two_value_cents / 100:.2f}",
+        "cap_two_contracts": intent.cap_two_contracts,
+        "available_contracts": available_contracts,
         "cap_binding": intent.cap_binding,
         "effective_cap_dollars": (f"${intent.target_size_usd_cents / 100:.2f}"),
         "quantity": qty,

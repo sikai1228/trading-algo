@@ -58,18 +58,30 @@ class DecisionConfig:
     strategy has live-traded data; configurable via the YAML field
     ``decision.position_size_hard_cap_usd``."""
 
-    position_size_volume_pct: float = 0.05
-    """Cap two — fraction of the market's total traded volume the
-    bot is willing to take in a single trade. Default 5 %.
+    position_size_orderbook_pct: float = 0.20
+    """Cap two — fraction of the YES contracts CURRENTLY available at
+    prices ≤ ``max_buy_price_cents`` that the bot is willing to take
+    in a single trade. Default 20 %.
 
-    .. note::
-       ``markets.volume`` is captured from Kalshi as a count of
-       contracts. We convert to a dollar-equivalent cap by treating
-       one contract as $1 of notional (i.e.,
-       ``cap_two_cents = volume * 100 * 0.05``). For a brand-new
-       market with no recorded volume, cap two evaluates to $0 and
-       trading on that ticker is effectively disabled until volume
-       develops.
+    Phase 4 Part 2.6 (rename + redefine): the previous semantics
+    used historical traded volume (5 % of ``markets.volume``).
+    Total volume is a poor proxy for current liquidity — a market
+    with a thick history but a thin live book would let the bot
+    place a trade that destroys the book on entry. The new
+    semantics directly target slippage: when the book is thin the
+    cap tightens automatically; when it's deep the cap expands.
+
+    Computation::
+
+        acceptable_levels = [(p, q) for p, q in yes_ask_levels
+                             if p <= max_buy_price_cents]
+        available = sum(q for _, q in acceptable_levels)
+        cap_two_contracts = floor(available * position_size_orderbook_pct)
+        avg_price = sum(p * q for p, q in acceptable_levels) // available
+        cap_two_cents = cap_two_contracts * avg_price
+
+    For a brand-new market with no live book (or every level above
+    the price ceiling), ``available == 0`` → engine skips the trade.
     """
 
     min_trade_size_contracts: int = 5
@@ -128,8 +140,10 @@ class MarketState:
 
     total_volume_traded_contracts: int = 0
     """Cumulative number of YES contracts traded over the market's
-    lifetime, sourced from ``markets.volume``. Phase 3 Part 1 uses
-    this to compute cap two = 5 % x volume x $1/contract."""
+    lifetime, sourced from ``markets.volume``. No longer used for
+    sizing — Phase 4 Part 2.6 redefined cap_two against live
+    orderbook depth. Kept on the snapshot because some downstream
+    logging / reasoning may surface it for context."""
 
 
 @dataclass(frozen=True)
@@ -290,17 +304,25 @@ class DecisionEngine:
 
         # ---- Rule 7/8/9 — two-cap system ----
         cap_one_cents = self._cfg.position_size_hard_cap_cents
-        # Cap two: 5 % of market volume. ``markets.volume`` is captured
-        # from Kalshi as a contract count; we treat 1 contract ≈ $1 of
-        # notional, so cap_two_cents = volume x 100 x 0.05 = volume x 5.
-        # See DecisionConfig.position_size_volume_pct for the rationale.
-        volume_dollars_cents = market_state.total_volume_traded_contracts * 100
-        cap_two_cents = int(volume_dollars_cents * self._cfg.position_size_volume_pct)
+        # Cap two: 20 % of YES contracts AVAILABLE at prices ≤
+        # max_buy_price_cents. Phase 4 Part 2.6 swap from
+        # historical-volume to live-orderbook-depth (rationale on
+        # DecisionConfig.position_size_orderbook_pct).
+        cap_two_contracts, cap_two_cents = _compute_cap_two_pure(
+            yes_ask_levels,
+            max_price_cents=self._cfg.max_buy_price_cents,
+            orderbook_pct=self._cfg.position_size_orderbook_pct,
+        )
+
+        # Skip on insufficient orderbook depth — engine returns None
+        # silently per the pure-function contract; the daemon loop
+        # logs the engine_returned_none case at the call site.
+        if cap_two_contracts < self._cfg.min_trade_size_contracts:
+            return None
+
         effective_cap_cents = min(cap_one_cents, cap_two_cents)
         cap_binding = _which_cap_binds(cap_one_cents, cap_two_cents)
 
-        # Cap-two-zero (brand-new market): trading is effectively
-        # disabled until volume develops. Drop with reasoning logged.
         if effective_cap_cents <= 0:
             return None
 
@@ -318,11 +340,19 @@ class DecisionEngine:
         if walk.total_cost_cents < self._cfg.min_trade_value_cents:
             return None
 
+        # Recompute available contracts for the reasoning text (cheap;
+        # the cap-two helper threw it away). Same filter the helper
+        # used so the numbers in the reasoning match the cap math.
+        available_contracts_for_reasoning = sum(
+            q for p, q in yes_ask_levels if 0 < p <= self._cfg.max_buy_price_cents and q > 0
+        )
         reasoning = _build_entry_reasoning(
             match=match,
             market_state=market_state,
             cap_one_cents=cap_one_cents,
             cap_two_cents=cap_two_cents,
+            cap_two_contracts=cap_two_contracts,
+            available_contracts=available_contracts_for_reasoning,
             cap_binding=cap_binding,
             effective_cap_cents=effective_cap_cents,
             walk=walk,
@@ -344,6 +374,7 @@ class DecisionEngine:
             cap_binding=cap_binding,
             cap_one_value_cents=cap_one_cents,
             cap_two_value_cents=cap_two_cents,
+            cap_two_contracts=cap_two_contracts,
             slippage_cents=walk.slippage_cents,
             levels_consumed=list(walk.levels_consumed),
             reasoning_text=reasoning,
@@ -456,6 +487,7 @@ class DecisionEngine:
             cap_binding=synthetic_intent.cap_binding,
             cap_one_value_cents=synthetic_intent.cap_one_value_cents,
             cap_two_value_cents=synthetic_intent.cap_two_value_cents,
+            cap_two_contracts=synthetic_intent.cap_two_contracts,
             slippage_cents=synthetic_intent.slippage_cents,
             levels_consumed=list(synthetic_intent.levels_consumed),
             reasoning_text=(
@@ -516,6 +548,34 @@ def _article_within_window(
     return True
 
 
+def _compute_cap_two_pure(
+    yes_ask_levels: Sequence[tuple[int, int]],
+    *,
+    max_price_cents: int,
+    orderbook_pct: float,
+) -> tuple[int, int]:
+    """Pure helper for the orderbook-depth cap-two computation.
+
+    Returns ``(cap_two_contracts, cap_two_value_cents)``. Both are
+    0 when the book is empty (or every level above the price
+    ceiling). Volume-weighted average price is used to translate the
+    contract count to a dollar amount comparable to ``cap_one``.
+
+    Pulled out as a module-level helper so tests can pin the math
+    independently of the full decision pipeline.
+    """
+    acceptable = [(p, q) for p, q in yes_ask_levels if 0 < p <= max_price_cents and q > 0]
+    available = sum(q for _p, q in acceptable)
+    if available <= 0:
+        return (0, 0)
+    cap_two_contracts = int(available * orderbook_pct)
+    if cap_two_contracts <= 0:
+        return (0, 0)
+    total_value_cents = sum(p * q for p, q in acceptable)
+    avg_price_cents = total_value_cents // available
+    return (cap_two_contracts, cap_two_contracts * avg_price_cents)
+
+
 def _which_cap_binds(cap_one_cents: int, cap_two_cents: int) -> CapBinding:
     """Return 'cap_one' / 'cap_two' / 'tie'. Used both in the engine's
     pipeline and in the reasoning-text builder so the labels stay
@@ -531,6 +591,8 @@ def _build_entry_reasoning(
     market_state: MarketState,
     cap_one_cents: int,
     cap_two_cents: int,
+    cap_two_contracts: int,
+    available_contracts: int,
     cap_binding: CapBinding,
     effective_cap_cents: int,
     walk: OrderbookWalkResult,
@@ -544,19 +606,30 @@ def _build_entry_reasoning(
     cites integer cents in dollars-formatted strings; nothing here
     feeds back into the engine's arithmetic."""
     best_ask = market_state.yes_ask_cents or 0
-    volume = market_state.total_volume_traded_contracts
     cap_one_dollars = f"${cap_one_cents / 100:.2f}"
     cap_two_dollars = f"${cap_two_cents / 100:.2f}"
     binding_label = {
         "cap_one": "Cap_one (hard $20)",
-        "cap_two": "Cap_two (5 % of volume)",
+        "cap_two": "Cap_two (20 % of acceptable orderbook depth)",
         "tie": "Tie — both caps equal",
     }.get(cap_binding, cap_binding)
 
+    # Phase 4 Part 2.6: cap_two now reflects live orderbook depth.
+    # Show the contract count under the price ceiling AND the
+    # 20%-of-depth subset, with the volume-weighted dollar value.
+    if available_contracts > 0 and cap_two_contracts > 0:
+        avg_price_cents = cap_two_cents // cap_two_contracts
+        cap_two_phrase = (
+            f"{cap_two_dollars} (20 % of {available_contracts} contracts "
+            f"available under 90c ceiling: {cap_two_contracts} contracts "
+            f"≈ {cap_two_dollars} at avg {avg_price_cents}c)"
+        )
+    else:
+        cap_two_phrase = f"{cap_two_dollars} (no acceptable depth in book)"
+
     cap_para = (
         f"Cap analysis: cap_one={cap_one_dollars}, "
-        f"cap_two={cap_two_dollars} (5 % of {volume} contracts of market "
-        f"volume). Binding: {binding_label}, sizing target "
+        f"cap_two={cap_two_phrase}. Binding: {binding_label}, sizing target "
         f"${effective_cap_cents / 100:.2f}."
     )
 

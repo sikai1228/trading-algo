@@ -124,11 +124,18 @@ class TradeIntent(_IntentBase):
     """``target_size_usd_cents + estimated_fees_cents``, for audit."""
 
     cap_binding: Literal["cap_one", "cap_two", "tie", "unknown"] = "unknown"
-    """Which cap (hard $20 or 5 % of volume) was binding at decision
-    time. ``tie`` when both equal; ``unknown`` for back-compat fixtures."""
+    """Which cap (hard $20 or 20 % of acceptable orderbook depth)
+    was binding at decision time. ``tie`` when both equal;
+    ``unknown`` for back-compat fixtures."""
 
     cap_one_value_cents: int = 0
     cap_two_value_cents: int = 0
+    cap_two_contracts: int = 0
+    """Phase 4 Part 2.6: number of contracts cap_two would allow,
+    derived as ``floor(available_acceptable_contracts x 0.20)``.
+    Persisted alongside the dollar value so the operator can see
+    both representations after the trade closes."""
+
     slippage_cents: int = 0
     """Average fill price minus best ask — the cost of depth."""
 
@@ -166,6 +173,9 @@ class ReentryIntent(_IntentBase):
     cap_binding: Literal["cap_one", "cap_two", "tie", "unknown"] = "unknown"
     cap_one_value_cents: int = 0
     cap_two_value_cents: int = 0
+    cap_two_contracts: int = 0
+    """Phase 4 Part 2.6 — same semantics as TradeIntent.cap_two_contracts."""
+
     slippage_cents: int = 0
     levels_consumed: list[tuple[int, int]] = []
 

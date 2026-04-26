@@ -297,6 +297,7 @@ class KalshiExecutor:
                 cap_binding=intent.cap_binding,
                 cap_one_value_cents=intent.cap_one_value_cents,
                 cap_two_value_cents=intent.cap_two_value_cents,
+                cap_two_contracts=intent.cap_two_contracts,
                 target_avg_fill_price_cents=intent.target_avg_fill_price_cents,
                 actual_avg_fill_price_cents=actual_avg,
                 slippage_cents=rewalk.slippage_cents,

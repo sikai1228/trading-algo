@@ -717,6 +717,12 @@ class TradeInsertRow:
 
     cap_one_value_cents: int | None = None
     cap_two_value_cents: int | None = None
+    cap_two_contracts: int | None = None
+    """Phase 4 Part 2.6: contract-count representation of cap_two
+    (``floor(available x 0.20)``). NULL on rows minted before
+    migration 009 — those were sized under the old volume semantics
+    and there's no way to reconstruct the live orderbook snapshot."""
+
     target_avg_fill_price_cents: int | None = None
     """The avg fill price the engine's walk predicted (decision time)."""
 
@@ -759,6 +765,7 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         risk_decision_id, approval_id, is_reentry, prior_trade_id,
         reasoning_text, entered_at, created_at,
         cap_binding, cap_one_value_cents, cap_two_value_cents,
+        cap_two_contracts,
         target_avg_fill_price_cents, actual_avg_fill_price_cents,
         slippage_cents, entry_fees_cents, levels_consumed_json,
         client_order_id, kalshi_order_id,
@@ -770,6 +777,7 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         :risk_decision_id, :approval_id, :is_reentry, :prior_trade_id,
         :reasoning_text, :entered_at, :now,
         :cap_binding, :cap_one_value_cents, :cap_two_value_cents,
+        :cap_two_contracts,
         :target_avg_fill_price_cents, :actual_avg_fill_price_cents,
         :slippage_cents, :entry_fees_cents, :levels_consumed_json,
         :client_order_id, :kalshi_order_id,

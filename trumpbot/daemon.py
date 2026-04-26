@@ -176,7 +176,7 @@ async def _amain(config_path: Path) -> int:
             max_buy_price_cents=cfg.decision.max_buy_price_cents,
             position_size_base_pct=cfg.decision.position_size_base_pct,
             position_size_hard_cap_cents=cfg.decision.position_size_hard_cap_cents,
-            position_size_volume_pct=cfg.decision.position_size_volume_pct,
+            position_size_orderbook_pct=cfg.decision.position_size_orderbook_pct,
             min_trade_size_contracts=cfg.decision.min_trade_size_contracts,
             min_trade_value_cents=cfg.decision.min_trade_value_cents,
             stop_loss_drop_cents=cfg.decision.stop_loss_drop_cents,

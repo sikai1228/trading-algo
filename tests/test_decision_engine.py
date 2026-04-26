@@ -199,14 +199,20 @@ class TestEvaluateNewsMatch:
             is None
         )
 
-    # ---- Two-cap system (Phase 3 Part 1) ----
+    # ---- Two-cap system (Phase 3 Part 1, redefined Phase 4 Part 2.6) ----
+    #
+    # Cap two now reflects LIVE orderbook depth: 20 % of YES contracts
+    # available at prices ≤ max_buy_price_cents (90c). Total historical
+    # volume on the market is no longer involved.
 
-    def test_cap_one_binds_when_market_volume_is_huge(self) -> None:
-        """Default $20 hard cap should bind on a high-volume market.
-        $20 budget at 50c -> 40 contracts ($20.00)."""
+    def test_cap_one_binds_when_book_is_deep(self) -> None:
+        """Default $20 hard cap should bind when the live book has
+        deep acceptable inventory. 10 000 contracts at 50c → cap_two
+        ≈ 20 % x 10 000 x 50c = $1000. Cap_one ($20) is much smaller
+        → cap_one binds. $20 budget at 50c → 40 contracts."""
         intent = _engine().evaluate_news_match(
             _match(confidence=0.9),
-            _market(volume=100_000),  # cap_two = 5% x 100k x $1 = $5000
+            _market(),
             None,
             _bankroll(),
             yes_ask_levels=_levels(qty=10_000),
@@ -214,47 +220,84 @@ class TestEvaluateNewsMatch:
         assert intent is not None
         assert intent.cap_binding == "cap_one"
         assert intent.cap_one_value_cents == 2000
-        assert intent.cap_two_value_cents == 500_000
+        # cap_two = floor(10000 x 0.20) x 50c = 2000 contracts x 50 = 100 000c
+        assert intent.cap_two_contracts == 2000
+        assert intent.cap_two_value_cents == 100_000
         assert intent.target_size_usd_cents == 2000
         assert intent.target_quantity == 40
 
-    def test_cap_two_binds_when_market_volume_is_thin(self) -> None:
-        """Volume = 200 contracts -> cap_two = 5 % x 200 x $1 = $10.
-        That's < $20 cap_one, so cap_two binds. $10 at 50c = 20 contracts."""
+    def test_cap_two_binds_when_book_is_thin(self) -> None:
+        """Thin book: only 50 contracts available at 50c. cap_two =
+        floor(50 x 0.20) = 10 contracts x 50c = $5.00, well under
+        cap_one ($20.00). cap_two binds. Walker fills $5.00 → 10
+        contracts at 50c."""
         intent = _engine().evaluate_news_match(
             _match(confidence=0.9),
-            _market(volume=200),
+            _market(),
             None,
             _bankroll(),
-            yes_ask_levels=_levels(qty=10_000),
+            yes_ask_levels=[(50, 50)],
         )
         assert intent is not None
         assert intent.cap_binding == "cap_two"
         assert intent.cap_one_value_cents == 2000
-        assert intent.cap_two_value_cents == 1000
-        assert intent.target_size_usd_cents == 1000
-        assert intent.target_quantity == 20
+        assert intent.cap_two_contracts == 10
+        assert intent.cap_two_value_cents == 500
+        assert intent.target_size_usd_cents == 500
+        assert intent.target_quantity == 10
 
-    def test_cap_two_zero_disables_trading_on_brand_new_market(self) -> None:
-        """No volume at all -> cap_two = 0 -> effective cap = 0 -> drop."""
+    def test_empty_book_skips_trade(self) -> None:
+        """Empty live book → no acceptable depth → engine returns
+        None (no_acceptable_liquidity scenario)."""
         out = _engine().evaluate_news_match(
             _match(),
-            _market(volume=0),
+            _market(),
             None,
             _bankroll(),
-            yes_ask_levels=_levels(qty=10_000),
+            yes_ask_levels=[],
+        )
+        assert out is None
+
+    def test_book_above_ceiling_skips_trade(self) -> None:
+        """Every level above the 90c ceiling → no acceptable depth →
+        engine returns None. Top-of-book pre-check actually catches
+        this earlier (best_ask > 90), but this still pins the
+        cap-two computation when somehow we reach it (e.g. matcher
+        finds a stale market)."""
+        out = _engine().evaluate_news_match(
+            _match(),
+            _market(yes_ask=95),
+            None,
+            _bankroll(),
+            yes_ask_levels=[(95, 1000)],
+        )
+        assert out is None
+
+    def test_book_too_thin_to_meet_min_trade_size_skips(self) -> None:
+        """Available = 20 contracts under ceiling. cap_two_contracts =
+        floor(20 x 0.20) = 4 < min_trade_size_contracts (5) → engine
+        skips with the below_minimum_after_orderbook_cap scenario."""
+        out = _engine().evaluate_news_match(
+            _match(),
+            _market(),
+            None,
+            _bankroll(),
+            yes_ask_levels=[(50, 20)],
         )
         assert out is None
 
     def test_caps_equal_reports_tie_binding(self) -> None:
-        """cap_one and cap_two equal -> binding = 'tie'.
-        Volume = 400 -> cap_two = $20 = cap_one."""
+        """cap_one and cap_two equal → binding = 'tie'.
+
+        For 200 contracts at 50c: cap_two_contracts = 40, cap_two =
+        40 x 50 = 2000c = $20 = cap_one → tie.
+        """
         intent = _engine().evaluate_news_match(
             _match(confidence=0.9),
-            _market(volume=400),
+            _market(),
             None,
             _bankroll(),
-            yes_ask_levels=_levels(qty=10_000),
+            yes_ask_levels=[(50, 200)],
         )
         assert intent is not None
         assert intent.cap_binding == "tie"
@@ -265,7 +308,7 @@ class TestEvaluateNewsMatch:
         eng = DecisionEngine(DecisionConfig(position_size_hard_cap_cents=1000))
         intent = eng.evaluate_news_match(
             _match(confidence=0.95),
-            _market(volume=100_000),
+            _market(),
             None,
             _bankroll(),
             yes_ask_levels=_levels(qty=10_000),
@@ -274,43 +317,71 @@ class TestEvaluateNewsMatch:
         assert intent.target_size_usd_cents == 1000
         assert intent.target_quantity == 20
 
-    def test_volume_pct_value_read_from_config(self) -> None:
+    def test_orderbook_pct_value_read_from_config(self) -> None:
         """Override cap_two pct and confirm the engine respects it.
-        10 % x 200 contracts x $1 = $20 — same as cap_one -> tie."""
-        eng = DecisionEngine(DecisionConfig(position_size_volume_pct=0.10))
+        Bumping to 40 % of the same thin book doubles cap_two."""
+        eng = DecisionEngine(DecisionConfig(position_size_orderbook_pct=0.40))
         intent = eng.evaluate_news_match(
             _match(confidence=0.9),
-            _market(volume=200),
+            _market(),
             None,
             _bankroll(),
-            yes_ask_levels=_levels(qty=10_000),
+            yes_ask_levels=[(50, 50)],
         )
         assert intent is not None
-        assert intent.cap_two_value_cents == 2000
+        # 40 % x 50 contracts = 20 contracts at 50c = $10.00
+        assert intent.cap_two_contracts == 20
+        assert intent.cap_two_value_cents == 1000
+
+    def test_volume_weighted_avg_used_for_cap_two_dollar_value(self) -> None:
+        """When acceptable levels span multiple prices, cap_two_cents
+        uses the volume-weighted average so the dollar number is
+        comparable to cap_one. Levels [(50, 100), (80, 100)] →
+        available 200, cap_two_contracts = 40, avg = (5000+8000)/200
+        = 65c, cap_two = 40 x 65 = 2600c. Cap_one ($20) binds."""
+        intent = _engine().evaluate_news_match(
+            _match(confidence=0.9),
+            _market(),
+            None,
+            _bankroll(),
+            yes_ask_levels=[(50, 100), (80, 100)],
+        )
+        assert intent is not None
+        assert intent.cap_two_contracts == 40
+        assert intent.cap_two_value_cents == 2600
+        assert intent.cap_binding == "cap_one"  # 2000 < 2600
 
     # ---- Walker integration ----
 
     def test_intent_carries_walk_audit_fields(self) -> None:
         """Walking a multi-level book populates levels_consumed,
-        slippage_cents, estimated_fees_cents."""
+        slippage_cents, estimated_fees_cents.
+
+        Phase 4 Part 2.6: book extended to 1010 contracts under the
+        ceiling so cap_two doesn't bind below cap_one. cap_two =
+        floor(1010 x 0.20) x avg ≈ 202 contracts at avg 70c = ~$141,
+        well above the $20 cap_one. cap_one binds → walker walks $20
+        (same as before)."""
         intent = _engine().evaluate_news_match(
             _match(confidence=0.9),
-            _market(volume=100_000),
+            _market(),
             None,
             _bankroll(),
-            yes_ask_levels=[(50, 5), (60, 5), (70, 100)],
+            yes_ask_levels=[(50, 5), (60, 5), (70, 1000)],
         )
         assert intent is not None
-        # Walked: 5 @ 50 ($2.50), 5 @ 60 ($3.00), then 22 @ 70 ($15.40)
-        # for total $20.90 — wait, budget is $20 so we stop earlier:
-        # 5 @ 50 = 250, 5 @ 60 = 300 (running 550), at 70 affordable =
+        # Walked: 5 @ 50 = 250, 5 @ 60 = 300 (running 550), at 70 affordable =
         # (2000-550)//70 = 20, take 20 @ 70 = 1400. Total = 1950, qty = 30.
+        assert intent.cap_binding == "cap_one"
         assert intent.target_size_usd_cents == 1950
         assert intent.target_quantity == 30
         assert intent.levels_consumed == [(50, 5), (60, 5), (70, 20)]
         assert intent.slippage_cents > 0
         assert intent.estimated_fees_cents > 0
         assert intent.target_avg_fill_price_cents == 65  # 1950/30 = 65 exact
+        # Phase 4 Part 2.6: cap_two_contracts populated from the
+        # 20%-of-orderbook-depth computation.
+        assert intent.cap_two_contracts == 202  # floor(1010 x 0.20)
 
     def test_walk_with_no_acceptable_levels_returns_none(self) -> None:
         """Top-of-book passes the ceiling check (90c) but ALL levels
@@ -397,6 +468,79 @@ class TestEvaluateNewsMatch:
 # ---------------------------------------------------------------------------
 # evaluate_stop_loss
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# _compute_cap_two_pure helper (Phase 4 Part 2.6)
+# ---------------------------------------------------------------------------
+
+
+class TestComputeCapTwoPure:
+    """Pure-function unit tests for the cap_two computation. These pin
+    the math independently of the full decision pipeline so a math
+    bug surfaces with a tighter test name."""
+
+    def test_empty_levels_returns_zero(self) -> None:
+        from trumpbot.decision.engine import _compute_cap_two_pure
+
+        assert _compute_cap_two_pure([], max_price_cents=90, orderbook_pct=0.20) == (0, 0)
+
+    def test_all_levels_above_ceiling_returns_zero(self) -> None:
+        from trumpbot.decision.engine import _compute_cap_two_pure
+
+        assert _compute_cap_two_pure(
+            [(95, 100), (99, 50)], max_price_cents=90, orderbook_pct=0.20
+        ) == (0, 0)
+
+    def test_single_level_under_ceiling(self) -> None:
+        """100 contracts at 50c → 20 contracts x 50c = 1000c."""
+        from trumpbot.decision.engine import _compute_cap_two_pure
+
+        contracts, value = _compute_cap_two_pure(
+            [(50, 100)], max_price_cents=90, orderbook_pct=0.20
+        )
+        assert contracts == 20
+        assert value == 1000
+
+    def test_volume_weighted_average_across_levels(self) -> None:
+        """[(50, 100), (80, 100)] available=200, cap_contracts=40,
+        avg=(5000+8000)/200=65, value=40*65=2600."""
+        from trumpbot.decision.engine import _compute_cap_two_pure
+
+        contracts, value = _compute_cap_two_pure(
+            [(50, 100), (80, 100)], max_price_cents=90, orderbook_pct=0.20
+        )
+        assert contracts == 40
+        assert value == 2600
+
+    def test_filter_drops_above_ceiling(self) -> None:
+        """100 @ 50c kept; 100 @ 95c dropped. Result same as
+        single-level test."""
+        from trumpbot.decision.engine import _compute_cap_two_pure
+
+        contracts, value = _compute_cap_two_pure(
+            [(50, 100), (95, 100)], max_price_cents=90, orderbook_pct=0.20
+        )
+        assert contracts == 20
+        assert value == 1000
+
+    def test_zero_quantity_levels_ignored(self) -> None:
+        from trumpbot.decision.engine import _compute_cap_two_pure
+
+        contracts, value = _compute_cap_two_pure(
+            [(50, 0), (60, 100)], max_price_cents=90, orderbook_pct=0.20
+        )
+        # Only 60c level counts → 100 available → 20 x 60 = 1200
+        assert contracts == 20
+        assert value == 1200
+
+    def test_tiny_book_floors_to_zero_contracts(self) -> None:
+        """4 contracts x 0.20 = 0.8 → floor to 0 → returns zero/zero."""
+        from trumpbot.decision.engine import _compute_cap_two_pure
+
+        contracts, value = _compute_cap_two_pure([(50, 4)], max_price_cents=90, orderbook_pct=0.20)
+        assert contracts == 0
+        assert value == 0
 
 
 class TestEvaluateStopLoss:

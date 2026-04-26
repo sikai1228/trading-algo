@@ -97,6 +97,7 @@ async def detect_and_close_settlements(
             exit_price_cents=payoff,
             realized_pnl_usd_cents=realized,
             exited_at=_utcnow_iso(),
+            exit_fees_cents=0,  # Kalshi fee is 0 at p=0/p=100 settlements
         )
         insert_system_event(
             db,

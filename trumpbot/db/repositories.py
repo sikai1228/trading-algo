@@ -744,6 +744,13 @@ class TradeInsertRow:
 
 
 def insert_trade(db: Database, row: TradeInsertRow) -> int:
+    """Insert a fresh trade row.
+
+    Phase 4 Part 2.1: also populates the acquisition-side tax fields
+    (``acquired_date`` and ``acquisition_cost_cents``) so the row is
+    tax-trackable from the moment it lands. Disposal fields stay NULL
+    until :func:`close_trade` fires.
+    """
     sql = """
     INSERT INTO trades (
         ticker, side, action, status,
@@ -754,7 +761,8 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         cap_binding, cap_one_value_cents, cap_two_value_cents,
         target_avg_fill_price_cents, actual_avg_fill_price_cents,
         slippage_cents, entry_fees_cents, levels_consumed_json,
-        client_order_id, kalshi_order_id
+        client_order_id, kalshi_order_id,
+        acquired_date, acquisition_cost_cents
     ) VALUES (
         :ticker, 'yes', 'buy', :status,
         :entry_price_cents, :quantity, :cost_basis_usd_cents,
@@ -764,13 +772,22 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         :cap_binding, :cap_one_value_cents, :cap_two_value_cents,
         :target_avg_fill_price_cents, :actual_avg_fill_price_cents,
         :slippage_cents, :entry_fees_cents, :levels_consumed_json,
-        :client_order_id, :kalshi_order_id
+        :client_order_id, :kalshi_order_id,
+        :acquired_date, :acquisition_cost_cents
     )
     """
+    # acquisition_cost_cents = price * qty + entry fees. cost_basis_usd_cents
+    # already equals price * qty in production code paths, so this is the
+    # closest-to-final acquisition cost we can record at fill time.
+    acquired_date = row.entered_at[:10] if row.entered_at else None
+    entry_fees = row.entry_fees_cents or 0
+    acquisition_cost = row.cost_basis_usd_cents + entry_fees
     params = {
         **row.__dict__,
         "is_reentry": int(row.is_reentry),
         "now": utcnow_iso(),
+        "acquired_date": acquired_date,
+        "acquisition_cost_cents": acquisition_cost,
     }
     with db.transaction() as conn:
         cur = conn.execute(sql, params)
@@ -931,16 +948,85 @@ def close_trade(
     exit_price_cents: int,
     realized_pnl_usd_cents: int,
     exited_at: str,
+    exit_fees_cents: int | None = None,
 ) -> None:
+    """Close a trade row and populate the Phase 4 Part 2.1 tax fields.
+
+    ``disposed_date``, ``holding_period_days``, ``disposal_proceeds_cents``,
+    ``realized_gain_loss_cents`` and ``tax_year`` are all derived from
+    columns the row already carries (``acquired_date`` from
+    :func:`insert_trade`; ``acquisition_cost_cents`` likewise; the
+    new ``exit_price_cents`` / ``exit_fees_cents`` from the executor).
+
+    Storing these alongside the lifecycle update keeps the per-trade
+    tax record stable: exporters never have to recompute from raw data.
+    """
+    disposed_date = exited_at[:10] if exited_at else None
+    fees = int(exit_fees_cents or 0)
     with db.transaction() as conn:
+        # Pull the acquired_date so SQLite can compute holding period
+        # in the same UPDATE without a Python round-trip.
+        existing = conn.execute(
+            "SELECT acquired_date, acquisition_cost_cents, quantity FROM trades WHERE id = ?",
+            (trade_id,),
+        ).fetchone()
+        acquired_date = existing["acquired_date"] if existing is not None else None
+        acquisition_cost = (
+            int(existing["acquisition_cost_cents"])
+            if existing is not None and existing["acquisition_cost_cents"] is not None
+            else None
+        )
+        quantity = int(existing["quantity"]) if existing is not None else 0
+        # disposal_proceeds depends on the terminal status:
+        #   stop-loss -> exit_price * qty - exit_fees
+        #   YES resolution -> 100 * qty (executor passes exit_price=100)
+        #   NO resolution  -> 0          (executor passes exit_price=0)
+        # All three patterns reduce to the same formula because the
+        # executor always sets exit_price_cents to the right number.
+        disposal_proceeds = exit_price_cents * quantity - fees
+        if acquisition_cost is not None:
+            realized_gain_loss = disposal_proceeds - acquisition_cost
+        else:
+            # Defensive: pre-Phase-4-Part-2.1 row missing acquisition cost.
+            # Fall back to realized_pnl_usd_cents which already accounts
+            # for cost_basis (less precise re fees but deterministic).
+            realized_gain_loss = realized_pnl_usd_cents
+        tax_year = int(exited_at[:4]) if exited_at and len(exited_at) >= 4 else None
+        # holding period = (disposed - acquired) calendar days. Use SQLite
+        # julianday() so the math matches migration 008's backfill exactly.
+        if acquired_date is not None and disposed_date is not None:
+            hp_row = conn.execute(
+                "SELECT CAST(julianday(?) - julianday(?) AS INTEGER)",
+                (disposed_date, acquired_date),
+            ).fetchone()
+            holding_period = int(hp_row[0]) if hp_row is not None else None
+        else:
+            holding_period = None
+
         conn.execute(
             """
             UPDATE trades
                SET status = ?, exit_price_cents = ?,
-                   realized_pnl_usd_cents = ?, exited_at = ?
+                   realized_pnl_usd_cents = ?, exited_at = ?,
+                   exit_fees_cents = COALESCE(?, exit_fees_cents),
+                   disposed_date = ?, holding_period_days = ?,
+                   disposal_proceeds_cents = ?,
+                   realized_gain_loss_cents = ?, tax_year = ?
              WHERE id = ?
             """,
-            (new_status, exit_price_cents, realized_pnl_usd_cents, exited_at, trade_id),
+            (
+                new_status,
+                exit_price_cents,
+                realized_pnl_usd_cents,
+                exited_at,
+                exit_fees_cents,
+                disposed_date,
+                holding_period,
+                disposal_proceeds,
+                realized_gain_loss,
+                tax_year,
+                trade_id,
+            ),
         )
 
 

@@ -144,6 +144,10 @@ class DryRunExecutor:
         if row is None:
             return None
         # YES contract pays out 100c on YES resolution, 0c on NO.
+        # Phase 4 Part 2.1: settlement payouts pay no exit fee (Kalshi's
+        # fee formula returns 0 at price=0 or price=100 — see
+        # trumpbot/execution/fees.py). Pass 0 explicitly for the audit
+        # trail rather than leaving it None.
         payoff_cents = 100 if resolution == "settled_yes" else 0
         proceeds_cents = payoff_cents * row["quantity"]
         realized = proceeds_cents - row["cost_basis_usd_cents"]
@@ -154,6 +158,7 @@ class DryRunExecutor:
             exit_price_cents=payoff_cents,
             realized_pnl_usd_cents=realized,
             exited_at=_utcnow_iso(),
+            exit_fees_cents=0,
         )
         return ExecutionResult(
             trade_id=row["id"],
@@ -340,12 +345,17 @@ class DryRunExecutor:
     def _submit_stop_loss(
         self, intent: StopLossIntent, approved: RiskApprovedOrder
     ) -> ExecutionResult:
+        from trumpbot.execution.fees import calculate_exit_fee_cents
+
         quote = self._quote_fn(intent.ticker)
         # We sell into the bid. If no bid is available (extremely rare),
         # fall back to the bid the engine observed when generating the
         # intent. Simulated fills only — Phase 4 reads the live book.
         bid = quote.yes_bid_cents if quote.yes_bid_cents is not None else intent.current_bid_cents
-        proceeds = bid * intent.position_quantity
+        # Phase 4 Part 2.1: exit fees enter the close lifecycle so the
+        # disposal_proceeds_cents reflects net cash to the operator.
+        exit_fees = calculate_exit_fee_cents(bid, intent.position_quantity)
+        proceeds = bid * intent.position_quantity - exit_fees
         realized = proceeds - intent.cost_basis_usd_cents
         close_trade(
             self._db,
@@ -354,6 +364,7 @@ class DryRunExecutor:
             exit_price_cents=bid,
             realized_pnl_usd_cents=realized,
             exited_at=_utcnow_iso(),
+            exit_fees_cents=exit_fees,
         )
         # The risk-decision audit row is logged separately by the
         # RiskManager; we don't double-write here.

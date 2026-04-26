@@ -222,7 +222,17 @@ class TestStopLossSubmission:
         executor2 = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=20, ask=22))
         stop_result = await executor2.submit(approved_stop)
         assert stop_result.fill_price_cents == 20
-        assert stop_result.realized_pnl_usd_cents == (20 - 80) * entry_result.fill_quantity
+        # Phase 4 Part 2.1: stop-loss exits now net Kalshi exit fees
+        # against proceeds. Fee at 20c x 10 contracts ~ 12c
+        # (ceil(0.07 * 10 * 20 * 80 / 100)). Realized P&L =
+        # (20 - 80) * 10 - 12 = -612.
+        from trumpbot.execution.fees import calculate_exit_fee_cents
+
+        expected_fee = calculate_exit_fee_cents(20, entry_result.fill_quantity)
+        assert (
+            stop_result.realized_pnl_usd_cents
+            == (20 - 80) * entry_result.fill_quantity - expected_fee
+        )
         # Status updated to closed.
         row = (
             db.connect()

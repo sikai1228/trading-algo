@@ -559,6 +559,177 @@ hardcoded. Exits 0 only on all-green.
 
 ---
 
+## Phase 4 Part 2.1 — tax tracking + exports
+
+Every trade is potentially a taxable event. The bot captures all the
+tax-relevant data on the trade row at lifecycle time so year-end
+exports (CSV / Form 8949 / Kalshi 1099-B reconciliation) read from a
+stable per-trade record without recomputing anything from raw data.
+
+**Strategy choice:** capture EVERYTHING at trade time. We never try
+to figure out at filing time what the operator will need; the
+`TaxExporter` filters from the captured columns.
+
+### DB schema (migration 008)
+
+Adds 7 columns to the `trades` table:
+
+| column | populated at | notes |
+|---|---|---|
+| `acquired_date` | `insert_trade` | `entered_at[:10]` |
+| `disposed_date` | `close_trade` | `exited_at[:10]` |
+| `holding_period_days` | `close_trade` | SQLite `julianday()` diff |
+| `acquisition_cost_cents` | `insert_trade` | `cost_basis_usd_cents + entry_fees` |
+| `disposal_proceeds_cents` | `close_trade` | `exit_price * qty - exit_fees` |
+| `realized_gain_loss_cents` | `close_trade` | `proceeds - cost` |
+| `tax_year` | `close_trade` | year of `disposed_date` |
+
+Backfill SQL in the same migration computes these for every existing
+closed Phase-2/3 trade so historical data is exportable from day one.
+Open trades leave the columns NULL — meaningful only at close.
+
+`tax_year` is the year of **disposal**, not entry. A trade entered
+Dec 30, 2025 and closed Jan 5, 2026 belongs to tax year 2026 (mirrors
+how the IRS treats disposal date as the gain-recognition trigger).
+
+Indexes: `idx_trades_tax_year`, `idx_trades_disposed_date`.
+
+### TaxExporter — `trumpbot/exports/tax_exports.py`
+
+Pure-function exporter over the captured columns. Four methods:
+
+- `export_yearly_summary(year) -> YearlySummary` — totals, win/loss,
+  largest gain/loss with the market that produced them, average
+  holding period, per-ticker breakdown.
+- `export_trade_log(year, format="csv"|"json")` — full per-trade detail.
+  CSV columns are LOCKED:
+  ```
+  trade_id, ticker, market_description, acquired_date, disposed_date,
+  holding_period_days, quantity, acquisition_cost_usd,
+  disposal_proceeds_usd, realized_gain_loss_usd, status,
+  resolution_outcome, notes
+  ```
+- `export_form_8949_format(year)` — IRS Form 8949 column layout with
+  `Adjustment` and `Code` left blank for the operator's accountant.
+- `export_kalshi_reconciliation(year)` — line-item totals + per-trade
+  detail in the shape Kalshi's 1099-B uses, suitable for filing-time
+  comparison.
+
+**Money rule (carries over from Phase 2):** storage stays in integer
+cents. Conversion to dollar strings happens ONLY at the export
+boundary via `_dollars_str` / `_bare_dollars` (Decimal-based, no
+float drift). $17.49 always renders as $17.49, never $17.490000001.
+
+### Telegram commands
+
+- `/tax_summary [year]` — aggregated stats for the year (default:
+  current calendar year). Renders `command_reply_tax_summary`.
+- `/tax_export [year] [csv|json|form_8949]` — writes a filing-ready
+  file under `<db_dir>/exports/annual/<year>/` and tells the operator
+  the path. Format defaults to `csv`.
+- `/tax_reconcile [year]` — writes the Kalshi 1099-B reconciliation
+  JSON for line-item comparison once Kalshi issues the form.
+
+### Monthly digest — `monthly_tax_digest_loop`
+
+Fires on `cfg.tax_tracking.monthly_digest_day` of the month at
+`cfg.tax_tracking.monthly_digest_time_et` Eastern. Computes the
+previous month's stats, writes a CSV to
+`<db_dir>/exports/monthly/YYYY-MM.csv`, sends the
+`monthly_tax_digest` template to Telegram.
+
+The loop is idempotent — if the daemon is down across the firing
+instant, the next iteration silently skips that month (committed
+CSVs in `data/exports/monthly/` cover the audit trail anyway).
+
+Gated on `cfg.tax_tracking.monthly_digest_enabled`. Set to False to
+skip the loop; the per-trade tax columns continue to be populated.
+
+### Exit fees enter the close lifecycle
+
+A behavioral change introduced by Part 2.1: stop-loss exits now net
+the Kalshi exit fee against `disposal_proceeds_cents` so the
+realized gain/loss reflects the operator's actual cash. Settlement
+exits at $0 / $1 incur 0 fees by Kalshi's formula and pass
+`exit_fees_cents=0` explicitly for the audit trail.
+
+The pre-Phase-4-Part-2.1 dry-run-executor test
+`test_closes_at_current_bid` was updated to import
+`calculate_exit_fee_cents` and assert the fee-aware P&L.
+
+### Annual export workflow
+
+Once a year (typically February when Kalshi issues the 1099-B):
+
+1. `uv run python -m scripts.generate_annual_export --year 2026`
+   — writes 5 files to `<db_dir>/exports/annual/2026/`:
+   `full_trade_log.csv`, `yearly_summary.json`,
+   `form_8949_format.csv`, `kalshi_reconciliation.json`,
+   `README.md` (explains each file).
+2. `uv run python -m scripts.import_kalshi_1099 --file <pdf> --year 2026`
+   — extracts totals from Kalshi's PDF (via `pypdf`, lazy-imported)
+   and compares to the bot's records. Exits non-zero on
+   discrepancies. Writes `1099_reconciliation.txt` in the same
+   directory. `--allow-manual-paste` lets the operator type the
+   numbers if PDF parsing fails.
+
+### Config — `cfg.tax_tracking`
+
+```yaml
+tax_tracking:
+  enabled: true
+  user_tax_year_start: "01-01"
+  default_export_format: "csv"
+  monthly_digest_enabled: true
+  monthly_digest_day: 1
+  monthly_digest_time_et: "09:00"
+```
+
+### Templates added
+
+- `command_reply_tax_summary`
+- `command_reply_tax_export`
+- `command_reply_tax_reconcile`
+- `monthly_tax_digest`
+
+### File map for Phase 4 Part 2.1
+
+- `migrations/008_phase4_part_2_1_tax.sql` — schema + backfill
+- `trumpbot/exports/__init__.py`
+- `trumpbot/exports/tax_exports.py` — `TaxExporter`, dollar helpers
+- `trumpbot/notifications/commands.py` — three new tax handlers
+- `trumpbot/notifications/scheduled.py` — `monthly_tax_digest_loop`
+- `trumpbot/notifications/templates.py` — four new templates
+- `trumpbot/config.py` — `TaxTrackingConfig`
+- `scripts/generate_annual_export.py`
+- `scripts/import_kalshi_1099.py`
+- `tests/test_phase4_tax.py` — 28 regressions
+
+---
+
+## Phase 4 deployment readiness
+
+Phase 4 Part 1 + Part 2.1 are verified end-to-end. The combined
+verification (`VERIFICATION_PHASE_4_FULL.md`) ran 47 checks across
+the 11 spec sections; result was 47/47 PASS with zero critical
+bugs. Six items are deferred to Phase 4 Part 2.2 with documented
+reasoning (none block live trading).
+
+To go live:
+
+1. Run `uv run python -m scripts.pre_live_checklist`. All six checks
+   must pass.
+2. Deposit ≥ $100 on Kalshi.
+3. Verify production credentials in `~/.config/trumpbot/secrets.env`.
+4. Send `/heartbeat` to the bot from your phone, confirm reply.
+5. Edit `cfg.execution.mode = "live"` in `config.yaml`.
+6. `deploy/setup_macos.sh` to redeploy.
+7. Watch `~/Library/Logs/trumpbot/stdout.log` for the
+   `mode_switched_live` audible alert and `reconciliation_ok`.
+8. First real Telegram approval — read carefully before tapping ✅.
+
+---
+
 ## Type-system enforcement of risk gating
 
 The single most important invariant in Phase 2: **only `RiskManager` can

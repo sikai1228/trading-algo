@@ -105,8 +105,8 @@ class TestEvaluateNewsMatch:
         assert intent is not None
         assert intent.ticker == "KXTRUMPMEET-26APR-VPUT"
         assert intent.target_quantity >= 1
-        # target_price_cents is the ceiling now (max-buy 80), not best ask.
-        assert intent.target_price_cents == 80
+        # target_price_cents is the ceiling now (max-buy 90), not best ask.
+        assert intent.target_price_cents == 90
         assert intent.target_avg_fill_price_cents == 50  # walked at 50c
         assert intent.cap_binding == "cap_one"  # $20 < $5000
 
@@ -165,26 +165,28 @@ class TestEvaluateNewsMatch:
         )
 
     def test_price_above_ceiling_returns_none(self) -> None:
-        # Top-of-book 81c -> engine fast-fails before walking.
+        # Top-of-book 91c -> engine fast-fails before walking.
+        # (Phase 4 Part 2.5: ceiling raised from 80c to 90c.)
         assert (
             _engine().evaluate_news_match(
                 _match(),
-                _market(yes_ask=81),
+                _market(yes_ask=91),
                 None,
                 _bankroll(),
-                yes_ask_levels=_levels(price=81),
+                yes_ask_levels=_levels(price=91),
             )
             is None
         )
 
     def test_price_at_ceiling_passes(self) -> None:
+        # 90c is the new ceiling (Phase 4 Part 2.5).
         assert (
             _engine().evaluate_news_match(
                 _match(),
-                _market(yes_ask=80),
+                _market(yes_ask=90),
                 None,
                 _bankroll(),
-                yes_ask_levels=_levels(price=80),
+                yes_ask_levels=_levels(price=90),
             )
             is not None
         )
@@ -311,14 +313,14 @@ class TestEvaluateNewsMatch:
         assert intent.target_avg_fill_price_cents == 65  # 1950/30 = 65 exact
 
     def test_walk_with_no_acceptable_levels_returns_none(self) -> None:
-        """Top-of-book passes the ceiling check (80c) but ALL levels
+        """Top-of-book passes the ceiling check (90c) but ALL levels
         are above it after merging — walker fills 0."""
         out = _engine().evaluate_news_match(
             _match(),
-            _market(yes_ask=80),
+            _market(yes_ask=90),
             None,
             _bankroll(),
-            yes_ask_levels=[(85, 1000)],  # no level <= 80c
+            yes_ask_levels=[(95, 1000)],  # no level <= 90c
         )
         assert out is None
 
@@ -381,7 +383,7 @@ class TestEvaluateNewsMatch:
         # YES-resolution P&L scenario.
         assert "reuters_via_gnews" in text
         assert "0.9" in text
-        assert "80c" in text
+        assert "90c" in text
         assert "Cap analysis" in text
         assert "cap_one" in text
         assert "cap_two" in text

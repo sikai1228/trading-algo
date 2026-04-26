@@ -147,7 +147,13 @@ telegram:
 
 decision:
   llm_confidence_threshold: 0.85
-  max_buy_price_cents: 80
+  # Hard ceiling on YES contract entry price (in cents). Trades above
+  # this are rejected by both the engine and the risk gate. Raised
+  # from 80 → 90 in Phase 4 Part 2.5: markets often trade in the
+  # 80-90c band for several hours after a confirming news headline
+  # before snapping to $1.00, and the bot was missing those legs
+  # because of the old ceiling.
+  max_buy_price_cents: 90
   position_size_base_pct: 0.08
 
   # ----- Phase 3 Part 1: two-cap sizing system -----

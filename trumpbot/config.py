@@ -68,7 +68,13 @@ class DecisionPhaseConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     llm_confidence_threshold: float = 0.85
-    max_buy_price_cents: int = 80
+    max_buy_price_cents: int = 90
+    """Hard ceiling on YES contract entry price (in cents). Trades
+    above this are rejected by the engine and the risk gate. Raised
+    from 80 to 90 (Phase 4 Part 2.5) — markets often trade in the
+    80-90 cent band for several hours after a confirming news
+    headline before snapping to $1.00, and the bot was missing those
+    legs because of the old ceiling."""
     position_size_base_pct: float = 0.08
     # Phase 3 Part 1: two-cap system (was a single fixed cap in PR #10).
     position_size_hard_cap_cents: int = 2000

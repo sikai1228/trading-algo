@@ -112,6 +112,11 @@ _SAMPLES: dict[str, Any] = {
     "diff_excerpt": "+ A qualifying interaction now requires...",
     "old_version": "v1",
     "new_version": "v2",
+    # Phase 4 Part 2.2 (pre-live fix #2): bankroll sync auto-halt
+    "failure_count": 3,
+    "first_failure_time": "2026-04-26 14:08:42 UTC",
+    "age": "16m",
+    "balance": "$127.43",
     # Warning alerts
     "source_name": "ap_via_gnews",
     "duration_min": 35,

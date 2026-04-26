@@ -707,6 +707,113 @@ tax_tracking:
 
 ---
 
+## Phase 4 Part 2.2 — pre-live fixes (#1, #2, #11 from OPEN_ISSUES.md)
+
+Three open issues documented in `OPEN_ISSUES.md` were resolved before
+flipping to live mode:
+
+### Fix #1 — Live bankroll piped through BankrollState
+
+In dry-run mode the engine sized off `cfg.bankroll.starting_amount_usd`
+(intentional — dry-run is "trade against this fake bankroll"). In
+live mode the same code path was reading from config, NOT from the
+synced Kalshi balance written by `bankroll_sync_loop`. So every
+live-mode sizing decision used the static config number.
+
+The fix:
+
+- `BankrollState` now carries `source: BankrollSource` (one of
+  `config`, `kalshi_synced`, `kalshi_fallback`) and
+  `last_synced_at: datetime | None`.
+- `available_usd_cents` is the canonical "what the engine can spend"
+  number. `available_bankroll_usd_cents` remains as a back-compat
+  alias.
+- `_bankroll_state` in `trumpbot/decision/loops.py` accepts an
+  `execution_mode` parameter. In live mode it consults
+  `system_state['bankroll_usd_cents']` and tags the result
+  `kalshi_synced`. If the cache is empty (daemon just started), it
+  falls back to the config value but tags the result
+  `kalshi_fallback` so the reasoning text discloses the fallback.
+- The four daemon loops (decision / stop-loss / position-marking /
+  re-entry) thread `execution_mode=cfg.execution.mode` through to
+  `_bankroll_state`.
+- The reasoning text builder includes a `Bankroll: $XX ({source}, last
+  synced Nm ago); available $YY after open positions.` paragraph so
+  the audit log discloses provenance.
+
+The risk gate already used `available_*_cents` for sizing decisions;
+no risk-gate behavior change.
+
+### Fix #2 — Bankroll-sync auto-halt + auto-resume
+
+`bankroll_sync_loop` previously logged warnings on failure but never
+halted trading. A prolonged Kalshi outage would silently let the bot
+keep sizing off increasingly stale data.
+
+The fix:
+
+- Loop tracks `consecutive_failures` across iterations.
+- After `SYNC_FAILURE_HALT_THRESHOLD = 3` consecutive failures:
+  sets `system_state.halt_flag = 'true'` AND
+  `system_state.halt_reason = 'bankroll_sync'`. Fires
+  `alert_critical_bankroll_sync_failed` (audible).
+- On the next successful sync, if and only if `halt_reason ==
+  'bankroll_sync'`, clears the halt and fires
+  `alert_info_bankroll_sync_recovered` (silent).
+- The user's manual `/halt` is **never** overridden by the auto-resume
+  logic. Only the bot's own auto-halt is auto-cleared. This is
+  enforced by checking `halt_reason` before clearing
+  (`_clear_halt_if_ours`).
+
+The daemon plumbs `send_text` into the loop so the alerts can fire.
+
+### Fix #11 — Prefer Kalshi-reported fills over re-walk
+
+`KalshiExecutor._finalize_buy_success` previously wrote the trade
+row's `entry_price_cents` / `quantity` / `cost_basis_usd_cents` from
+the LOCAL re-walk. If Kalshi's matching engine filled slightly
+differently (different micro-second snapshot of the book), the
+in-memory row briefly diverged from Kalshi's truth.
+
+The fix:
+
+- Both `_finalize_buy_success` and the stop-loss path (`_submit_stop_loss`'s
+  finalize) now PREFER `order.avg_fill_price` and `order.filled_count`
+  from Kalshi's response.
+- Fall back to re-walk numbers (or `intent.position_quantity` for
+  stop-loss) only when Kalshi omits a field.
+- When ANY field falls back, write a `using_rewalk_fallback`
+  system_event with both the Kalshi values and the local fallback
+  values for audit. Operator can grep for the event type to spot
+  divergence over time.
+- For derived counts (`count - remaining_count` when `filled_count`
+  is None), tag the source as `kalshi` (still Kalshi truth, just
+  reconstructed).
+
+### Templates added
+
+- `alert_critical_bankroll_sync_failed` (audible)
+- `alert_info_bankroll_sync_recovered` (silent)
+
+### Tests added
+
+`tests/test_pre_live_fixes.py` — 15 regressions:
+
+- `TestBankrollStateSourcing` (6 tests): dry-run uses config, live
+  uses cache, fallback when cache empty / corrupt, available
+  excludes open positions, available clamps at zero.
+- `TestBankrollStateInReasoning` (1): reasoning text mentions
+  `Kalshi-synced balance` + dollar amount.
+- `TestBankrollSyncAutoHalt` (4): three failures set halt, recovery
+  clears halt, user's manual halt is not overridden, counter resets
+  on success.
+- `TestPreferKalshiReportedFills` (4): uses Kalshi avg + count when
+  present, falls back to re-walk + logs system_event when Kalshi
+  omits, derives from `count - remaining` when `filled_count` is
+  None.
+
+---
+
 ## Phase 4 deployment readiness
 
 Phase 4 Part 1 + Part 2.1 are verified end-to-end. The combined

@@ -171,7 +171,7 @@ _TRADE_PROPOSAL_ENTRY = MessageTemplate(
         "💰 TRADE PROPOSAL\n"
         "Ticker: {ticker}\n"
         "Triggered by match #{match_id}\n"
-        "Confidence: {confidence}  Confirmation weight: {weight}\n\n"
+        "Confidence: {confidence}\n\n"
         "Approve within 3:00 to execute.\n\n" + _PROPOSAL_BODY
     ),
 )
@@ -561,7 +561,7 @@ _COMMAND_REPLY_WHY = MessageTemplate(
     audible=False,
     # fields: trade_id, ticker, subject_full_name, entry_time_et,
     #         quantity, entry_price, total_cost, fees, source,
-    #         source_weight, headline, published_time_et, lag, url,
+    #         headline, published_time_et, lag, url,
     #         confidence, llm_reasoning, cap_one_amount, cap_one_status,
     #         cap_two_pct, market_volume, cap_two_amount, binding_cap,
     #         slippage, best_ask, expected_roi
@@ -572,7 +572,7 @@ _COMMAND_REPLY_WHY = MessageTemplate(
         "Quantity: {quantity} contracts @ {entry_price}c avg\n"
         "Total cost: {total_cost} + {fees} fees\n\n"
         "Triggering article:\n"
-        "  Source: {source} (weight {source_weight})\n"
+        "  Source: {source}\n"
         '  Headline: "{headline}"\n'
         "  Published: {published_time_et} ({lag} before trade)\n"
         "  URL: {url}\n\n"

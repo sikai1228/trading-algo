@@ -96,7 +96,6 @@ class RSSPoller(NewsMonitor):
         if False:  # pragma: no cover — contractual no-op for this monitor
             yield FetchedItem(
                 source="",
-                source_weight=0.0,
                 is_kalshi_approved=False,
                 headline="",
                 url=None,
@@ -161,7 +160,6 @@ class RSSPoller(NewsMonitor):
         canonical = canonicalize_url(item.url) if item.url else None
         row = NewsEventRow(
             source=item.source,
-            source_weight=item.source_weight,
             is_kalshi_approved=item.is_kalshi_approved,
             headline=item.headline,
             url=item.url,
@@ -219,7 +217,6 @@ def _entry_to_item(entry: Any, source: NewsSourceConfig) -> FetchedItem | None:
 
     return FetchedItem(
         source=source.name,
-        source_weight=source.weight,
         is_kalshi_approved=source.is_kalshi_approved,
         headline=headline,
         url=url,

@@ -238,8 +238,8 @@ Every `TradeIntent` carries a reasoning string with this structure
 (rendered into Telegram and persisted to `trades.reasoning_text`):
 
 ```
-{source} (weight={w}) classified an article matching {ticker} at
-confidence {c}, with interaction_occurred=true.
+{source} classified an article matching {ticker} at confidence {c},
+with interaction_occurred=true.
 
 Current YES ask is {ask}c (max-buy ceiling 90c).
 
@@ -984,6 +984,79 @@ there's no way to reconstruct the live orderbook snapshot.
   helper's math directly: empty levels → zero, all-above-ceiling
   → zero, single-level, multi-level volume-weighted, filter, zero-
   quantity skipped, tiny-book floors-to-zero.
+
+---
+
+## Phase 4 Part 2.7 — source weight removed
+
+All news sources are now treated equally. The per-source `weight`
+field, the `news_events.source_weight` column, the
+`MatchSnapshot.source_weight` field, the `TradeIntent /
+ReentryIntent.confirmation_weight` field, and every "source X
+(weight=Y)" reference in reasoning text and Telegram templates
+have been removed.
+
+### Why
+
+The weight × confidence multiplication was a hand-tuned heuristic
+that the LLM cascade obsoletes: the cascade already evaluates
+each article against the market's verbatim Kalshi resolution
+rules, and its confidence score (0..1) captures whether the
+article actually proves the qualifying interaction. Multiplying
+by a per-source weight just dampens the LLM's signal with a
+config-time prior that has no live-data backing.
+
+The 0.85 confidence gate in the engine's entry rule is now the
+sole signal-strength filter.
+
+### Code changes
+
+- `NewsSourceConfig`: `weight` field removed; `model_config` switched
+  to `extra="allow"` so existing config.yaml files with `weight: …`
+  keys load (silently ignored) without forcing a redeploy step.
+- `FetchedItem`: `source_weight` field removed.
+- `NewsEventRow` + `insert_news_event`: column + insert SQL dropped
+  the field.
+- All three pollers (`RSSPoller`, `TwitterScraper`,
+  `TruthSocialScraper`) stopped reading `source.weight`.
+- `MatchSnapshot.source_weight` removed.
+- `TradeIntent.confirmation_weight` and `ReentryIntent.confirmation_weight`
+  removed (and the `confirmation_weight = source_weight × confidence`
+  computation in the engine).
+- `queries.NewsEvidence.source_weight` removed.
+- Reasoning text dropped the "(weight=…)" parenthetical from the
+  source line.
+- Telegram trade-proposal template dropped "Confirmation weight: {weight}"
+  from the header.
+- `/why` template dropped the "(weight ...)" annotation on the
+  source line.
+- `config/config.example.yaml`: every `weight: 1.0` (or 0.85, 0.9,
+  0.95) inline-dict entry stripped from the news-source list.
+
+### Migration 010
+
+`ALTER TABLE news_events DROP COLUMN source_weight`. SQLite 3.35+
+supports DROP COLUMN natively (the runtime ships 3.50.4). Existing
+rows lose the value silently; no read path consults it after the
+migration applies.
+
+### Tests
+
+`source_weight=` and `confirmation_weight=` kwargs were removed
+from every test fixture (`source_weight=` in MatchSnapshot
+builders, `confirmation_weight=` in TradeIntent / ReentryIntent
+builders, `weight=` in NewsSourceConfig fixtures). One
+`test_poll_persists_items` assertion that read
+`rows[0]["source_weight"]` was dropped along with the column.
+
+### Operator-facing impact
+
+- The `/why <trade_id>` reply no longer shows source weight.
+- Trade-proposal Telegram messages no longer show "Confirmation
+  weight: X". Confidence is the only signal-strength number.
+- Existing config.yaml files keep working — the `weight: 1.0`
+  keys are silently ignored. The example config has them
+  removed; redeployments don't require config edits.
 
 ---
 

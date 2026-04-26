@@ -187,7 +187,6 @@ class TestEndToEndMatch:
             db,
             NewsEventRow(
                 source="reuters",
-                source_weight=1.0,
                 is_kalshi_approved=True,
                 headline="Trump spoke with Putin about Ukraine",
                 url="https://example.com/x",
@@ -232,7 +231,6 @@ class TestEndToEndMatch:
             db,
             NewsEventRow(
                 source="reuters",
-                source_weight=1.0,
                 is_kalshi_approved=True,
                 headline="Trump spoke with Unknown Person",
                 url="https://example.com/u",

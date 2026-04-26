@@ -63,7 +63,6 @@ def _intent(
         target_quantity=target_quantity,
         target_size_usd_cents=target_price_cents * target_quantity,
         triggering_match_id=1,
-        confirmation_weight=0.9,
         confidence_score=0.9,
         reasoning_text="for tests",
     )
@@ -273,7 +272,6 @@ class TestApprovals:
             target_quantity=5,
             target_size_usd_cents=200,
             triggering_match_id=2,
-            confirmation_weight=0.95,
             confidence_score=0.95,
             reasoning_text="reentry",
             prior_trade_id=99,

@@ -119,7 +119,6 @@ class MatchSnapshot:
     as proving a qualifying interaction. Pre-LLM rows are False."""
 
     source_name: str
-    source_weight: float
     is_kalshi_approved: bool
 
     market_open_ts: str | None
@@ -365,7 +364,6 @@ class DecisionEngine:
             target_quantity=walk.filled_quantity,
             target_size_usd_cents=walk.total_cost_cents,
             triggering_match_id=match.match_id,
-            confirmation_weight=match.source_weight * match.confidence,
             confidence_score=match.confidence,
             target_avg_fill_price_cents=walk.average_fill_price_cents,
             target_max_fill_price_cents=walk.max_price_reached_cents,
@@ -478,7 +476,6 @@ class DecisionEngine:
             target_quantity=synthetic_intent.target_quantity,
             target_size_usd_cents=synthetic_intent.target_size_usd_cents,
             triggering_match_id=synthetic_intent.triggering_match_id,
-            confirmation_weight=synthetic_intent.confirmation_weight,
             confidence_score=synthetic_intent.confidence_score,
             target_avg_fill_price_cents=synthetic_intent.target_avg_fill_price_cents,
             target_max_fill_price_cents=synthetic_intent.target_max_fill_price_cents,
@@ -665,9 +662,9 @@ def _build_entry_reasoning(
     )
 
     header = (
-        f"Source {match.source_name} (weight={match.source_weight}) "
-        f"classified an article matching {match.ticker} at confidence "
-        f"{match.confidence:.2f}, with interaction_occurred=true."
+        f"Source {match.source_name} classified an article matching "
+        f"{match.ticker} at confidence {match.confidence:.2f}, with "
+        f"interaction_occurred=true."
     )
     ceiling = f"Current YES ask is {best_ask}c (max-buy ceiling 90c)."
 

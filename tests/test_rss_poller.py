@@ -43,7 +43,6 @@ async def test_poll_persists_items(tmp_db: Database) -> None:
         type="rss",
         url="https://example.com/feed.xml",
         poll_interval_sec=60,
-        weight=1.0,
         is_kalshi_approved=True,
     )
     respx.get("https://example.com/feed.xml").mock(
@@ -57,7 +56,6 @@ async def test_poll_persists_items(tmp_db: Database) -> None:
     assert len(rows) == 2
     assert rows[0]["headline"] == "Trump and Putin spoke today"
     assert rows[0]["url"] == "https://example.com/article-1"
-    assert rows[0]["source_weight"] == 1.0
     assert rows[0]["is_kalshi_approved"] == 1
 
 
@@ -69,7 +67,6 @@ async def test_poll_dedups_on_repeat(tmp_db: Database) -> None:
         type="rss",
         url="https://example.com/feed.xml",
         poll_interval_sec=60,
-        weight=1.0,
         is_kalshi_approved=True,
     )
     respx.get("https://example.com/feed.xml").mock(
@@ -92,7 +89,6 @@ async def test_429_does_not_persist(tmp_db: Database) -> None:
         type="rss",
         url="https://example.com/feed.xml",
         poll_interval_sec=60,
-        weight=1.0,
         is_kalshi_approved=True,
     )
     respx.get("https://example.com/feed.xml").mock(

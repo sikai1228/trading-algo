@@ -280,7 +280,6 @@ def insert_orderbook_snapshot(db: Database, row: OrderbookSnapshotRow) -> None:
 @dataclass(frozen=True)
 class NewsEventRow:
     source: str
-    source_weight: float
     is_kalshi_approved: bool
     headline: str
     url: str | None
@@ -295,21 +294,26 @@ class NewsEventRow:
 
 
 def insert_news_event(db: Database, row: NewsEventRow) -> int | None:
-    """Insert a news event. Returns lastrowid, or None on URL collision."""
+    """Insert a news event. Returns lastrowid, or None on URL collision.
+
+    Phase 4 Part 2.7: ``source_weight`` was REMOVED from this row.
+    The ``news_events.source_weight`` column was dropped by migration
+    010; all sources are now treated equally and the LLM cascade's
+    confidence is the only signal that feeds into the entry rule.
+    """
     sql = """
     INSERT INTO news_events (
-        source, source_weight, is_kalshi_approved, headline, url,
+        source, is_kalshi_approved, headline, url,
         url_canonical, body_excerpt, author, raw_published_ts,
         detected_ts, has_photo, has_video, raw_data
     ) VALUES (
-        :source, :source_weight, :is_kalshi_approved, :headline, :url,
+        :source, :is_kalshi_approved, :headline, :url,
         :url_canonical, :body_excerpt, :author, :raw_published_ts,
         :detected_ts, :has_photo, :has_video, :raw_data
     )
     """
     params = {
         "source": row.source,
-        "source_weight": row.source_weight,
         "is_kalshi_approved": int(row.is_kalshi_approved),
         "headline": row.headline,
         "url": row.url,

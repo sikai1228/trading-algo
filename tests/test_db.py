@@ -199,7 +199,6 @@ class TestNewsRepo:
     def _event(self, url: str = "https://example.com/a") -> NewsEventRow:
         return NewsEventRow(
             source="reuters",
-            source_weight=1.0,
             is_kalshi_approved=True,
             headline="Trump and Putin spoke",
             url=url,

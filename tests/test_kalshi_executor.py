@@ -74,7 +74,6 @@ def _seed_match(db: Database) -> int:
         db,
         NewsEventRow(
             source="reuters_via_gnews",
-            source_weight=1.0,
             is_kalshi_approved=True,
             headline="h",
             url="https://e.com/1",
@@ -118,7 +117,6 @@ def _intent_with_walk(*, match_id: int, qty: int = 10, avg: int = 50) -> TradeIn
         target_quantity=qty,
         target_size_usd_cents=avg * qty,
         triggering_match_id=match_id,
-        confirmation_weight=0.9,
         confidence_score=0.9,
         target_avg_fill_price_cents=avg,
         target_max_fill_price_cents=avg,

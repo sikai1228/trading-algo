@@ -55,7 +55,6 @@ def _entry_data(intent: TradeIntent, approved: RiskApprovedOrder) -> dict[str, o
         "ticker": intent.ticker,
         "match_id": intent.triggering_match_id,
         "confidence": f"{intent.confidence_score:.2f}",
-        "weight": f"{intent.confirmation_weight:.2f}",
         **_proposal_body_data(intent, qty),
     }
 

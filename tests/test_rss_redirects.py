@@ -52,7 +52,6 @@ async def test_redirected_feed_actually_ingested(tmp_path) -> None:  # type: ign
         type="rss",
         url="http://old.example.com/feed",
         poll_interval_sec=60,
-        weight=0.85,
         is_kalshi_approved=True,
     )
     respx.get("http://old.example.com/feed").mock(

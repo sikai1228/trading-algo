@@ -166,7 +166,6 @@ async def test_decision_cycle_no_op_when_halted(tmp_path: Path) -> None:
         db,
         NewsEventRow(
             source="ap",
-            source_weight=1.0,
             is_kalshi_approved=True,
             headline="h",
             url="https://e.com/1",

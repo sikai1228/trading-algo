@@ -247,7 +247,6 @@ class TestMatcherWorkerIncludesSettledMarkets:
             db,
             NewsEventRow(
                 source="reuters",
-                source_weight=1.0,
                 is_kalshi_approved=True,
                 headline="Trump called Netanyahu, sources confirm",
                 url="https://example.com/n",

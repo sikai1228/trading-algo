@@ -53,7 +53,6 @@ def _seed_match(db: Database) -> int:
         db,
         NewsEventRow(
             source="reuters_via_gnews",
-            source_weight=1.0,
             is_kalshi_approved=True,
             headline="h",
             url="https://e.com/1",
@@ -109,7 +108,6 @@ class TestEntrySubmission:
             target_quantity=10,
             target_size_usd_cents=500,
             triggering_match_id=match_id,
-            confirmation_weight=0.9,
             confidence_score=0.9,
             reasoning_text="r",
         )
@@ -134,7 +132,6 @@ class TestEntrySubmission:
             target_quantity=10,
             target_size_usd_cents=500,
             triggering_match_id=match_id,
-            confirmation_weight=0.9,
             confidence_score=0.9,
             reasoning_text="r",
         )
@@ -154,7 +151,6 @@ class TestEntrySubmission:
             target_quantity=100,
             target_size_usd_cents=5000,
             triggering_match_id=match_id,
-            confirmation_weight=0.9,
             confidence_score=0.9,
             reasoning_text="r",
         )
@@ -196,7 +192,6 @@ class TestStopLossSubmission:
             target_quantity=10,
             target_size_usd_cents=800,
             triggering_match_id=match_id,
-            confirmation_weight=1.0,
             confidence_score=1.0,
             reasoning_text="r",
         )
@@ -260,7 +255,6 @@ class TestUpdatePositionMarks:
             target_quantity=10,
             target_size_usd_cents=500,
             triggering_match_id=match_id,
-            confirmation_weight=0.9,
             confidence_score=0.9,
             reasoning_text="r",
         )
@@ -295,7 +289,6 @@ class TestCloseResolved:
             target_quantity=10,
             target_size_usd_cents=420,
             triggering_match_id=match_id,
-            confirmation_weight=0.9,
             confidence_score=0.9,
             reasoning_text="r",
         )
@@ -316,7 +309,6 @@ class TestCloseResolved:
             target_quantity=10,
             target_size_usd_cents=420,
             triggering_match_id=match_id,
-            confirmation_weight=0.9,
             confidence_score=0.9,
             reasoning_text="r",
         )
@@ -350,7 +342,6 @@ def _entry_intent_with_walk(
         target_quantity=target_qty,
         target_size_usd_cents=target_budget,
         triggering_match_id=match_id,
-        confirmation_weight=0.9,
         confidence_score=0.9,
         target_avg_fill_price_cents=target_avg,
         target_max_fill_price_cents=target_avg,

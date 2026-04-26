@@ -39,57 +39,57 @@ news:
     # so is_kalshi_approved stays true. URLs go through a Google
     # redirector; URL canonicalization treats each as unique. See
     # VERIFICATION_PHASE_1_5.md for the URL-by-URL audit.
-    - {name: "reuters_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:reuters.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "ap_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:apnews.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "bloomberg", type: "rss", url: "https://feeds.bloomberg.com/politics/news.rss", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "nyt_politics", type: "rss", url: "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
-    - {name: "nyt_world", type: "rss", url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
+    - {name: "reuters_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:reuters.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "ap_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:apnews.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "bloomberg", type: "rss", url: "https://feeds.bloomberg.com/politics/news.rss", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "nyt_politics", type: "rss", url: "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "nyt_world", type: "rss", url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", poll_interval_sec: 90, is_kalshi_approved: true}
     # WaPo politics direct feed is intermittent (frequent timeouts);
     # /world still serves about 8 items reliably. We supplement with a
     # Google News query for fuller WaPo coverage.
-    - {name: "wapo_world", type: "rss", url: "https://feeds.washingtonpost.com/rss/world", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
-    - {name: "wapo_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:washingtonpost.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
-    - {name: "wsj_politics", type: "rss", url: "https://feeds.a.dj.com/rss/RSSPoliticsAndPolicy.xml", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "wsj_world", type: "rss", url: "https://feeds.a.dj.com/rss/RSSWorldNews.xml", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "axios", type: "rss", url: "https://api.axios.com/feed/", poll_interval_sec: 90, weight: 0.9, is_kalshi_approved: true}
-    - {name: "politico_picks", type: "rss", url: "https://www.politico.com/rss/politicopicks.xml", poll_interval_sec: 90, weight: 0.9, is_kalshi_approved: true}
-    - {name: "politico_wh", type: "rss", url: "https://rss.politico.com/whitehouse.xml", poll_interval_sec: 90, weight: 0.9, is_kalshi_approved: true}
-    - {name: "semafor_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:semafor.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 120, weight: 0.9, is_kalshi_approved: true}
-    - {name: "the_information", type: "rss", url: "https://www.theinformation.com/feed", poll_interval_sec: 120, weight: 0.9, is_kalshi_approved: true}
-    - {name: "cnn_politics", type: "rss", url: "http://rss.cnn.com/rss/cnn_allpolitics.rss", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "cnn_world", type: "rss", url: "http://rss.cnn.com/rss/cnn_world.rss", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "fox_politics", type: "rss", url: "https://moxie.foxnews.com/google-publisher/politics.xml", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "fox_world", type: "rss", url: "https://moxie.foxnews.com/google-publisher/world.xml", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
+    - {name: "wapo_world", type: "rss", url: "https://feeds.washingtonpost.com/rss/world", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "wapo_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:washingtonpost.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "wsj_politics", type: "rss", url: "https://feeds.a.dj.com/rss/RSSPoliticsAndPolicy.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "wsj_world", type: "rss", url: "https://feeds.a.dj.com/rss/RSSWorldNews.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "axios", type: "rss", url: "https://api.axios.com/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "politico_picks", type: "rss", url: "https://www.politico.com/rss/politicopicks.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "politico_wh", type: "rss", url: "https://rss.politico.com/whitehouse.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "semafor_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:semafor.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 120, is_kalshi_approved: true}
+    - {name: "the_information", type: "rss", url: "https://www.theinformation.com/feed", poll_interval_sec: 120, is_kalshi_approved: true}
+    - {name: "cnn_politics", type: "rss", url: "http://rss.cnn.com/rss/cnn_allpolitics.rss", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "cnn_world", type: "rss", url: "http://rss.cnn.com/rss/cnn_world.rss", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "fox_politics", type: "rss", url: "https://moxie.foxnews.com/google-publisher/politics.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "fox_world", type: "rss", url: "https://moxie.foxnews.com/google-publisher/world.xml", poll_interval_sec: 90, is_kalshi_approved: true}
     # Old http://msnbc.com/feeds/latest returns the homepage HTML; the
     # current RSS lives at /feed/.
-    - {name: "msnbc", type: "rss", url: "https://www.msnbc.com/feed/", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "nbc_politics", type: "rss", url: "https://feeds.nbcnews.com/nbcnews/public/politics", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "nbc_world", type: "rss", url: "https://feeds.nbcnews.com/nbcnews/public/world", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "abc_politics", type: "rss", url: "https://abcnews.go.com/abcnews/politicsheadlines", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "abc_international", type: "rss", url: "https://abcnews.go.com/abcnews/internationalheadlines", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "cbs_politics", type: "rss", url: "https://www.cbsnews.com/latest/rss/politics", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "cbs_world", type: "rss", url: "https://www.cbsnews.com/latest/rss/world", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
+    - {name: "msnbc", type: "rss", url: "https://www.msnbc.com/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "nbc_politics", type: "rss", url: "https://feeds.nbcnews.com/nbcnews/public/politics", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "nbc_world", type: "rss", url: "https://feeds.nbcnews.com/nbcnews/public/world", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "abc_politics", type: "rss", url: "https://abcnews.go.com/abcnews/politicsheadlines", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "abc_international", type: "rss", url: "https://abcnews.go.com/abcnews/internationalheadlines", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "cbs_politics", type: "rss", url: "https://www.cbsnews.com/latest/rss/politics", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "cbs_world", type: "rss", url: "https://www.cbsnews.com/latest/rss/world", poll_interval_sec: 90, is_kalshi_approved: true}
     # Government and official sources (treated as authoritative for these markets).
-    - {name: "whitehouse_news", type: "rss", url: "https://www.whitehouse.gov/news/feed/", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "whitehouse_press", type: "rss", url: "https://www.whitehouse.gov/briefing-room/press-briefings/feed/", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "state_press", type: "rss", url: "https://www.state.gov/press-releases/feed/", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "state_readouts", type: "rss", url: "https://www.state.gov/secretary-readouts/feed/", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "dod_news", type: "rss", url: "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=945&max=10", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
+    - {name: "whitehouse_news", type: "rss", url: "https://www.whitehouse.gov/news/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "whitehouse_press", type: "rss", url: "https://www.whitehouse.gov/briefing-room/press-briefings/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "state_press", type: "rss", url: "https://www.state.gov/press-releases/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "state_readouts", type: "rss", url: "https://www.state.gov/secretary-readouts/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "dod_news", type: "rss", url: "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=945&max=10", poll_interval_sec: 90, is_kalshi_approved: true}
     # Press release distribution — lower weight because they distribute on
     # behalf of others.
-    - {name: "pr_newswire_gov", type: "rss", url: "https://www.prnewswire.com/rss/policy-public-interest-latest-news/policy-public-interest-latest-news-list.rss", poll_interval_sec: 120, weight: 0.85, is_kalshi_approved: true}
-    - {name: "business_wire", type: "rss", url: "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRVw==", poll_interval_sec: 120, weight: 0.85, is_kalshi_approved: true}
+    - {name: "pr_newswire_gov", type: "rss", url: "https://www.prnewswire.com/rss/policy-public-interest-latest-news/policy-public-interest-latest-news-list.rss", poll_interval_sec: 120, is_kalshi_approved: true}
+    - {name: "business_wire", type: "rss", url: "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRVw==", poll_interval_sec: 120, is_kalshi_approved: true}
     # Verified social media. Twitter polling requires TWITTER_BEARER_TOKEN
     # in the environment; without it those sources are silently disabled
     # (a system_event records the disablement). Truth Social uses an
     # unauthenticated public scraper.
-    - {name: "twitter:@WhiteHouse", type: "twitter", handle: "WhiteHouse", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "twitter:@PressSec", type: "twitter", handle: "PressSec", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "twitter:@POTUS", type: "twitter", handle: "POTUS", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "twitter:@SecState", type: "twitter", handle: "SecState", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "twitter:@StateDept", type: "twitter", handle: "StateDept", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "twitter:@DeptofDefense", type: "twitter", handle: "DeptofDefense", poll_interval_sec: 90, weight: 0.9, is_kalshi_approved: true}
-    - {name: "truth_social:@realDonaldTrump", type: "truth_social", handle: "realDonaldTrump", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
+    - {name: "twitter:@WhiteHouse", type: "twitter", handle: "WhiteHouse", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "twitter:@PressSec", type: "twitter", handle: "PressSec", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "twitter:@POTUS", type: "twitter", handle: "POTUS", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "twitter:@SecState", type: "twitter", handle: "SecState", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "twitter:@StateDept", type: "twitter", handle: "StateDept", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "twitter:@DeptofDefense", type: "twitter", handle: "DeptofDefense", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "truth_social:@realDonaldTrump", type: "truth_social", handle: "realDonaldTrump", poll_interval_sec: 90, is_kalshi_approved: true}
 
 matcher:
   # "auto" → ~/.config/trumpbot/subject_aliases.yaml (macOS) or

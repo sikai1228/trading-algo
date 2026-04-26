@@ -34,6 +34,7 @@ from trumpbot.notifications.scheduled import (
     _check_source_health,
     _humanize_duration,
     _process_settlements,
+    _seconds_until_next_aligned_tick,
     _seconds_until_next_hour,
 )
 
@@ -323,6 +324,41 @@ class TestHelpers:
         assert _humanize_duration(timedelta(seconds=45)) == "45s"
         assert _humanize_duration(timedelta(seconds=300)) == "5 min"
         assert _humanize_duration(timedelta(seconds=4000)) == "1h"
+
+    # ----- Heartbeat aligned-tick helper (Phase 4 Part 2.4) -----
+
+    def test_aligned_tick_60min_at_quarter_past_returns_to_top_of_hour(self) -> None:
+        """interval=60: from 14:23 next tick is 15:00 → 37 min."""
+        now = datetime(2026, 4, 25, 14, 23, tzinfo=UTC)
+        secs = _seconds_until_next_aligned_tick(60, now=now)
+        assert secs == 37 * 60
+
+    def test_aligned_tick_60min_exactly_on_hour_skips_to_next(self) -> None:
+        """interval=60: from 14:00 exactly we advance one full hour
+        to 15:00 (never fire twice on the same boundary)."""
+        now = datetime(2026, 4, 25, 14, 0, 0, tzinfo=UTC)
+        secs = _seconds_until_next_aligned_tick(60, now=now)
+        assert secs == 60 * 60
+
+    def test_aligned_tick_15min_at_23_returns_30(self) -> None:
+        """interval=15: from 14:23 next tick is 14:30 → 7 min."""
+        now = datetime(2026, 4, 25, 14, 23, tzinfo=UTC)
+        secs = _seconds_until_next_aligned_tick(15, now=now)
+        assert secs == 7 * 60
+
+    def test_aligned_tick_15min_at_46_rolls_to_next_hour(self) -> None:
+        """interval=15: from 14:46 next tick is 15:00 → 14 min.
+        Verifies the spill-into-next-hour branch."""
+        now = datetime(2026, 4, 25, 14, 46, tzinfo=UTC)
+        secs = _seconds_until_next_aligned_tick(15, now=now)
+        assert secs == 14 * 60
+
+    def test_aligned_tick_60min_at_59_rolls_to_next_hour(self) -> None:
+        """interval=60: from 14:59 next tick is 15:00 → 1 min.
+        Edge case: very close to the boundary."""
+        now = datetime(2026, 4, 25, 14, 59, tzinfo=UTC)
+        secs = _seconds_until_next_aligned_tick(60, now=now)
+        assert secs == 60
 
 
 # Suppress unused-import warning.

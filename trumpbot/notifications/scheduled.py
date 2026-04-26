@@ -5,9 +5,9 @@ Phase 3 Part 2.
 Four asyncio coroutines the daemon supervises alongside the existing
 data-collection + decision tasks:
 
-- :func:`heartbeat_loop` -- every 15 min (configurable). Sends a
-  one-line ``heartbeat_periodic`` to Telegram with the current bot
-  state.
+- :func:`heartbeat_loop` -- every 60 min (configurable), aligned to
+  the wall-clock hour boundary. Sends a one-line
+  ``heartbeat_periodic`` to Telegram with the current bot state.
 - :func:`daily_digest_loop` -- once per day at 8:00 AM ET. Renders
   ``daily_digest`` from yesterday's outcomes + month-to-date.
 - :func:`settlement_notification_loop` -- every 5 min. Detects markets
@@ -67,8 +67,17 @@ async def heartbeat_loop(
     stop_event: asyncio.Event,
     sources_provider: Callable[[], tuple[int, int]] | None = None,
 ) -> None:
-    """Send the periodic ``heartbeat_periodic`` template every
-    ``interval_minutes`` until ``stop_event`` is set.
+    """Send the periodic ``heartbeat_periodic`` template aligned to
+    minute boundaries divisible by ``interval_minutes``.
+
+    Fires once immediately on startup (so the operator sees life
+    right after a redeploy), then schedules every subsequent
+    heartbeat at the next aligned wall-clock minute. For
+    ``interval_minutes=60`` that means fires at HH:00 of every hour;
+    for ``interval_minutes=15`` it would be HH:00, HH:15, HH:30,
+    HH:45. Drift never accumulates because each next-tick is
+    computed from current wall-clock time, not from the previous
+    fire.
 
     ``sources_provider`` returns ``(active, total)``; when None,
     ``source_status`` is queried instead. Returning a literal value
@@ -87,8 +96,43 @@ async def heartbeat_loop(
         except Exception as exc:  # pragma: no cover -- defensive
             log.error(f"{component}_error", error=repr(exc))
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop_event.wait(), timeout=interval_minutes * 60)
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=_seconds_until_next_aligned_tick(interval_minutes),
+            )
     log.info(f"{component}_stopped")
+
+
+def _seconds_until_next_aligned_tick(
+    interval_minutes: int, *, now: datetime | None = None
+) -> float:
+    """Return seconds-from-now until the next wall-clock minute mark
+    divisible by ``interval_minutes``.
+
+    Examples (UTC; conversion to ET happens at template-render time
+    only):
+
+    - ``interval=60`` at 14:23 → next tick at 15:00 → 37 min
+    - ``interval=60`` at 14:00 → next tick at 15:00 → 60 min
+    - ``interval=15`` at 14:23 → next tick at 14:30 → 7 min
+    - ``interval=15`` at 14:30 → next tick at 14:45 → 15 min
+
+    The "exactly at a tick" case rolls forward one full interval so
+    we never fire twice on the same wall-clock boundary.
+    """
+    n = now or datetime.now(UTC)
+    minutes_into_hour = n.minute
+    # Round UP to the next interval-aligned minute. If we're EXACTLY
+    # on a tick, advance by one full interval.
+    next_minute = ((minutes_into_hour // interval_minutes) + 1) * interval_minutes
+    target = n.replace(second=0, microsecond=0)
+    if next_minute >= 60:
+        # Spills into the next hour (or later, for interval=60).
+        target = target.replace(minute=0) + timedelta(hours=next_minute // 60)
+        target = target + timedelta(minutes=next_minute % 60)
+    else:
+        target = target.replace(minute=next_minute)
+    return max(1.0, (target - n).total_seconds())
 
 
 def _build_heartbeat_data(

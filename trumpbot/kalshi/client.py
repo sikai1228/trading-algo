@@ -15,7 +15,7 @@ import httpx
 import pydantic
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
-from trumpbot.kalshi.auth import build_auth_headers
+from trumpbot.kalshi.auth import API_PATH_PREFIX, build_auth_headers, signed_resource_path
 from trumpbot.kalshi.exceptions import (
     KalshiError,
     StateError,
@@ -39,7 +39,12 @@ T = TypeVar("T", bound=pydantic.BaseModel)
 
 log = get_logger(__name__)
 
-DEFAULT_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+# Production elections endpoint. Verified 2026-04-25 — a balance call
+# against this base URL with the signing scheme below succeeded. The
+# trailing path segment must match ``API_PATH_PREFIX`` (defined in
+# trumpbot.kalshi.auth) so that the URL and the signing path stay in
+# lockstep.
+DEFAULT_BASE_URL = f"https://api.elections.kalshi.com{API_PATH_PREFIX}"
 # Kalshi documents 100 reads/sec on the standard tier; cap at 80 % per spec.
 DEFAULT_RATE_PER_SEC = 80.0
 DEFAULT_BURST = 40.0
@@ -212,7 +217,10 @@ class KalshiClient:
         model: type[T],
     ) -> T:
         url = f"{self._base_url}{path}"
-        sign_path = f"/trade-api/v2{path}"
+        # Kalshi signs the FULL path including the API_PATH_PREFIX. The
+        # only sanctioned way to construct this string is
+        # signed_resource_path() — see trumpbot/kalshi/auth.py for why.
+        sign_path = signed_resource_path(path)
 
         async def attempt() -> T:
             headers = build_auth_headers(

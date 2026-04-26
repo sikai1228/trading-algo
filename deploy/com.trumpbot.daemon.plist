@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+launchd LaunchAgent for the trumpbot daemon on macOS.
+
+Install:
+  1. Copy this file to ~/Library/LaunchAgents/, replacing __HOME__ with
+     your actual home directory (e.g. /Users/sikai):
+       sed "s|__HOME__|$HOME|g" deploy/com.trumpbot.daemon.plist \
+         > ~/Library/LaunchAgents/com.trumpbot.daemon.plist
+  2. launchctl load ~/Library/LaunchAgents/com.trumpbot.daemon.plist
+  3. launchctl start com.trumpbot.daemon
+
+Uninstall:
+  launchctl unload ~/Library/LaunchAgents/com.trumpbot.daemon.plist
+  rm ~/Library/LaunchAgents/com.trumpbot.daemon.plist
+
+The daemon runs as the logged-in user; no root required. It reads
+~/.config/trumpbot/config.yaml, writes to
+~/Library/Application Support/trumpbot/, and logs to
+~/Library/Logs/trumpbot/.
+
+Run scripts/smoke_test.py once before loading this agent — it
+exercises the same code path against the same config and proves
+the credentials + network + Kalshi auth are working end-to-end.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.trumpbot.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/uv</string>
+        <string>run</string>
+        <string>--directory</string>
+        <string>__HOME__/Desktop/Auto Trading</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>trumpbot</string>
+        <string>--config</string>
+        <string>__HOME__/.config/trumpbot/config.yaml</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:__HOME__/.local/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/Desktop/Auto Trading</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Restart on non-zero exit. Don't restart while the user is
+             logged out (avoids hammering Kalshi if the network is down
+             but launchd keeps respawning). -->
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/trumpbot/stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/trumpbot/stderr.log</string>
+
+    <!-- macOS unloads agents whose binary isn't reachable; leaving a
+         stale plist after deleting the venv is a common foot-gun. The
+         RunAtLoad+KeepAlive combo above causes launchd to surface that
+         immediately in stderr.log. -->
+</dict>
+</plist>

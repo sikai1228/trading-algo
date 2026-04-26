@@ -1,3 +1,6 @@
+# Backtest output (per-run CSVs, not tracked)
+data/backtest_results/
+
 # Python
 __pycache__/
 *.py[cod]

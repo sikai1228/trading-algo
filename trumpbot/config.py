@@ -18,6 +18,10 @@ ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 class KalshiConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Production elections endpoints. Verified working 2026-04-25 via a
+    # signed /portfolio/balance call. The path segments after the host
+    # must match the constants in trumpbot.kalshi.auth (API_PATH_PREFIX
+    # and WS_AUTH_PATH); changing one without the other breaks signing.
     base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
     api_key_id: str
@@ -29,6 +33,93 @@ class KalshiConfig(BaseModel):
     rate_per_sec: float = 100.0
     rate_burst: float = 40.0
     rate_limit_pct: float = 0.8
+
+
+class DiscoveryConfig(BaseModel):
+    """Monthly KXTRUMPMEET discovery loop."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    series: str = "KXTRUMPMEET"
+    poll_interval_sec: int = 3600  # 1 hour per the brief
+    backfill_months: int = 2
+    # ``"auto"`` resolves to the platform default at startup; see
+    # trumpbot.platform_paths.
+    snapshot_dir: str = "auto"
+    initial_subjects_path: str | None = "auto"
+
+
+class TelegramConfig(BaseModel):
+    """Phase-1 heads-up notifier + Phase-2 approval-bot credentials.
+
+    Same chat_id is used for both: the bot polls and validates inbound
+    callbacks against this chat. Empty values disable Telegram cleanly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    bot_token: str | None = None
+    chat_id: str | None = None
+
+
+class DecisionPhaseConfig(BaseModel):
+    """Phase-2 decision-layer thresholds (LOCKED by CLAUDE.md)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    llm_confidence_threshold: float = 0.85
+    max_buy_price_cents: int = 80
+    position_size_base_pct: float = 0.08
+    # Phase 3 Part 1: two-cap system (was a single fixed cap in PR #10).
+    position_size_hard_cap_cents: int = 2000
+    """Cap one — hard fixed-dollar ceiling per trade, in USDCents.
+    Default $20.00. Configurable via the YAML field
+    ``decision.position_size_hard_cap_usd``."""
+
+    position_size_volume_pct: float = 0.05
+    """Cap two — fraction of the market's total traded volume the
+    bot is willing to take in a single trade. Default 5 %."""
+
+    min_trade_size_contracts: int = 5
+    """Skip the trade entirely if the walk fills fewer than this."""
+
+    min_trade_value_cents: int = 200
+    """Skip if the walk's total cost is below this. Default $2.00."""
+
+    total_exposure_cap_pct: float = 0.30
+    stop_loss_drop_cents: int = 50
+    decision_loop_interval_sec: int = 10
+    stop_loss_loop_interval_sec: int = 60
+    position_marking_loop_interval_sec: int = 60
+    reentry_loop_interval_sec: int = 30
+
+
+class RiskPhaseConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    halted: bool = False
+
+
+class ApprovalPhaseConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = "human"
+    entry_timeout_sec: int = 180
+    stop_loss_timeout_sec: int | None = None
+    reentry_timeout_sec: int | None = None
+
+
+class ExecutionPhaseConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: str = "dry_run"
+
+
+class BankrollConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    starting_amount_usd: float = 500.00
 
 
 class NewsConfig(BaseModel):
@@ -85,6 +176,13 @@ class TrumpbotConfig(BaseModel):
     health: HealthConfig = Field(default_factory=lambda: HealthConfig())
     logging: LoggingConfig = Field(default_factory=lambda: LoggingConfig())
     daemon: DaemonConfig = Field(default_factory=lambda: DaemonConfig())
+    discovery: DiscoveryConfig = Field(default_factory=lambda: DiscoveryConfig())
+    telegram: TelegramConfig = Field(default_factory=lambda: TelegramConfig())
+    decision: DecisionPhaseConfig = Field(default_factory=lambda: DecisionPhaseConfig())
+    risk: RiskPhaseConfig = Field(default_factory=lambda: RiskPhaseConfig())
+    approval: ApprovalPhaseConfig = Field(default_factory=lambda: ApprovalPhaseConfig())
+    execution: ExecutionPhaseConfig = Field(default_factory=lambda: ExecutionPhaseConfig())
+    bankroll: BankrollConfig = Field(default_factory=lambda: BankrollConfig())
 
 
 def _expand_env(value: Any) -> Any:

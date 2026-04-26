@@ -24,11 +24,14 @@ from trumpbot.config import TrumpbotConfig, load_config
 from trumpbot.db.connection import Database
 from trumpbot.db.repositories import (
     NewsMatchRow,
+    SubjectRow,
     fetch_news_events_without_matches,
     insert_news_matches,
     insert_system_event,
     list_active_markets,
+    list_markets_for_matching,
     recent_news_events,
+    upsert_subject,
 )
 from trumpbot.discovery.service import MarketDiscoveryService
 from trumpbot.discovery.subjects import DEFAULT_SUBJECT_ALIASES, SubjectExtractor
@@ -42,6 +45,8 @@ from trumpbot.news.matcher import MarketContext, NewsMatcher
 from trumpbot.news.rss import RSSPoller
 from trumpbot.news.truthsocial import TruthSocialScraper
 from trumpbot.news.twitter import TwitterScraper
+from trumpbot.notifications.telegram import TelegramNotifier
+from trumpbot.platform_paths import current_platform_paths, resolve_path
 from trumpbot.utils.logging import configure_logging, get_logger
 from trumpbot.utils.timeutil import utcnow_iso
 
@@ -61,9 +66,21 @@ TASK_HEALTHY = Gauge("trumpbot_task_healthy", "1 if task healthy", ["task"])
 async def _amain(config_path: Path) -> int:
     cfg = load_config(config_path)
     configure_logging(cfg.logging.level)
-    log.info("trumpbot_starting", config_path=str(config_path))
+    paths = current_platform_paths()
+    log.info(
+        "trumpbot_starting",
+        config_path=str(config_path),
+        platform=paths.config_dir.parts[1] if len(paths.config_dir.parts) > 1 else "unknown",
+    )
 
-    db = Database(cfg.database.path)
+    # Resolve "auto" path sentinels against the per-OS defaults so the
+    # same config.yaml works on macOS and Linux without editing.
+    db_path = resolve_path(cfg.database.path, paths.database_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    private_key_path = resolve_path(cfg.kalshi.private_key_path, paths.private_key_path)
+    snapshot_dir = resolve_path(cfg.discovery.snapshot_dir, paths.snapshot_dir)
+
+    db = Database(db_path)
     db.connect()
     insert_system_event(
         db,
@@ -71,11 +88,25 @@ async def _amain(config_path: Path) -> int:
         severity="info",
         component="daemon",
         message="trumpbot daemon starting",
+        detail={
+            "platform": paths.config_dir.parts[1] if len(paths.config_dir.parts) > 1 else "unknown",
+            "database_path": str(db_path),
+        },
     )
+
+    # Idempotently seed the subjects table from the YAML so the matcher
+    # has metadata even before the discovery service has run.
+    initial_subjects_path = (
+        resolve_path(cfg.discovery.initial_subjects_path, paths.initial_subjects_path)
+        if cfg.discovery.initial_subjects_path
+        else None
+    )
+    if initial_subjects_path is not None:
+        _seed_subjects(db, initial_subjects_path)
 
     extractor = _load_extractor(cfg)
     private_key = load_private_key(
-        cfg.kalshi.private_key_path,
+        private_key_path,
         passphrase=(
             cfg.kalshi.private_key_passphrase.encode()
             if cfg.kalshi.private_key_passphrase
@@ -92,14 +123,18 @@ async def _amain(config_path: Path) -> int:
         rate_limit_pct=cfg.kalshi.rate_limit_pct,
     )
     bus = EventBus()
+    telegram = TelegramNotifier(
+        bot_token=cfg.telegram.bot_token,
+        chat_id=cfg.telegram.chat_id,
+    )
     discovery = MarketDiscoveryService(
         client=rest_client,
         db=db,
-        target_series=cfg.kalshi.target_series,
-        extractor=extractor,
         event_bus=bus,
-        poll_interval_sec=cfg.kalshi.market_discovery_interval_sec,
-        backfill_days=cfg.kalshi.backfill_days,
+        telegram=telegram,
+        series=cfg.discovery.series,
+        poll_interval_sec=cfg.discovery.poll_interval_sec,
+        snapshot_dir=snapshot_dir,
     )
     ws_feed = KalshiWebSocketFeed(
         rest_client=rest_client,
@@ -120,9 +155,119 @@ async def _amain(config_path: Path) -> int:
     )
     heartbeat = HeartbeatLogger(db=db, interval_sec=cfg.daemon.heartbeat_interval_sec)
 
+    # ---- Phase 2 decision layer ----
+    from trumpbot.approval.gate import ApprovalGate, ApprovalGateConfig
+    from trumpbot.approval.telegram_bot import TelegramApprovalBot
+    from trumpbot.decision.engine import DecisionConfig as DecCfg
+    from trumpbot.decision.engine import DecisionEngine
+    from trumpbot.decision.loops import (
+        decision_loop,
+        position_marking_loop,
+        reentry_loop,
+        stop_loss_loop,
+    )
+    from trumpbot.execution.dry_run import DryRunExecutor, Quote
+    from trumpbot.risk.manager import RiskConfig as RskCfg
+    from trumpbot.risk.manager import RiskManager
+
+    decision_engine = DecisionEngine(
+        DecCfg(
+            llm_confidence_threshold=cfg.decision.llm_confidence_threshold,
+            max_buy_price_cents=cfg.decision.max_buy_price_cents,
+            position_size_base_pct=cfg.decision.position_size_base_pct,
+            position_size_hard_cap_cents=cfg.decision.position_size_hard_cap_cents,
+            position_size_volume_pct=cfg.decision.position_size_volume_pct,
+            min_trade_size_contracts=cfg.decision.min_trade_size_contracts,
+            min_trade_value_cents=cfg.decision.min_trade_value_cents,
+            total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
+            stop_loss_drop_cents=cfg.decision.stop_loss_drop_cents,
+        )
+    )
+    risk_manager = RiskManager(
+        db=db,
+        config=RskCfg(
+            enabled=cfg.risk.enabled,
+            max_buy_price_cents=cfg.decision.max_buy_price_cents,
+            total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
+            position_size_hard_cap_cents=cfg.decision.position_size_hard_cap_cents,
+            halted=cfg.risk.halted,
+        ),
+    )
+
+    # Telegram bot — Phase 2 needs the approval flow. Falls back to a
+    # stub requester if no token is configured (the loops will record
+    # "send_failed" expirations rather than crashing).
+    telegram_bot: TelegramApprovalBot | None = None
+    requester: object
+    if cfg.telegram.bot_token and cfg.telegram.chat_id:
+        telegram_bot = TelegramApprovalBot(
+            bot_token=cfg.telegram.bot_token, chat_id=cfg.telegram.chat_id
+        )
+        await telegram_bot.start()
+        requester = telegram_bot
+    else:
+        # No-op requester so the gate is callable in headless setups.
+        from trumpbot.approval.gate import ApprovalRequester
+
+        class _StubRequester(ApprovalRequester):
+            chat_id = None
+
+            async def send_request(
+                self, *, intent_id: str, intent_type: str, message_text: str
+            ) -> int:
+                raise RuntimeError("Telegram not configured")
+
+            async def await_response(
+                self, *, intent_id: str, timeout_sec: int | None
+            ) -> tuple[str, str]:
+                return ("expired", "timeout")
+
+        requester = _StubRequester()
+
+    def _orderbook(ticker: str) -> Quote:
+        # Read from the WS feed's in-memory book if available; fall back
+        # to (None, None) if the ticker isn't subscribed.
+        book = ws_feed._books.get(ticker)  # direct internal read
+        if book is None:
+            return Quote(yes_bid_cents=None, yes_ask_cents=None)
+        return Quote(yes_bid_cents=book.best_yes_bid(), yes_ask_cents=book.best_yes_ask())
+
+    def _depth(ticker: str) -> list[tuple[int, int]] | None:
+        """Phase 3 Part 1: full YES-ask depth for the walker. NO bids
+        are inverted to implied YES asks via :func:`merge_to_yes_asks`
+        and merged with the YES side."""
+        from trumpbot.execution.slippage import merge_to_yes_asks
+
+        book = ws_feed._books.get(ticker)
+        if book is None:
+            return None
+        return merge_to_yes_asks(
+            book.yes_levels_sorted(),
+            book.no_levels_sorted(),
+        )
+
+    approval_gate = ApprovalGate(
+        db=db,
+        config=ApprovalGateConfig(
+            mode=cfg.approval.mode,
+            entry_timeout_sec=cfg.approval.entry_timeout_sec,
+            stop_loss_timeout_sec=cfg.approval.stop_loss_timeout_sec,
+            reentry_timeout_sec=cfg.approval.reentry_timeout_sec,
+        ),
+        requester=requester,  # type: ignore[arg-type]
+        depth_fn=_depth,
+    )
+
+    dry_run_executor = DryRunExecutor(db=db, orderbook_fn=_orderbook, depth_fn=_depth)
+
     bus.subscribe("news_event_ingested", _make_news_metric_handler())
     bus.subscribe("market_discovered", _make_market_metric_handler(db))
     bus.subscribe("market_status_changed", _make_market_metric_handler(db))
+    # Auto-subscribe the WS feed to every market the discovery service
+    # finds. Without this, a fresh deployment with no markets in the DB
+    # at startup time would never produce price snapshots — the smoke
+    # test specifically asserts at least one snapshot within 60 s.
+    bus.subscribe("market_discovered", _make_ws_subscribe_handler(ws_feed))
 
     health = HealthcheckServer(
         health_check=_make_health_check(ws_feed, discovery, matcher_worker),
@@ -149,6 +294,71 @@ async def _amain(config_path: Path) -> int:
         "kalshi_ws": asyncio.create_task(_supervised(ws_feed.run, "kalshi_ws", critical=True)),
         "matcher": asyncio.create_task(_supervised(matcher_worker.run, "matcher", critical=False)),
         "heartbeat": asyncio.create_task(_supervised(heartbeat.run, "heartbeat", critical=False)),
+        "decision_loop": asyncio.create_task(
+            _supervised(
+                lambda: decision_loop(
+                    db=db,
+                    engine=decision_engine,
+                    risk=risk_manager,
+                    gate=approval_gate,
+                    executor=dry_run_executor,
+                    orderbook=_orderbook,
+                    depth=_depth,
+                    starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    poll_interval_sec=cfg.decision.decision_loop_interval_sec,
+                    stop_event=stop_event,
+                ),
+                "decision_loop",
+                critical=False,
+            )
+        ),
+        "stop_loss_loop": asyncio.create_task(
+            _supervised(
+                lambda: stop_loss_loop(
+                    db=db,
+                    engine=decision_engine,
+                    risk=risk_manager,
+                    gate=approval_gate,
+                    executor=dry_run_executor,
+                    orderbook=_orderbook,
+                    depth=_depth,
+                    starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    poll_interval_sec=cfg.decision.stop_loss_loop_interval_sec,
+                    stop_event=stop_event,
+                ),
+                "stop_loss_loop",
+                critical=False,
+            )
+        ),
+        "position_marking_loop": asyncio.create_task(
+            _supervised(
+                lambda: position_marking_loop(
+                    executor=dry_run_executor,
+                    poll_interval_sec=cfg.decision.position_marking_loop_interval_sec,
+                    stop_event=stop_event,
+                ),
+                "position_marking_loop",
+                critical=False,
+            )
+        ),
+        "reentry_loop": asyncio.create_task(
+            _supervised(
+                lambda: reentry_loop(
+                    db=db,
+                    engine=decision_engine,
+                    risk=risk_manager,
+                    gate=approval_gate,
+                    executor=dry_run_executor,
+                    orderbook=_orderbook,
+                    depth=_depth,
+                    starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    poll_interval_sec=cfg.decision.reentry_loop_interval_sec,
+                    stop_event=stop_event,
+                ),
+                "reentry_loop",
+                critical=False,
+            )
+        ),
     }
 
     log.info("trumpbot_started", task_count=len(tasks))
@@ -178,6 +388,9 @@ async def _amain(config_path: Path) -> int:
         await twitter_scraper.stop()
         await truth_scraper.stop()
         await rest_client.aclose()
+        await telegram.aclose()
+        if telegram_bot is not None:
+            await telegram_bot.stop()
         await health.stop()
         insert_system_event(
             db,
@@ -223,6 +436,58 @@ def _make_market_metric_handler(db: Database) -> Callable[[Event], Awaitable[Non
         ACTIVE_MARKETS.set(len(list_active_markets(db)))
 
     return handle
+
+
+def _make_ws_subscribe_handler(
+    ws_feed: KalshiWebSocketFeed,
+) -> Callable[[Event], Awaitable[None]]:
+    """Subscribe the WebSocket feed to any newly-discovered market."""
+
+    async def handle(event: Event) -> None:
+        ticker = event.payload.get("ticker")
+        if isinstance(ticker, str):
+            await ws_feed.subscribe(ticker)
+
+    return handle
+
+
+def _seed_subjects(db: Database, path: Path) -> None:
+    """Idempotently upsert every subject defined in ``path`` (YAML)."""
+    if not path.is_file():
+        log.info("initial_subjects_not_found", path=str(path))
+        return
+    import yaml as _yaml
+
+    raw = _yaml.safe_load(path.read_text()) or {}
+    rows = raw.get("subjects") or []
+    if not isinstance(rows, list):
+        log.warning("initial_subjects_invalid_shape", path=str(path))
+        return
+    seeded = 0
+    for entry in rows:
+        if not isinstance(entry, dict):
+            continue
+        subject_key = entry.get("subject_key")
+        full_name = entry.get("full_name")
+        aliases = entry.get("aliases") or []
+        if not isinstance(subject_key, str) or not isinstance(full_name, str):
+            continue
+        if not isinstance(aliases, list):
+            continue
+        upsert_subject(
+            db,
+            SubjectRow(
+                subject_key=subject_key,
+                full_name=full_name,
+                aliases=[str(a) for a in aliases],
+                ticker_suffix=None,
+                auto_extracted=False,
+                llm_enriched=False,
+                reviewed=False,
+            ),
+        )
+        seeded += 1
+    log.info("initial_subjects_seeded", path=str(path), count=seeded)
 
 
 def _make_health_check(
@@ -318,7 +583,11 @@ class MatcherWorker:
         events = fetch_news_events_without_matches(self._db, limit=self._batch_size)
         if not events:
             return 0
-        markets_rows = list_active_markets(self._db)
+        # Match against ALL markets with subject (not just active) so the
+        # observation period captures matches against settled markets too
+        # — those are how we calibrate matcher quality. The Phase-2
+        # decision engine will filter back to active before any trading.
+        markets_rows = list_markets_for_matching(self._db)
         contexts = [
             MarketContext(
                 ticker=row["ticker"],
@@ -331,9 +600,20 @@ class MatcherWorker:
         ]
         if not contexts:
             return len(events)
+
+        # Build a fresh matcher each batch with aliases pulled from the
+        # subjects table merged on top of DEFAULT_SUBJECT_ALIASES. Without
+        # this, the discovery service's "vladimirputin" subject_keys
+        # never resolve to alias lists and every match returns
+        # confidence=0 / "unknown_subject". This is the bridge between
+        # the Phase-1 discovery-side keys (long form) and the matcher's
+        # original short-form keys.
+        merged_aliases = self._build_merged_aliases()
+        matcher = NewsMatcher(extractor=SubjectExtractor(aliases=merged_aliases))
+
         rows: list[NewsMatchRow] = []
         for evt in events:
-            results = self._matcher.match(
+            results = matcher.match(
                 headline=evt["headline"],
                 body=evt["body_excerpt"],
                 markets=contexts,
@@ -354,6 +634,12 @@ class MatcherWorker:
                 MATCHES_WRITTEN.labels(confidence_bucket=bucket).inc()
         insert_news_matches(self._db, rows)
         return len(events)
+
+    def _build_merged_aliases(self) -> dict[str, list[str]]:
+        """Discovery-service subjects layered on top of DEFAULT_SUBJECT_ALIASES."""
+        from trumpbot.db.repositories import subjects_alias_map
+
+        return {**DEFAULT_SUBJECT_ALIASES, **subjects_alias_map(self._db)}
 
 
 def _bucket(confidence: float) -> str:

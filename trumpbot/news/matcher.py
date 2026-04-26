@@ -75,6 +75,31 @@ DIRECT_VERBS: Final[tuple[str, ...]] = (
     "video-call",
     "videoconference",
     "video conference",
+    # Briefings: contract-relevant when both parties are present
+    # ("Powell briefed Trump on rates").
+    "briefed",
+    "briefing",
+    "briefing with",
+    # Meal meetings: explicitly listed in the contract as qualifying
+    # ("Working dinners, lunches, or other meal meetings"). Forms with
+    # and without "with" both common in real headlines; the proximity
+    # check anchors them to the subject so the bare forms don't run wild.
+    "dined",
+    "dined with",
+    "dinner",
+    "dinner with",
+    "had dinner",
+    "had dinner with",
+    "lunch",
+    "lunch with",
+    "lunched",
+    "lunched with",
+    "had lunch",
+    "had lunch with",
+    "breakfast",
+    "breakfast with",
+    "had breakfast",
+    "had breakfast with",
 )
 
 # Verbs that indicate a *mention* but not necessarily a conversation.
@@ -429,9 +454,14 @@ class NewsMatcher:
 
     @staticmethod
     def _within_distance(text: str, phrase_a: str, phrase_b: str, *, distance: int) -> bool:
-        """True if `phrase_a` and `phrase_b` both occur in text within ``distance`` chars."""
-        a_re = re.compile(rf"\b{re.escape(phrase_a)}\b")
-        b_re = re.compile(rf"\b{re.escape(phrase_b)}\b")
+        """True if `phrase_a` and `phrase_b` both occur in text within ``distance`` chars.
+
+        ``text`` is pre-lowercased upstream; both phrases are lowercased
+        here so callers can pass aliases in their natural casing
+        ("Vladimir Putin", "Bibi") without silently never matching.
+        """
+        a_re = re.compile(rf"\b{re.escape(phrase_a.lower())}\b")
+        b_re = re.compile(rf"\b{re.escape(phrase_b.lower())}\b")
         a_positions = [m.start() for m in a_re.finditer(text)]
         if not a_positions:
             return False

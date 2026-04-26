@@ -54,7 +54,10 @@ class TestMigrations:
         tmp_db.close()
         tmp_db.connect()
         rows = list(tmp_db.connect().execute("SELECT filename FROM schema_migrations"))
-        assert len(rows) == 1
+        # Each migration file should appear exactly once even after reopen.
+        filenames = sorted(r["filename"] for r in rows)
+        assert filenames == sorted(set(filenames))
+        assert "001_initial.sql" in filenames
 
 
 class TestMarketRepo:

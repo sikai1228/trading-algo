@@ -59,9 +59,14 @@ class RSSPoller(NewsMonitor):
         self._db = db
         self._bus = event_bus
         self._owns_http = http_client is None
+        # follow_redirects=True is essential — many feeds (MSNBC, ABC,
+        # WaPo, ...) return 301 to canonical URLs. httpx defaults to
+        # NOT following, which would silently turn every 301 feed into
+        # zero ingested articles.
         self._http = http_client or httpx.AsyncClient(
             timeout=RSS_FETCH_TIMEOUT_SEC,
             headers={"User-Agent": USER_AGENT},
+            follow_redirects=True,
         )
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []

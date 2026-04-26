@@ -2,6 +2,32 @@
 
 Run on the `verification-pass` branch off `phase-1-data-collection`.
 
+## Kalshi Authentication
+
+**PASS — verified 2026-04-25.** Manual `GET /portfolio/balance` against
+`https://api.elections.kalshi.com/trade-api/v2` using the signing scheme
+in `trumpbot/kalshi/auth.py` returned a valid balance response. The
+critical detail (the REST signing path must include the
+`/trade-api/v2` prefix) is locked in by:
+
+- `API_PATH_PREFIX = "/trade-api/v2"` and `WS_AUTH_PATH =
+  "/trade-api/ws/v2"` — single source of truth in
+  `trumpbot/kalshi/auth.py`.
+- `signed_resource_path(resource)` — the only sanctioned way to build a
+  REST signing path.
+- `tests/test_kalshi_signing.py::TestSignatureIncludesPathPrefix::test_signature_includes_path_prefix`
+  — regression test that fails loudly if the prefix is ever dropped, plus
+  source-level guards that scan `client.py` and `kalshi_ws.py` for any
+  reintroduced literal `/trade-api/...` strings outside the auth module.
+- Pinned signing-message vector
+  `1777151610000GET/trade-api/v2/portfolio/balance` is exact-string
+  asserted in `test_pinned_signing_message`.
+
+Bug class prevented: signature mismatches caused by REST and WebSocket
+paths drifting apart between files.
+
+
+
 The brief uses `bot/` as the package name; this codebase calls it
 `trumpbot/` (decision made in the bootstrap session). Reads "bot/" in
 the checks below as "trumpbot/".

@@ -1,18 +1,28 @@
-# Example trumpbot config. Copy to /etc/trumpbot/config.yaml and edit.
+# Example trumpbot config.
+#
+# Default install paths (resolved automatically when the field is "auto"):
+#   macOS  → ~/.config/trumpbot/config.yaml
+#   Linux  → /etc/trumpbot/config.yaml
+#
 # Environment placeholders ${VAR_NAME} are expanded at load time from
-# /etc/trumpbot/secrets.env (sourced by systemd via EnvironmentFile=).
+# the per-OS secrets.env (sourced by systemd or launchd).
+#
+# Any path field set to "auto" is resolved at startup against the
+# OS-appropriate default in trumpbot.platform_paths. The same example
+# therefore works on macOS and Linux without editing.
 
 kalshi:
   base_url: "https://api.elections.kalshi.com/trade-api/v2"
   ws_url: "wss://api.elections.kalshi.com/trade-api/ws/v2"
   api_key_id: "${KALSHI_API_KEY_ID}"
-  private_key_path: "/etc/trumpbot/kalshi_private.pem"
+  # "auto" → ~/.config/trumpbot/kalshi_private.pem (macOS) or
+  #          /etc/trumpbot/kalshi_private.pem (Linux).
+  private_key_path: "auto"
   private_key_passphrase: "${KALSHI_PRIVATE_KEY_PASSPHRASE}"
-  # Verify exact series tickers in the Kalshi platform before deployment.
+  # Phase 1 confirmed-active series. Other series can be added once their
+  # event-ticker pattern is verified.
   target_series:
-    - "KXTRUMPCALL"
     - "KXTRUMPMEET"
-    - "KXTRUMPMENTION"
   market_discovery_interval_sec: 300
   backfill_days: 60
   rate_per_sec: 100.0
@@ -21,25 +31,38 @@ kalshi:
 
 news:
   sources:
-    - {name: "reuters", type: "rss", url: "https://www.reutersagency.com/feed/?best-topics=political-general&post_type=best", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
-    - {name: "ap", type: "rss", url: "https://apnews.com/hub/ap-top-news/feed", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
+    # Reuters / AP / Semafor have no working public RSS as of 2026-04-25
+    # (Reuters shut down feeds in 2020, AP moved to a partner-only API,
+    # Semafor never published one). We use a Google News source-filtered
+    # query as the discovery mechanism — the underlying article is still
+    # the Kalshi-approved outlet (the <source> field in the RSS confirms),
+    # so is_kalshi_approved stays true. URLs go through a Google
+    # redirector; URL canonicalization treats each as unique. See
+    # VERIFICATION_PHASE_1_5.md for the URL-by-URL audit.
+    - {name: "reuters_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:reuters.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
+    - {name: "ap_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:apnews.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
     - {name: "bloomberg", type: "rss", url: "https://feeds.bloomberg.com/politics/news.rss", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
     - {name: "nyt_politics", type: "rss", url: "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
     - {name: "nyt_world", type: "rss", url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
-    - {name: "wapo_politics", type: "rss", url: "http://feeds.washingtonpost.com/rss/politics", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
-    - {name: "wapo_world", type: "rss", url: "http://feeds.washingtonpost.com/rss/world", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
+    # WaPo politics direct feed is intermittent (frequent timeouts);
+    # /world still serves about 8 items reliably. We supplement with a
+    # Google News query for fuller WaPo coverage.
+    - {name: "wapo_world", type: "rss", url: "https://feeds.washingtonpost.com/rss/world", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
+    - {name: "wapo_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:washingtonpost.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, weight: 0.95, is_kalshi_approved: true}
     - {name: "wsj_politics", type: "rss", url: "https://feeds.a.dj.com/rss/RSSPoliticsAndPolicy.xml", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
     - {name: "wsj_world", type: "rss", url: "https://feeds.a.dj.com/rss/RSSWorldNews.xml", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
     - {name: "axios", type: "rss", url: "https://api.axios.com/feed/", poll_interval_sec: 90, weight: 0.9, is_kalshi_approved: true}
     - {name: "politico_picks", type: "rss", url: "https://www.politico.com/rss/politicopicks.xml", poll_interval_sec: 90, weight: 0.9, is_kalshi_approved: true}
     - {name: "politico_wh", type: "rss", url: "https://rss.politico.com/whitehouse.xml", poll_interval_sec: 90, weight: 0.9, is_kalshi_approved: true}
-    - {name: "semafor", type: "rss", url: "https://www.semafor.com/feed.xml", poll_interval_sec: 120, weight: 0.9, is_kalshi_approved: true}
+    - {name: "semafor_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:semafor.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 120, weight: 0.9, is_kalshi_approved: true}
     - {name: "the_information", type: "rss", url: "https://www.theinformation.com/feed", poll_interval_sec: 120, weight: 0.9, is_kalshi_approved: true}
     - {name: "cnn_politics", type: "rss", url: "http://rss.cnn.com/rss/cnn_allpolitics.rss", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
     - {name: "cnn_world", type: "rss", url: "http://rss.cnn.com/rss/cnn_world.rss", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
     - {name: "fox_politics", type: "rss", url: "https://moxie.foxnews.com/google-publisher/politics.xml", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
     - {name: "fox_world", type: "rss", url: "https://moxie.foxnews.com/google-publisher/world.xml", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
-    - {name: "msnbc", type: "rss", url: "http://www.msnbc.com/feeds/latest", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
+    # Old http://msnbc.com/feeds/latest returns the homepage HTML; the
+    # current RSS lives at /feed/.
+    - {name: "msnbc", type: "rss", url: "https://www.msnbc.com/feed/", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
     - {name: "nbc_politics", type: "rss", url: "https://feeds.nbcnews.com/nbcnews/public/politics", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
     - {name: "nbc_world", type: "rss", url: "https://feeds.nbcnews.com/nbcnews/public/world", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
     - {name: "abc_politics", type: "rss", url: "https://abcnews.go.com/abcnews/politicsheadlines", poll_interval_sec: 90, weight: 0.85, is_kalshi_approved: true}
@@ -69,14 +92,19 @@ news:
     - {name: "truth_social:@realDonaldTrump", type: "truth_social", handle: "realDonaldTrump", poll_interval_sec: 90, weight: 1.0, is_kalshi_approved: true}
 
 matcher:
-  subject_aliases_path: "/etc/trumpbot/subject_aliases.yaml"
+  # "auto" → ~/.config/trumpbot/subject_aliases.yaml (macOS) or
+  #          /etc/trumpbot/subject_aliases.yaml (Linux). Optional.
+  subject_aliases_path: "auto"
   body_match_window_chars: 500
   verb_proximity_chars: 200
   poll_interval_sec: 5
   batch_size: 100
 
 database:
-  path: "/var/lib/trumpbot/trumpbot.db"
+  # "auto" →
+  #   ~/Library/Application Support/trumpbot/trumpbot.db (macOS)
+  #   /var/lib/trumpbot/trumpbot.db                       (Linux)
+  path: "auto"
 
 health:
   host: "127.0.0.1"
@@ -88,3 +116,74 @@ logging:
 
 daemon:
   heartbeat_interval_sec: 60
+
+discovery:
+  # Monthly KXTRUMPMEET event auto-discovery. The service polls
+  # /events/{event_ticker} for the current and next calendar month
+  # every poll_interval_sec, upserts new markets, and writes
+  # snapshot artifacts to snapshot_dir. See trumpbot/discovery/.
+  series: "KXTRUMPMEET"
+  poll_interval_sec: 3600
+  backfill_months: 2
+  # "auto" →
+  #   ~/Library/Application Support/trumpbot/markets/ (macOS)
+  #   /var/lib/trumpbot/markets/                       (Linux)
+  snapshot_dir: "auto"
+  # Optional. If present, the daemon upserts every entry into the
+  # `subjects` table at startup so the matcher has a baseline of
+  # known names even before the first discovery cycle runs. The
+  # discovery service refines aliases with full-name forms from
+  # actual market titles. "auto" → look in the platform config dir.
+  initial_subjects_path: "auto"
+
+telegram:
+  # Phase 1 only sends one-way heads-up notifications (e.g. "new
+  # month detected"). Leave both empty to disable; the daemon runs
+  # without it. Bidirectional approval flow lands in Phase 3.
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_id: "${TELEGRAM_CHAT_ID}"
+
+# ----- Phase 2 (decision layer) -----------------------------------------
+
+decision:
+  llm_confidence_threshold: 0.85
+  max_buy_price_cents: 80
+  position_size_base_pct: 0.08
+
+  # ----- Phase 3 Part 1: two-cap sizing system -----
+  # Cap one — hard fixed-dollar ceiling per trade (in cents). Default
+  # $20.00 = 2000c. Easy to raise (e.g. to 50000 = $500) once the
+  # strategy proves itself.
+  position_size_hard_cap_cents: 2000
+  # Cap two — fraction of the market's total traded volume the bot
+  # will take in a single trade. Default 5 %. Cap two evaluates against
+  # ``markets.volume`` × $1/contract, so a brand-new market with no
+  # volume yet effectively disables itself.
+  position_size_volume_pct: 0.05
+  # Skip the trade entirely if the order-book walk fills fewer
+  # contracts than this, OR fewer dollars than min_trade_value_cents.
+  min_trade_size_contracts: 5
+  min_trade_value_cents: 200
+
+  total_exposure_cap_pct: 0.30
+  stop_loss_drop_cents: 50
+  decision_loop_interval_sec: 10
+  stop_loss_loop_interval_sec: 60
+  position_marking_loop_interval_sec: 60
+  reentry_loop_interval_sec: 30
+
+risk:
+  enabled: true
+  halted: false  # set true to halt all new orders (Phase-3 /halt stub)
+
+approval:
+  mode: "human"  # always 'human' in Phase 2
+  entry_timeout_sec: 180
+  stop_loss_timeout_sec: null   # unlimited per locked rules
+  reentry_timeout_sec: null     # unlimited per locked rules
+
+execution:
+  mode: "dry_run"  # 'dry_run' until Phase 4
+
+bankroll:
+  starting_amount_usd: 500.00  # adjust per actual deposit

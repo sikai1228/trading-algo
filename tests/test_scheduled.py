@@ -30,11 +30,9 @@ from trumpbot.notifications.alerts import AlertDispatcher
 from trumpbot.notifications.llm_cost import LLMCostGuard, LLMCostGuardConfig
 from trumpbot.notifications.scheduled import (
     _build_digest_data,
-    _build_heartbeat_data,
     _check_source_health,
     _humanize_duration,
     _process_settlements,
-    _seconds_until_next_aligned_tick,
     _seconds_until_next_hour,
 )
 
@@ -128,31 +126,11 @@ def _open_trade(db: Database, *, status: str = "dry_run") -> int:
     )
 
 
-# ---------------------------------------------------------------------------
-# Heartbeat data
-# ---------------------------------------------------------------------------
-
-
-class TestHeartbeatData:
-    def test_no_open_positions(self, tmp_path: Path) -> None:
-        db = _db(tmp_path)
-        cg = LLMCostGuard(db=db, config=LLMCostGuardConfig(monthly_cap_usd_cents=1000))
-        data = _build_heartbeat_data(db, cg, sources_provider=lambda: (5, 8))
-        assert data["open_count"] == 0
-        assert data["sources_active"] == 5
-        assert data["sources_total"] == 8
-        assert data["llm_today"] == "$0.00"
-        assert data["llm_cap"] == "$10.00"
-        assert "+" in data["today_pnl"] or "-" in data["today_pnl"]
-
-    def test_falls_back_to_source_status_when_no_provider(self, tmp_path: Path) -> None:
-        db = _db(tmp_path)
-        upsert_source_status(db, source_name="ap", current_status="active")
-        upsert_source_status(db, source_name="reuters", current_status="down")
-        cg = LLMCostGuard(db=db, config=LLMCostGuardConfig(monthly_cap_usd_cents=1000))
-        data = _build_heartbeat_data(db, cg, sources_provider=None)
-        assert data["sources_total"] == 2
-        assert data["sources_active"] == 1
+# Phase 4 Part 2.10 — TestHeartbeatData was REMOVED with
+# _build_heartbeat_data and the heartbeat_loop. The morning daily
+# digest is the regular status notification now; /status is on
+# demand. See tests/test_no_heartbeat.py for the regression test
+# pinning the surface stays gone.
 
 
 # ---------------------------------------------------------------------------
@@ -324,40 +302,11 @@ class TestHelpers:
         assert _humanize_duration(timedelta(seconds=300)) == "5 min"
         assert _humanize_duration(timedelta(seconds=4000)) == "1h"
 
-    # ----- Heartbeat aligned-tick helper (Phase 4 Part 2.4) -----
 
-    def test_aligned_tick_60min_at_quarter_past_returns_to_top_of_hour(self) -> None:
-        """interval=60: from 14:23 next tick is 15:00 → 37 min."""
-        now = datetime(2026, 4, 25, 14, 23, tzinfo=UTC)
-        secs = _seconds_until_next_aligned_tick(60, now=now)
-        assert secs == 37 * 60
-
-    def test_aligned_tick_60min_exactly_on_hour_skips_to_next(self) -> None:
-        """interval=60: from 14:00 exactly we advance one full hour
-        to 15:00 (never fire twice on the same boundary)."""
-        now = datetime(2026, 4, 25, 14, 0, 0, tzinfo=UTC)
-        secs = _seconds_until_next_aligned_tick(60, now=now)
-        assert secs == 60 * 60
-
-    def test_aligned_tick_15min_at_23_returns_30(self) -> None:
-        """interval=15: from 14:23 next tick is 14:30 → 7 min."""
-        now = datetime(2026, 4, 25, 14, 23, tzinfo=UTC)
-        secs = _seconds_until_next_aligned_tick(15, now=now)
-        assert secs == 7 * 60
-
-    def test_aligned_tick_15min_at_46_rolls_to_next_hour(self) -> None:
-        """interval=15: from 14:46 next tick is 15:00 → 14 min.
-        Verifies the spill-into-next-hour branch."""
-        now = datetime(2026, 4, 25, 14, 46, tzinfo=UTC)
-        secs = _seconds_until_next_aligned_tick(15, now=now)
-        assert secs == 14 * 60
-
-    def test_aligned_tick_60min_at_59_rolls_to_next_hour(self) -> None:
-        """interval=60: from 14:59 next tick is 15:00 → 1 min.
-        Edge case: very close to the boundary."""
-        now = datetime(2026, 4, 25, 14, 59, tzinfo=UTC)
-        secs = _seconds_until_next_aligned_tick(60, now=now)
-        assert secs == 60
+# Phase 4 Part 2.10 — the `_seconds_until_next_aligned_tick` tests
+# were REMOVED with the helper itself when the heartbeat_loop went
+# away. The daily-digest scheduler uses `_seconds_until_next_hour`
+# (still exercised above).
 
 
 # Suppress unused-import warning.

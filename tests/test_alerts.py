@@ -205,20 +205,32 @@ class TestDedup:
 class TestMisuse:
     @pytest.mark.asyncio
     async def test_non_alert_template_rejected(self, tmp_path: Path) -> None:
-        """Sending a heartbeat through the alert dispatcher would
-        misroute the audit severity. Reject at the boundary."""
+        """Sending a digest through the alert dispatcher would misroute
+        the audit severity. Reject at the boundary. (Phase 4 Part 2.10
+        switched the example template from heartbeat_periodic to
+        daily_digest after the heartbeat went away.)"""
         dispatcher, _, _ = _make(tmp_path)
         with pytest.raises(ValueError, match="not an alert category"):
             await dispatcher.send(
-                template_name="heartbeat_periodic",
+                template_name="daily_digest",
                 data={
-                    "time_et": "10:00",
+                    "date": "2026-04-26",
+                    "closed_count": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "win_rate": "0%",
+                    "pnl_yesterday": "+$0",
                     "open_count": 0,
-                    "today_pnl": "+$0",
-                    "llm_today": "$0",
-                    "llm_cap": "$10",
+                    "unrealized_pnl": "+$0",
+                    "pnl_week": "+$0",
+                    "pnl_month": "+$0",
                     "sources_active": 8,
                     "sources_total": 8,
+                    "sources_note": "",
+                    "critical_count": 0,
+                    "llm_mtd": "$0",
+                    "llm_cap": "$20",
+                    "llm_pct": "0%",
                 },
             )
 

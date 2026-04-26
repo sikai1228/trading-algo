@@ -1,9 +1,13 @@
 """Top-level orchestrator: starts every Phase 1 task, manages shutdown.
 
 Runs the Kalshi WS feed, market discovery, RSS poller, Twitter scraper,
-Truth Social scraper, news matcher worker, heartbeat logger, and
-healthcheck server concurrently. SIGTERM triggers graceful shutdown:
-each task stops accepting new work, drains pending writes, and exits.
+Truth Social scraper, news matcher worker, and healthcheck server
+concurrently. SIGTERM triggers graceful shutdown: each task stops
+accepting new work, drains pending writes, and exits.
+
+(Phase 4 Part 2.10 removed the heartbeat logger and the periodic
+Telegram heartbeat. The morning daily digest is the regular status
+notification; /status is on demand.)
 """
 
 from __future__ import annotations
@@ -14,7 +18,6 @@ import contextlib
 import os
 import signal
 import sys
-import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -33,7 +36,6 @@ from trumpbot.db.repositories import (
     insert_system_event,
     list_active_markets,
     list_markets_for_matching,
-    recent_news_events,
     update_match_with_classification,
     upsert_subject,
 )
@@ -58,7 +60,6 @@ from trumpbot.news.twitter import TwitterScraper
 from trumpbot.notifications.telegram import TelegramNotifier
 from trumpbot.platform_paths import current_platform_paths, resolve_path
 from trumpbot.utils.logging import configure_logging, get_logger
-from trumpbot.utils.timeutil import utcnow_iso
 
 log = get_logger(__name__)
 
@@ -163,7 +164,10 @@ async def _amain(config_path: Path) -> int:
         poll_interval_sec=cfg.matcher.poll_interval_sec,
         batch_size=cfg.matcher.batch_size,
     )
-    heartbeat = HeartbeatLogger(db=db, interval_sec=cfg.daemon.heartbeat_interval_sec)
+    # Phase 4 Part 2.10 — HeartbeatLogger removed. The DB-only periodic
+    # liveness logger added log noise without earning its keep; the
+    # daily digest, /status on demand, and the healthcheck endpoint
+    # cover the operator's "is it alive?" needs.
 
     # ---- Phase 2 decision layer ----
     from trumpbot.approval.gate import ApprovalGate, ApprovalGateConfig
@@ -357,7 +361,7 @@ async def _amain(config_path: Path) -> int:
         "discovery": asyncio.create_task(_supervised(discovery.run, "discovery", critical=True)),
         "kalshi_ws": asyncio.create_task(_supervised(ws_feed.run, "kalshi_ws", critical=True)),
         "matcher": asyncio.create_task(_supervised(matcher_worker.run, "matcher", critical=False)),
-        "heartbeat": asyncio.create_task(_supervised(heartbeat.run, "heartbeat", critical=False)),
+        # Phase 4 Part 2.10 — heartbeat task removed.
         "decision_loop": asyncio.create_task(
             _supervised(
                 lambda: decision_loop(
@@ -566,14 +570,14 @@ async def _amain(config_path: Path) -> int:
             anthropic_key_present=anthropic_key_present,
         )
 
-    # Scheduled loops: heartbeat, daily digest, settlement, source health.
-    # All four are silent-by-default (heartbeat etc.); only the source-
-    # health loop fires alerts (via the dispatcher), and only critical
-    # ones are audible.
+    # Scheduled loops: daily digest, settlement, source health.
+    # All silent-by-default; only the source-health loop fires alerts
+    # (via the dispatcher), and only critical ones are audible.
+    # (Phase 4 Part 2.10 removed the heartbeat_loop. The morning
+    # daily digest is the regular status notification.)
     if telegram_bot is not None:
         from trumpbot.notifications.scheduled import (
             daily_digest_loop,
-            heartbeat_loop,
             monthly_tax_digest_loop,
             settlement_notification_loop,
             source_health_loop,
@@ -583,19 +587,6 @@ async def _amain(config_path: Path) -> int:
             assert telegram_bot is not None  # guarded by outer if
             await telegram_bot.send_text(text, silent=silent)
 
-        tasks["heartbeat_loop"] = asyncio.create_task(
-            _supervised(
-                lambda: heartbeat_loop(
-                    db=db,
-                    send_text=_send_text,
-                    cost_guard=cost_guard,
-                    interval_minutes=cfg.notifications.heartbeat_interval_minutes,
-                    stop_event=stop_event,
-                ),
-                "heartbeat_loop",
-                critical=False,
-            )
-        )
         tasks["daily_digest_loop"] = asyncio.create_task(
             _supervised(
                 lambda: daily_digest_loop(
@@ -813,7 +804,6 @@ async def _amain(config_path: Path) -> int:
         discovery.stop()
         ws_feed.stop()
         matcher_worker.stop()
-        heartbeat.stop()
         for task in tasks.values():
             task.cancel()
         for task in tasks.values():
@@ -1240,70 +1230,11 @@ def _bucket(confidence: float) -> str:
     return "zero"
 
 
-class HeartbeatLogger:
-    component = "heartbeat"
-
-    def __init__(self, *, db: Database, interval_sec: int = 60) -> None:
-        self._db = db
-        self._interval = interval_sec
-        self._stop = asyncio.Event()
-        self._started_at = time.time()
-
-    async def run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self._emit()
-            except Exception as exc:
-                log.error("heartbeat_error", error=repr(exc))
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
-            except TimeoutError:
-                continue
-
-    def _emit(self) -> None:
-        conn = self._db.connect()
-        active = list_active_markets(self._db)
-        total_markets = conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
-        recent = recent_news_events(self._db, limit=1)
-        last_news_ts = recent[0]["detected_ts"] if recent else None
-        # News events ingested in the last 60 seconds.
-        news_60s = conn.execute(
-            "SELECT COUNT(*) FROM news_events WHERE detected_ts >= datetime('now', '-60 seconds')"
-        ).fetchone()[0]
-        # Pending matcher backlog: news events without any match rows yet.
-        backlog = conn.execute(
-            """
-            SELECT COUNT(*) FROM news_events n
-            LEFT JOIN news_market_matches m ON m.news_event_id = n.id
-            WHERE m.id IS NULL
-            """
-        ).fetchone()[0]
-        # Last successful RSS poll per source — derived from latest detected_ts
-        # for any event from that source. Approximation; the daemon does not
-        # currently track per-source poll completions explicitly.
-        last_poll_per_source = {
-            r["source"]: r["last_ts"]
-            for r in conn.execute(
-                "SELECT source, MAX(detected_ts) AS last_ts FROM news_events GROUP BY source"
-            )
-        }
-        log.info(
-            "heartbeat",
-            uptime_sec=int(time.time() - self._started_at),
-            active_markets=len(active),
-            total_markets=total_markets,
-            last_news_ts=last_news_ts,
-            news_events_last_60s=news_60s,
-            matcher_backlog=backlog,
-            last_poll_per_source=last_poll_per_source,
-            ts=utcnow_iso(),
-        )
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def stopped(self) -> bool:
-        return self._stop.is_set()
+# Phase 4 Part 2.10 — ``HeartbeatLogger`` was REMOVED. The DB-only
+# periodic liveness logger added log noise without earning its keep:
+# the daily digest covers the daily "what's the bot doing?" question,
+# /status answers it on demand, and the healthcheck endpoint
+# (`/healthz` on port 9090) is the machine-readable liveness probe.
 
 
 # ---------------------------------------------------------------------------
@@ -1326,4 +1257,4 @@ def run() -> None:
     sys.exit(asyncio.run(_amain(config_path)))
 
 
-__all__ = ["HeartbeatLogger", "MatcherWorker", "run"]
+__all__ = ["MatcherWorker", "run"]

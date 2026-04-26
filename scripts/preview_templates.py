@@ -34,7 +34,7 @@ _FIELD_RE = re.compile(r"(?<!\{)\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 # fields fall back to the placeholder ``<field_name>`` so the preview
 # still renders. Add to this dict as you add templates.
 _SAMPLES: dict[str, Any] = {
-    # Heartbeat / digest
+    # Daily digest + shared
     "time_et": "14:23 ET",
     "open_count": 3,
     "today_pnl": "+$23.40",
@@ -151,8 +151,9 @@ _SAMPLES: dict[str, Any] = {
     "bankroll": "$500.00",
     "deposit_status": "Kalshi balance reflects this amount",
     "month_pnl": "+$340.00",
-    "last_heartbeat": "14:23 ET",
-    "heartbeat_age": "2 min",
+    # Phase 4 Part 2.10 — last_heartbeat / heartbeat_age dropped
+    # along with the heartbeat loop. uptime is the relevant
+    # liveness indicator now.
     "uptime": "3d 4h",
     "position_list": (
         "KXTRUMPMEET-26APR-XJIN\n"

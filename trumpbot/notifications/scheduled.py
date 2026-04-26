@@ -1,13 +1,12 @@
 """Scheduled-message daemon loops.
 
-Phase 3 Part 2.
+Phase 3 Part 2 introduced these. Phase 4 Part 2.10 removed
+``heartbeat_loop`` and its supporting helpers; the morning daily
+digest is the regular status notification now.
 
-Four asyncio coroutines the daemon supervises alongside the existing
-data-collection + decision tasks:
+Three asyncio coroutines the daemon supervises alongside the
+existing data-collection + decision tasks:
 
-- :func:`heartbeat_loop` -- every 60 min (configurable), aligned to
-  the wall-clock hour boundary. Sends a one-line
-  ``heartbeat_periodic`` to Telegram with the current bot state.
 - :func:`daily_digest_loop` -- once per day at 8:00 AM ET. Renders
   ``daily_digest`` from yesterday's outcomes + month-to-date.
 - :func:`settlement_notification_loop` -- every 5 min. Detects markets
@@ -19,8 +18,8 @@ data-collection + decision tasks:
   min, ``alert_info_source_recovered`` on recovery.
 
 Each loop is short and stateless. They read state from the DB, call
-the alert dispatcher (or send_text directly for the heartbeat), and
-sleep until the next tick. SIGTERM cancels via ``stop_event``.
+the alert dispatcher (or send_text directly), and sleep until the
+next tick. SIGTERM cancels via ``stop_event``.
 """
 
 from __future__ import annotations
@@ -52,127 +51,11 @@ log = get_logger(__name__)
 SendTextFn = Callable[[str, bool], Awaitable[None]]
 
 
-# ---------------------------------------------------------------------------
-# Heartbeat
-# ---------------------------------------------------------------------------
-
-
-async def heartbeat_loop(
-    *,
-    db: Database,
-    send_text: SendTextFn,
-    cost_guard: LLMCostGuard | None,
-    interval_minutes: int,
-    stop_event: asyncio.Event,
-    sources_provider: Callable[[], tuple[int, int]] | None = None,
-) -> None:
-    """Send the periodic ``heartbeat_periodic`` template aligned to
-    minute boundaries divisible by ``interval_minutes``.
-
-    Fires once immediately on startup (so the operator sees life
-    right after a redeploy), then schedules every subsequent
-    heartbeat at the next aligned wall-clock minute. For
-    ``interval_minutes=60`` that means fires at HH:00 of every hour;
-    for ``interval_minutes=15`` it would be HH:00, HH:15, HH:30,
-    HH:45. Drift never accumulates because each next-tick is
-    computed from current wall-clock time, not from the previous
-    fire.
-
-    ``sources_provider`` returns ``(active, total)``; when None,
-    ``source_status`` is queried instead. Returning a literal value
-    avoids a DB hit on every heartbeat for callers that already track
-    the count in memory.
-    """
-    component = "heartbeat_loop"
-    log.info(f"{component}_started", interval_minutes=interval_minutes)
-    while not stop_event.is_set():
-        try:
-            data = _build_heartbeat_data(db, cost_guard, sources_provider)
-            rendered = render_template("heartbeat_periodic", data)
-            await send_text(rendered.text, True)  # silent
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # pragma: no cover -- defensive
-            log.error(f"{component}_error", error=repr(exc))
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=_seconds_until_next_aligned_tick(interval_minutes),
-            )
-    log.info(f"{component}_stopped")
-
-
-def _seconds_until_next_aligned_tick(
-    interval_minutes: int, *, now: datetime | None = None
-) -> float:
-    """Return seconds-from-now until the next wall-clock minute mark
-    divisible by ``interval_minutes``.
-
-    Examples (UTC; conversion to ET happens at template-render time
-    only):
-
-    - ``interval=60`` at 14:23 → next tick at 15:00 → 37 min
-    - ``interval=60`` at 14:00 → next tick at 15:00 → 60 min
-    - ``interval=15`` at 14:23 → next tick at 14:30 → 7 min
-    - ``interval=15`` at 14:30 → next tick at 14:45 → 15 min
-
-    The "exactly at a tick" case rolls forward one full interval so
-    we never fire twice on the same wall-clock boundary.
-    """
-    n = now or datetime.now(UTC)
-    minutes_into_hour = n.minute
-    # Round UP to the next interval-aligned minute. If we're EXACTLY
-    # on a tick, advance by one full interval.
-    next_minute = ((minutes_into_hour // interval_minutes) + 1) * interval_minutes
-    target = n.replace(second=0, microsecond=0)
-    if next_minute >= 60:
-        # Spills into the next hour (or later, for interval=60).
-        target = target.replace(minute=0) + timedelta(hours=next_minute // 60)
-        target = target + timedelta(minutes=next_minute % 60)
-    else:
-        target = target.replace(minute=next_minute)
-    return max(1.0, (target - n).total_seconds())
-
-
-def _build_heartbeat_data(
-    db: Database,
-    cost_guard: LLMCostGuard | None,
-    sources_provider: Callable[[], tuple[int, int]] | None,
-) -> dict[str, Any]:
-    open_trades = list_open_trades(db)
-    today = datetime.now(UTC).date().isoformat()
-    today_realized = (
-        db.connect()
-        .execute(
-            "SELECT COALESCE(SUM(realized_pnl_usd_cents), 0) FROM trades "
-            "WHERE substr(exited_at, 1, 10) = ?",
-            (today,),
-        )
-        .fetchone()[0]
-    )
-    if sources_provider is not None:
-        s_active, s_total = sources_provider()
-    else:
-        rows = list_source_status(db)
-        s_total = len(rows)
-        s_active = sum(1 for r in rows if r.current_status == "active")
-    if cost_guard is None:
-        llm_today = "n/a"
-        llm_cap = "n/a"
-    else:
-        llm_today = f"${cost_guard.month_to_date_cents() / 100:.2f}"
-        llm_cap = f"${cost_guard.monthly_cap_usd_cents / 100:.2f}"
-    from zoneinfo import ZoneInfo
-
-    return {
-        "time_et": datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).strftime("%H:%M ET"),
-        "open_count": len(open_trades),
-        "today_pnl": _signed(int(today_realized)),
-        "llm_today": llm_today,
-        "llm_cap": llm_cap,
-        "sources_active": s_active,
-        "sources_total": s_total,
-    }
+# Phase 4 Part 2.10 — ``heartbeat_loop`` + ``_build_heartbeat_data``
+# + ``_seconds_until_next_aligned_tick`` were REMOVED. The morning
+# daily digest is the regular status notification; /status answers
+# the on-demand "is it alive?" question; the healthcheck endpoint
+# (`/healthz` on port 9090) is the machine-readable liveness probe.
 
 
 # ---------------------------------------------------------------------------
@@ -762,7 +645,6 @@ def _build_monthly_csv(rows: list[Any]) -> str:
 __all__ = [
     "SendTextFn",
     "daily_digest_loop",
-    "heartbeat_loop",
     "monthly_tax_digest_loop",
     "settlement_notification_loop",
     "source_health_loop",

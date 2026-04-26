@@ -174,12 +174,22 @@ class BankrollConfig(BaseModel):
 
 
 class NotificationsConfig(BaseModel):
-    """Knobs for the heartbeat / digest / settlement / source-health
-    loops + the categorized alert dispatcher's dedup window."""
+    """Knobs for the digest / settlement / source-health loops + the
+    categorized alert dispatcher's dedup window.
 
-    model_config = ConfigDict(extra="forbid")
+    Phase 4 Part 2.10 — switched to ``extra="ignore"`` so a legacy
+    ``heartbeat_interval_minutes`` key in an un-migrated config.yaml
+    loads silently (the field was removed alongside the heartbeat
+    loop).
+    """
 
-    heartbeat_interval_minutes: int = 60
+    model_config = ConfigDict(extra="ignore")
+
+    # Phase 4 Part 2.10 — ``heartbeat_interval_minutes`` was REMOVED.
+    # The morning daily digest is the regular status notification
+    # now; the field is silently ignored if still present in an
+    # un-migrated config.yaml.
+
     digest_hour_utc: int = 12  # 12 UTC ~ 8 AM ET in standard time
     settlement_check_interval_seconds: int = 300  # 5 min
     source_health_check_interval_seconds: int = 300
@@ -297,9 +307,12 @@ class LoggingConfig(BaseModel):
 
 
 class DaemonConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    heartbeat_interval_sec: int = 60
+    # Phase 4 Part 2.10 — switched to ``extra="ignore"`` so a legacy
+    # ``heartbeat_interval_sec`` key in an un-migrated config.yaml
+    # loads silently. The HeartbeatLogger and the field were both
+    # removed; the section stays defined as a placeholder so future
+    # daemon-level knobs can be added without a config-schema break.
+    model_config = ConfigDict(extra="ignore")
 
 
 class TrumpbotConfig(BaseModel):

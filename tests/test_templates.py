@@ -9,9 +9,9 @@ Two invariants pinned here:
    boundary, before the daemon tries to send to Telegram.
 
 2. Audibility tier is enforced: only ``alert_critical_*`` templates
-   may have ``audible=True``. Everything else (heartbeat, digest,
-   warnings, info, command replies, trade outcomes, trade proposals)
-   is silent.
+   may have ``audible=True``. Everything else (digest, warnings,
+   info, command replies, trade outcomes, trade proposals) is
+   silent.
 """
 
 from __future__ import annotations
@@ -73,9 +73,9 @@ def test_every_template_renders_with_sample_data(name: str) -> None:
 
 def test_only_critical_alerts_are_audible() -> None:
     """Audibility tier from the spec: only alert_critical_* messages
-    push an audible Telegram notification. Everything else (heartbeats,
-    digest, warnings, info, command replies, trade outcomes,
-    proposals) sends with disable_notification=True."""
+    push an audible Telegram notification. Everything else (digest,
+    warnings, info, command replies, trade outcomes, proposals) sends
+    with disable_notification=True."""
     audible_names = {n for n, t in TEMPLATE_CATALOG.items() if t.audible}
     expected = {
         "alert_critical_llm_cap",
@@ -116,8 +116,6 @@ def test_template_categories_match_naming_convention() -> None:
             assert tpl.category == "trade_outcome", name
         elif name.startswith("command_reply_") or name.startswith("_"):
             assert tpl.category == "command_reply", name
-        elif name == "heartbeat_periodic":
-            assert tpl.category == "heartbeat"
         elif name == "daily_digest":
             assert tpl.category == "digest"
 
@@ -132,7 +130,7 @@ def test_render_missing_field_raises_keyerror() -> None:
     surfacing the bug at the boundary instead of silently sending a
     half-rendered string."""
     with pytest.raises(KeyError):
-        render_template("command_reply_heartbeat", {})  # needs time_et
+        render_template("alert_warning_db_slow", {})  # needs query_duration
 
 
 def test_render_extra_fields_are_ignored() -> None:
@@ -140,25 +138,35 @@ def test_render_extra_fields_are_ignored() -> None:
     ignores them). Useful when a single data dict is shared across
     multiple templates."""
     rendered = render_template(
-        "command_reply_heartbeat",
-        {"time_et": "10:00 ET", "extra_unused_field": "ignored"},
+        "alert_warning_db_slow",
+        {"query_duration": "1.2s", "threshold": "0.5s", "extra_unused_field": "ignored"},
     )
-    assert "10:00 ET" in rendered.text
+    assert "1.2s" in rendered.text
 
 
 def test_rendered_message_carries_audibility() -> None:
     """The audibility flag must travel with the rendered text so the
     Telegram caller can pass it straight to disable_notification."""
     silent = render_template(
-        "heartbeat_periodic",
-        {
-            "time_et": "10:00",
+        "daily_digest",
+        {f: "x" for f in ("date",)}
+        | {
+            "closed_count": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": "0%",
+            "pnl_yesterday": "+$0",
             "open_count": 0,
-            "today_pnl": "+$0",
-            "llm_today": "$0",
-            "llm_cap": "$10",
+            "unrealized_pnl": "+$0",
+            "pnl_week": "+$0",
+            "pnl_month": "+$0",
             "sources_active": 8,
             "sources_total": 8,
+            "sources_note": "",
+            "critical_count": 0,
+            "llm_mtd": "$0",
+            "llm_cap": "$20",
+            "llm_pct": "0%",
         },
     )
     assert silent.audible is False
@@ -171,23 +179,8 @@ def test_rendered_message_carries_audibility() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_heartbeat_text_matches_spec() -> None:
-    """The exact one-line heartbeat format the spec called for. If
-    anyone tweaks it, this fails so the change is visible in PR
-    review."""
-    out = render_template(
-        "heartbeat_periodic",
-        {
-            "time_et": "14:23",
-            "open_count": 3,
-            "today_pnl": "+$23.40",
-            "llm_today": "$0.84",
-            "llm_cap": "$10.00",
-            "sources_active": 8,
-            "sources_total": 8,
-        },
-    )
-    assert out.text == ("✓ 14:23 | open: 3 | today: +$23.40 | LLM: $0.84/$10.00 | sources: 8/8")
+# Phase 4 Part 2.10 — test_heartbeat_text_matches_spec was REMOVED
+# along with the heartbeat_periodic template.
 
 
 def test_command_help_lists_every_command() -> None:
@@ -204,10 +197,11 @@ def test_command_help_lists_every_command() -> None:
         "/mode",
         "/halt",
         "/resume",
-        "/heartbeat",
         "/help",
     ):
         assert cmd in help_text, f"{cmd} missing from /help text"
+    # Phase 4 Part 2.10 — /heartbeat must NOT appear in /help.
+    assert "/heartbeat" not in help_text
 
 
 def test_alert_critical_anthropic_auth_has_no_required_fields() -> None:

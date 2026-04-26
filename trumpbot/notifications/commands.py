@@ -103,9 +103,9 @@ async def handle_help(ctx: CommandContext) -> RenderedMessage:
     return render_template("command_reply_help", {})
 
 
-async def handle_heartbeat(ctx: CommandContext) -> RenderedMessage:
-    del ctx
-    return render_template("command_reply_heartbeat", {"time_et": _now_et_short()})
+# Phase 4 Part 2.10 — handle_heartbeat / /heartbeat were REMOVED.
+# /status answers the on-demand "is it alive?" question with richer
+# information.
 
 
 async def handle_halt(ctx: CommandContext) -> RenderedMessage:
@@ -151,8 +151,9 @@ async def handle_status(ctx: CommandContext) -> RenderedMessage:
             "llm_mtd": _dollars(llm_mtd_cents),
             "llm_cap": _dollars(llm_cap_cents) if llm_cap_cents else "n/a",
             "llm_pct": llm_pct,
-            "last_heartbeat": _now_et_short(),
-            "heartbeat_age": "0 min",
+            # Phase 4 Part 2.10 — last_heartbeat / heartbeat_age dropped
+            # along with the heartbeat loop. ``uptime`` is the relevant
+            # liveness indicator now.
             "uptime": uptime,
         },
     )
@@ -646,7 +647,6 @@ class CommandRateLimiter:
 
 _HANDLERS: dict[str, CommandHandler] = {
     "help": handle_help,
-    "heartbeat": handle_heartbeat,
     "halt": handle_halt,
     "resume": handle_resume,
     "status": handle_status,

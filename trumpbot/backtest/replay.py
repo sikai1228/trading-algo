@@ -284,17 +284,23 @@ class Backtester:
         self, conn: sqlite3.Connection, start_ts: str, end_ts: str
     ) -> Iterable[sqlite3.Row]:
         # JOIN to news_events so by_source_breakdown can be populated.
+        # Phase 4 Part 2.9 — backtest only replays matches the LLM
+        # cascade actually classified as a real interaction. The old
+        # ``confidence >= llm_confidence_threshold`` filter was
+        # removed alongside the engine-side threshold.
         return conn.execute(
             """
             SELECT m.*, e.source AS source_name, e.is_kalshi_approved AS is_kalshi_approved
             FROM news_market_matches m
             LEFT JOIN news_events e ON e.id = m.news_event_id
-            WHERE m.confidence >= ?
+            LEFT JOIN llm_classifications c ON c.id = m.llm_classification_id
+            WHERE m.classifier_type = 'llm_cascade'
+              AND COALESCE(c.parsed_interaction_occurred, 0) = 1
               AND m.created_at >= ?
               AND m.created_at <= ?
             ORDER BY m.created_at ASC
             """,
-            (self._cfg.llm_confidence_threshold, start_ts, end_ts),
+            (start_ts, end_ts),
         )
 
     def _market(self, conn: sqlite3.Connection, ticker: str):  # type: ignore[no-untyped-def]

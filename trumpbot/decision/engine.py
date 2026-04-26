@@ -40,16 +40,21 @@ class DecisionConfig:
     """Strategy parameters. Phase 3 rules section in CLAUDE.md is the
     spec for the two-cap + walk + FOK pipeline."""
 
-    llm_confidence_threshold: float = 0.85
+    # Phase 4 Part 2.9 — ``llm_confidence_threshold`` was REMOVED.
+    # The trade trigger is now the LLM's ``interaction_occurred``
+    # boolean: yes or no, no gradient. The Haiku confidence float is
+    # still recorded in ``llm_classifications.parsed_confidence`` for
+    # audit and shadow analysis but no longer drives any decision.
+
     max_buy_price_cents: int = 90
     """Phase 4 Part 2.5: raised from 80 to 90. See
     :class:`trumpbot.config.DecisionPhaseConfig` docstring for
     rationale."""
-    position_size_base_pct: float = 0.08
-    """Confidence-scaled target as a fraction of bankroll. Multiplied
-    by ``match.confidence`` to set the dollar target before any cap
-    applies (so a 1.0-confidence match wants 8 % of bankroll, scaling
-    down with confidence)."""
+    # Phase 4 Part 2.9 — ``position_size_base_pct`` was REMOVED. It
+    # was the multiplier in the old "8 % of bankroll x confidence"
+    # sizing, which the two-cap system replaced in Phase 3 Part 1
+    # and the confidence-threshold removal in this PR finally
+    # severed. No production code reads it any more.
 
     # ---- Two-cap system (Phase 3 Part 1) -------------------------
     position_size_hard_cap_cents: int = 2000
@@ -242,23 +247,27 @@ class DecisionEngine:
 
         Logic chain (all integer-cents arithmetic):
 
-        1. Confidence ≥ 0.85, else None.
-        2. ``interaction_occurred`` true, else None.
-        3. Kalshi-approved source, else None.
-        4. No open position, else None.
-        5. Article inside the market's open/close window, else None.
-        6. Top-of-book ask ≤ ``max_buy_price_cents`` (90 c, raised
+        1. ``interaction_occurred`` true, else None. (Phase 4 Part 2.9
+           removed the confidence-threshold gate; the LLM's boolean
+           is the sole signal-strength filter. Confidence is logged
+           via ``llm_classifications.parsed_confidence`` but does not
+           drive any decision.)
+        2. Kalshi-approved source, else None.
+        3. No open position, else None.
+        4. Article inside the market's open/close window, else None.
+        5. Top-of-book ask ≤ ``max_buy_price_cents`` (90 c, raised
            from 80 c in Phase 4 Part 2.5), else None — fast guard
            before the walker.
-        7. ``cap_one = config.position_size_hard_cap_cents`` ($20).
-        8. ``cap_two = floor(market.volume_traded x 5)`` — 5 % of
-           market volume treating one contract as $1 of notional.
-        9. ``effective_cap = min(cap_one, cap_two)``.
-        10. Walk the order book for the effective cap with the 90 c
-            ceiling and the Kalshi fee calculator.
-        11. Skip if walk filled fewer than ``min_trade_size_contracts``
+        6. ``cap_one = config.position_size_hard_cap_cents`` ($20).
+        7. ``cap_two`` — Phase 4 Part 2.6 redefined this as 20 % of
+           the YES contracts available at prices ≤
+           ``max_buy_price_cents`` in the live orderbook.
+        8. ``effective_cap = min(cap_one, cap_two)``.
+        9. Walk the order book for the effective cap with the 90 c
+           ceiling and the Kalshi fee calculator.
+        10. Skip if walk filled fewer than ``min_trade_size_contracts``
             or below ``min_trade_value_cents``.
-        12. Build :class:`TradeIntent` with the full walk audit
+        11. Build :class:`TradeIntent` with the full walk audit
             (avg fill, max fill, slippage, fees, levels consumed,
             cap binding).
 
@@ -270,11 +279,10 @@ class DecisionEngine:
         """
         del now_utc  # unused — retained for caller compatibility
 
-        # Rule 1 — confidence threshold
-        if match.confidence < self._cfg.llm_confidence_threshold:
-            return None
-        # Rule 1b — must come from the LLM cascade with a positive
-        # interaction classification.
+        # Rule 1 — Phase 4 Part 2.9: trade trigger is the LLM's
+        # ``interaction_occurred`` boolean. The Haiku confidence float
+        # is recorded for audit but no longer gates anything: the LLM
+        # answers yes or no, no gradient.
         if not match.interaction_occurred:
             return None
 

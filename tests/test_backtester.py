@@ -81,12 +81,32 @@ def _seed(tmp_path: Path) -> Path:
             snapshot_reason="periodic",
         ),
     )
+    # Phase 4 Part 2.8 + 2.9: backtester reads only matches with
+    # ``classifier_type='llm_cascade'`` AND
+    # ``parsed_interaction_occurred=1``. Seed both.
     with db.transaction() as conn:
-        conn.execute(
-            "INSERT INTO news_market_matches (news_event_id, ticker, confidence, "
-            "matched_subject, match_reason, created_at) "
-            "VALUES (?, 'X', 0.95, 'putin', 'direct', '2026-04-15T12:00:01Z')",
+        cur = conn.execute(
+            """
+            INSERT INTO llm_classifications (
+                news_event_id, prompt_version, contract_hash, model,
+                request_payload, parsed_interaction_occurred,
+                parsed_subject, parsed_confidence, classified_at
+            ) VALUES (?, 'v1', 'abc', 'claude-haiku-4-5', '{}', 1,
+                      'putin', 0.92, '2026-04-15T12:00:01Z')
+            """,
             (eid,),
+        )
+        cls_id = cur.lastrowid
+        conn.execute(
+            """
+            INSERT INTO news_market_matches (
+                news_event_id, ticker, confidence, matched_subject,
+                match_reason, classifier_type, llm_classification_id,
+                created_at
+            ) VALUES (?, 'X', 0.92, 'putin', 'llm_cascade', 'llm_cascade', ?,
+                      '2026-04-15T12:00:01Z')
+            """,
+            (eid, cls_id),
         )
     db.close()
     return db_path

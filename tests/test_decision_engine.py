@@ -108,19 +108,35 @@ class TestEvaluateNewsMatch:
         assert intent.target_avg_fill_price_cents == 50  # walked at 50c
         assert intent.cap_binding == "cap_one"  # $20 < $5000
 
-    def test_below_confidence_threshold_returns_none(self) -> None:
+    def test_low_confidence_with_interaction_true_still_produces_intent(self) -> None:
+        """Phase 4 Part 2.9 removed the ``llm_confidence_threshold``
+        engine gate. A match with ``interaction_occurred=True`` and
+        ``confidence=0.51`` (well below the old 0.85 cut) must produce
+        a TradeIntent — proves the threshold is fully gone."""
+        out = _engine().evaluate_news_match(
+            _match(confidence=0.51, interaction_occurred=True),
+            _market(),
+            None,
+            _bankroll(),
+            yes_ask_levels=_levels(),
+        )
+        assert out is not None
+        assert out.confidence_score == 0.51
+
+    def test_high_confidence_but_interaction_false_returns_none(self) -> None:
+        """Phase 4 Part 2.9: ``interaction_occurred=False`` with
+        ``confidence=0.99`` must return None — the boolean is the
+        sole gate, the confidence float does not override it."""
         assert (
             _engine().evaluate_news_match(
-                _match(confidence=0.84), _market(), None, _bankroll(), yes_ask_levels=_levels()
+                _match(confidence=0.99, interaction_occurred=False),
+                _market(),
+                None,
+                _bankroll(),
+                yes_ask_levels=_levels(),
             )
             is None
         )
-
-    def test_at_threshold_passes(self) -> None:
-        out = _engine().evaluate_news_match(
-            _match(confidence=0.85), _market(), None, _bankroll(), yes_ask_levels=_levels()
-        )
-        assert out is not None
 
     def test_interaction_occurred_false_returns_none(self) -> None:
         assert (

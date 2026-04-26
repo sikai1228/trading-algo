@@ -18,8 +18,6 @@ from trumpbot.db.repositories import (
     MarketRow,
     get_system_state,
     insert_llm_spend,
-    is_market_snoozed,
-    list_active_snoozed_markets,
     upsert_market,
 )
 from trumpbot.notifications.commands import (
@@ -27,7 +25,6 @@ from trumpbot.notifications.commands import (
     CommandRateLimiter,
     all_command_names,
     dispatch,
-    parse_duration,
 )
 from trumpbot.notifications.llm_cost import LLMCostGuard, LLMCostGuardConfig
 
@@ -90,8 +87,6 @@ class TestDispatch:
             "history",
             "spend",
             "mode",
-            "snooze",
-            "unsnooze",
             "heartbeat",
             "help",
         ):
@@ -105,8 +100,18 @@ class TestDispatch:
     def test_all_command_names_includes_every_handler(self) -> None:
         names = set(all_command_names())
         assert "/halt" in names
-        assert "/snooze" in names
+        assert "/resume" in names
         assert "/help" in names
+
+    def test_snooze_commands_removed(self) -> None:
+        """Phase 4 Part 2.9: /snooze and /unsnooze are gone. The
+        dispatcher must return None so the unknown-command reply
+        fires."""
+        assert dispatch("snooze") is None
+        assert dispatch("unsnooze") is None
+        assert dispatch("/snooze") is None
+        assert "/snooze" not in set(all_command_names())
+        assert "/unsnooze" not in set(all_command_names())
 
 
 # ---------------------------------------------------------------------------
@@ -140,47 +145,9 @@ class TestHaltResume:
         assert "Halt: ON" in out2.text
 
 
-# ---------------------------------------------------------------------------
-# Snooze + unsnooze
-# ---------------------------------------------------------------------------
-
-
-class TestSnooze:
-    @pytest.mark.asyncio
-    async def test_snooze_with_default_duration(self, tmp_path: Path) -> None:
-        db = _db(tmp_path)
-        out = await dispatch("snooze")(_ctx(db, args=["X"]))  # type: ignore[misc]
-        assert "Snoozed: X" in out.text
-        assert "24h" in out.text
-        assert is_market_snoozed(db, "X") is True
-
-    @pytest.mark.asyncio
-    async def test_snooze_with_custom_duration(self, tmp_path: Path) -> None:
-        db = _db(tmp_path)
-        await dispatch("snooze")(_ctx(db, args=["X", "30m"]))  # type: ignore[misc]
-        rows = list_active_snoozed_markets(db)
-        assert len(rows) == 1
-
-    @pytest.mark.asyncio
-    async def test_snooze_no_args_returns_usage_hint(self, tmp_path: Path) -> None:
-        db = _db(tmp_path)
-        out = await dispatch("snooze")(_ctx(db))  # type: ignore[misc]
-        assert "Usage:" in out.text
-        assert "/snooze" in out.text
-
-    @pytest.mark.asyncio
-    async def test_snooze_invalid_duration_returns_usage_hint(self, tmp_path: Path) -> None:
-        db = _db(tmp_path)
-        out = await dispatch("snooze")(_ctx(db, args=["X", "garbage"]))  # type: ignore[misc]
-        assert "Usage:" in out.text
-
-    @pytest.mark.asyncio
-    async def test_unsnooze_removes_snooze(self, tmp_path: Path) -> None:
-        db = _db(tmp_path)
-        await dispatch("snooze")(_ctx(db, args=["X"]))  # type: ignore[misc]
-        out = await dispatch("unsnooze")(_ctx(db, args=["X"]))  # type: ignore[misc]
-        assert "Unsnoozed: X" in out.text
-        assert is_market_snoozed(db, "X") is False
+# Phase 4 Part 2.9 — TestSnooze was REMOVED with the /snooze and
+# /unsnooze handlers. See test_halt.py for the regression test that
+# pins the snooze surface stays gone.
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +211,7 @@ class TestSimpleCommands:
     async def test_help_lists_commands(self, tmp_path: Path) -> None:
         db = _db(tmp_path)
         out = await dispatch("help")(_ctx(db))  # type: ignore[misc]
-        for c in ("/status", "/snooze", "/halt"):
+        for c in ("/status", "/halt", "/resume"):
             assert c in out.text
 
     @pytest.mark.asyncio
@@ -254,29 +221,8 @@ class TestSimpleCommands:
         assert "Execution: dry_run" in out.text
 
 
-# ---------------------------------------------------------------------------
-# Duration parser
-# ---------------------------------------------------------------------------
-
-
-class TestParseDuration:
-    @pytest.mark.parametrize(
-        "spec,expected_seconds",
-        [
-            ("24h", 24 * 3600),
-            ("30m", 30 * 60),
-            ("3d", 3 * 86400),
-            ("2h30m", 2 * 3600 + 30 * 60),
-            ("1d12h", 86400 + 12 * 3600),
-        ],
-    )
-    def test_valid_formats(self, spec: str, expected_seconds: int) -> None:
-        assert parse_duration(spec).total_seconds() == expected_seconds
-
-    @pytest.mark.parametrize("spec", ["", "garbage", "24x", "abc24h", "24"])
-    def test_invalid_formats_raise(self, spec: str) -> None:
-        with pytest.raises(ValueError):
-            parse_duration(spec)
+# Phase 4 Part 2.9 — TestParseDuration was REMOVED with parse_duration.
+# It was only used by /snooze; both are gone.
 
 
 # ---------------------------------------------------------------------------

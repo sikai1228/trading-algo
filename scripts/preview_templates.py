@@ -148,7 +148,6 @@ _SAMPLES: dict[str, Any] = {
     "execution_mode": "dry_run",
     "approval_mode": "human",
     "halt_status": "off",
-    "snoozed_count": 0,
     "bankroll": "$500.00",
     "deposit_status": "Kalshi balance reflects this amount",
     "month_pnl": "+$340.00",
@@ -194,11 +193,10 @@ _SAMPLES: dict[str, Any] = {
     "unrealized_sign": "+",
     "unrealized_amount": "$1.21",
     "entry_relative_time": "2h ago",
-    "command": "/snooze",
-    "usage": "<ticker> [duration]",
+    "command": "/halt",
+    "usage": "(no args)",
     "resolution": "YES",
     "pnl": "+$5.00",
-    "resume_time_et": "2026-04-26 14:00 ET",
 }
 
 

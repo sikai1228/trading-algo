@@ -146,7 +146,12 @@ telegram:
 # ----- Phase 2 (decision layer) -----------------------------------------
 
 decision:
-  llm_confidence_threshold: 0.85
+  # Phase 4 Part 2.9 — `llm_confidence_threshold` was REMOVED. The
+  # decision engine now gates trades on the LLM's
+  # `interaction_occurred` boolean alone; the Haiku confidence float
+  # is recorded in `llm_classifications.parsed_confidence` for audit
+  # but does not drive any decision. Yes or no, no gradient.
+
   # Hard ceiling on YES contract entry price (in cents). Trades above
   # this are rejected by both the engine and the risk gate. Raised
   # from 80 → 90 in Phase 4 Part 2.5: markets often trade in the
@@ -154,7 +159,10 @@ decision:
   # before snapping to $1.00, and the bot was missing those legs
   # because of the old ceiling.
   max_buy_price_cents: 90
-  position_size_base_pct: 0.08
+  # Phase 4 Part 2.9 — `position_size_base_pct` was REMOVED. It was
+  # part of the old confidence-weighted sizing path; the two-cap
+  # system superseded it. The field is silently ignored if still
+  # present in an un-migrated config.yaml.
 
   # ----- Phase 3 Part 1: two-cap sizing system -----
   # Cap one — hard fixed-dollar ceiling per trade (in cents). Default

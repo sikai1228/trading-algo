@@ -12,17 +12,17 @@ SourceKind = Literal["rss", "twitter", "truth_social"]
 class NewsSourceConfig(BaseModel):
     """Configuration for a single news source.
 
-    Phase 4 Part 2.7: the per-source ``weight`` field was REMOVED.
-    All sources are now treated equally in the engine's confidence
-    math; the LLM cascade's confidence score is the only signal that
-    feeds into the entry rule. ``weight`` keys in older config files
-    are accepted-and-ignored via ``extra="allow"`` to keep deploys
-    smooth, but they have no effect on trading.
+    Phase 4 Part 2.7 removed the per-source ``weight`` field. Phase 4
+    Part 2.9 tightened the schema to ``extra="forbid"`` so a legacy
+    ``weight: 1.0`` key now fails loudly at config-load time instead
+    of being silently ignored. This catches a partial revert before
+    the daemon starts trading off the wrong assumption.
+
+    All Kalshi-approved sources are treated equally: a single one
+    confirming is enough.
     """
 
-    # Phase 4 Part 2.7 — accept (but ignore) legacy `weight` keys so
-    # an unmigrated config.yaml doesn't fail to load.
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
 
     name: str
     type: SourceKind

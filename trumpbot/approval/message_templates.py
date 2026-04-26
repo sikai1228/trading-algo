@@ -50,22 +50,25 @@ def format_message(approved: RiskApprovedOrder) -> str:
 
 
 def _entry_data(intent: TradeIntent, approved: RiskApprovedOrder) -> dict[str, object]:
+    # Phase 4 Part 2.9: dropped the ``confidence`` data field; the
+    # entry template no longer renders a ``Confidence:`` line.
     qty = approved.adjusted_quantity or intent.target_quantity
     return {
         "ticker": intent.ticker,
         "match_id": intent.triggering_match_id,
-        "confidence": f"{intent.confidence_score:.2f}",
         **_proposal_body_data(intent, qty),
     }
 
 
 def _reentry_data(intent: ReentryIntent, approved: RiskApprovedOrder) -> dict[str, object]:
+    # Phase 4 Part 2.9: dropped the ``confidence`` data field; the
+    # re-entry template no longer renders a ``(confidence ...)``
+    # annotation on the fresh-signal line.
     qty = approved.adjusted_quantity or intent.target_quantity
     realized = intent.prior_trade_realized_pnl_usd_cents / 100
     return {
         "ticker": intent.ticker,
         "match_id": intent.triggering_match_id,
-        "confidence": f"{intent.confidence_score:.2f}",
         "prior_trade_id": intent.prior_trade_id,
         "prior_trade_outcome": intent.prior_trade_outcome,
         "prior_realized_dollars": f"${realized:+.2f}",

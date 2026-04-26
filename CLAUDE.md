@@ -23,9 +23,16 @@ far:
   classifier -> match row).
 - **Phase 2** — decision layer with human-in-the-loop. Engine -> Risk ->
   Approval -> DryRunExecutor pipeline.
-- **Phase 3 Part 1 (current)** — two-cap position sizing,
-  order-book walking for slippage modeling, Kalshi fee modeling, FOK
-  semantics in dry-run. **Still dry-run only** until Phase 4
+- **Phase 3 Part 1** — two-cap position sizing, order-book walking
+  for slippage modeling, Kalshi fee modeling, FOK semantics in
+  dry-run.
+- **Phase 3 Part 2 (current)** — operational features. Full Telegram
+  command surface (`/status`, `/positions`, `/halt`, `/resume`,
+  `/snooze`, `/why`, `/history`, `/heartbeat`, `/spend`, `/mode`).
+  Scheduled messages (heartbeat, daily digest, settlement
+  notifications, source-health alerts). Categorized alert system
+  (critical/warning/info). LLM-based subject-alias enrichment when new
+  markets are discovered. **Still dry-run only** until Phase 4
   explicitly enables live order placement.
 
 ---
@@ -233,6 +240,155 @@ pairs). All NULLABLE -> existing Phase-2 dry-run rows remain valid.
 New `system_events.event_type` values:
 - `fok_killed_book_moved` — gate or executor re-walk rejected
 - `fok_killed_insufficient_liquidity` — executor re-walk found no depth
+
+---
+
+## Phase 3 Part 2 — operations: templates, commands, alerts, enrichment
+
+### Single-source-of-truth for Telegram messages
+
+**Every byte of text the user sees in Telegram lives in
+`trumpbot/notifications/templates.py`.** Code that needs to send a
+message references a template by name and passes a data dict; it does
+NOT construct strings inline. The grep test in CI enforces this.
+
+```python
+from trumpbot.notifications.templates import render_template
+
+rendered = render_template(
+    "heartbeat_periodic",
+    {"time_et": "14:23 ET", "open_count": 3, ...}
+)
+await telegram_bot.send_text(rendered.text, silent=not rendered.audible)
+```
+
+**Editing a Telegram message:**
+1. Edit the relevant template in `TEMPLATE_CATALOG` in
+   `trumpbot/notifications/templates.py`.
+2. Run `uv run pytest tests/test_templates.py` — every template is
+   rendered with sample data, so a missing field surfaces immediately.
+3. Visual review: `uv run python -m scripts.preview_templates [name_substring]`
+   renders any subset to stdout for copy review.
+4. If you renamed a field or added a required one, update the call
+   sites that supply the data dict.
+
+**Adding a new template:**
+1. Add an entry to `TEMPLATE_CATALOG` with `category` (one of:
+   `heartbeat`, `digest`, `trade_proposal`, `trade_outcome`,
+   `alert_critical`, `alert_warning`, `alert_info`, `command_reply`),
+   `audible` (only `True` for `alert_critical_*`), and `format` string.
+2. Document available fields in a comment above the template.
+3. Add a unit test rendering it.
+4. Update `scripts/preview_templates.py`'s `_SAMPLES` dict if you
+   introduced new field names.
+
+**UI literals** (button labels) are in the same file as
+`BUTTON_APPROVE_LABEL` / `BUTTON_REJECT_LABEL` constants so the
+single-source rule covers the entire user-facing surface.
+
+### Categorized alerts — `trumpbot/notifications/alerts.py`
+
+Three severity tiers, each with a fixed Telegram-notification policy:
+
+- **alert_critical** — audible push (`disable_notification=False`).
+  Reserved for events needing immediate attention: LLM cap exceeded,
+  Kalshi feed disconnected, Anthropic 401, daemon crash, contract
+  rules changed, mid-event resolution-rules change.
+- **alert_warning** — silent. Things worth knowing today but not
+  urgent: source down >30 min, slow DB query, risk-rejected trade,
+  market with no resolution rules.
+- **alert_info** — silent, no notification. Routine events: new month
+  discovered, subject aliases enriched, LLM spend at 50 % of cap,
+  source recovered.
+
+`AlertDispatcher.send(template_name=..., data=..., dedup_key=None)`
+renders the template, optionally dedups via `alert_dedup` (1-hour
+window by default), writes a `system_events` row at the matching
+severity, and sends to Telegram with the template's audibility.
+
+### Telegram command surface
+
+`trumpbot/notifications/commands.py` registers the following with
+`TelegramApprovalBot` at startup:
+
+- `/status` — bot state, P&L, sources, LLM spend
+- `/positions` — open trades + mark-to-market
+- `/why <trade_id>` — full reasoning for a specific trade
+- `/history [N]` — last N closed trades (default 10)
+- `/spend` — LLM spend (today / week / month) + projection
+- `/mode` — current execution + approval mode
+- `/halt` — pause new trade proposals (sets
+  `system_state.halt_flag = 'true'`)
+- `/resume` — resume new trade proposals
+- `/snooze <ticker> [duration]` — silence one market (e.g.
+  `/snooze X 24h`); duration accepts `24h`, `30m`, `3d`, `2h30m`
+- `/unsnooze <ticker>` — resume one market
+- `/heartbeat` — quick liveness check
+- `/help` — full command list
+
+Validation: messages from non-allowlisted chat IDs are silently
+dropped with a warning log. Commands rate-limit at 30/min/chat
+(defends against stolen-session abuse). Unknown commands reply with
+the `command_reply_unknown` template.
+
+### Halt + snooze plumbing
+
+**`/halt`** sets `system_state.halt_flag='true'`. Both the decision
+loop and the re-entry loop check `_is_halted(db)` at the start of
+every cycle and early-return if halted. Stop-losses are NOT gated —
+the user must still be able to approve emergency exits.
+
+**`/snooze <ticker>`** writes a row to `snoozed_markets`. The decision
+loop calls `is_market_snoozed(db, ticker)` per match and skips with a
+`trade_skipped_snoozed` system event. Snoozes auto-expire when
+`snoozed_until` passes; no cleanup task needed.
+
+### Scheduled loops (in addition to the four Phase 2 decision loops)
+
+- `heartbeat_loop` — 15 min (configurable). Sends one-line
+  `heartbeat_periodic` to Telegram.
+- `daily_digest_loop` — once per day at `notifications.digest_hour_utc`
+  (default 12 UTC = 8 AM ET in standard time). Renders `daily_digest`.
+- `settlement_notification_loop` — 5 min. Detects markets that resolved
+  while we held a position, sends `trade_settled_yes` /
+  `trade_settled_no`.
+- `source_health_loop` — 5 min. Walks `source_status`; fires
+  `alert_warning_source_down` when a source is stale >30 min,
+  `alert_info_source_recovered` on recovery. Source-down alerts are
+  deduped per source per hour.
+
+### Subject-alias LLM enrichment
+
+`trumpbot/news/alias_enrichment.py` subscribes to the
+`market_discovered` event. For each fresh subject, it calls Claude
+Haiku 4.5 with `trumpbot/news/prompts/alias_enrichment_v1.txt` to
+generate the common ways news media refer to that person. The aliases
+are union-merged with whatever the auto-extractor already pulled out
+of the market title; `subjects.llm_enriched` flips to True so the
+work is idempotent.
+
+Cost guard: `LLMCostGuard` in `trumpbot/notifications/llm_cost.py`
+records every call's spend in `llm_spend_log` and gates calls against
+`alias_enrichment.monthly_cap_usd_cents` (default $10/month). When
+cap is hit, enrichment is skipped (auto-extracted aliases survive)
+and `alert_critical_llm_cap` fires once per month. A 401 from
+Anthropic fires `alert_critical_anthropic_auth` (with a dedup so it
+doesn't repeat).
+
+### DB schema additions (migration 006)
+
+- `snoozed_markets` — per-ticker `/snooze` state (FK to markets).
+- `system_state` — generic key/value bag, seeded with `halt_flag='false'`.
+- `source_status` — per-news-source health for the source-health loop.
+- `alert_dedup` — short-window dedup of categorized-alert sends.
+- `llm_spend_log` — every Anthropic API call's cost in USDCents.
+
+### New `system_events.event_type` values
+
+- `alert_critical_*` / `alert_warning_*` / `alert_info_*` — every alert
+  send writes one of these (matches the template name for grep-ability).
+- `trade_skipped_snoozed` — decision loop skipped a match because the
+  ticker is snoozed.
 
 ---
 

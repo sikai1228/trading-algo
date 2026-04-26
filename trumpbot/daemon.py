@@ -197,11 +197,28 @@ async def _amain(config_path: Path) -> int:
     # Telegram bot — Phase 2 needs the approval flow. Falls back to a
     # stub requester if no token is configured (the loops will record
     # "send_failed" expirations rather than crashing).
+    # Phase 3 Part 2: LLM cost guard + alert dispatcher live alongside
+    # the Telegram bot. Both are constructed BEFORE the bot so we can
+    # pass them in as command-handler context.
+    from trumpbot.notifications.alerts import AlertDispatcher
+    from trumpbot.notifications.llm_cost import LLMCostGuard, LLMCostGuardConfig
+
+    cost_guard = LLMCostGuard(
+        db=db,
+        config=LLMCostGuardConfig(
+            monthly_cap_usd_cents=cfg.alias_enrichment.monthly_cap_usd_cents,
+        ),
+    )
+
     telegram_bot: TelegramApprovalBot | None = None
     requester: object
     if cfg.telegram.bot_token and cfg.telegram.chat_id:
         telegram_bot = TelegramApprovalBot(
-            bot_token=cfg.telegram.bot_token, chat_id=cfg.telegram.chat_id
+            bot_token=cfg.telegram.bot_token,
+            chat_id=cfg.telegram.chat_id,
+            db=db,
+            cost_guard=cost_guard,
+            bankroll_usd_cents=int(round(cfg.bankroll.starting_amount_usd * 100)),
         )
         await telegram_bot.start()
         requester = telegram_bot
@@ -360,6 +377,141 @@ async def _amain(config_path: Path) -> int:
             )
         ),
     }
+
+    # ---- Phase 3 Part 2: alerts + scheduled loops + alias enrichment ----
+    alert_dispatcher = AlertDispatcher(
+        db=db,
+        send_fn=(
+            (lambda text, audible: telegram_bot.send_text(text, silent=not audible))
+            if telegram_bot is not None
+            else None
+        ),
+        dedup_window_seconds=cfg.notifications.alert_dedup_window_minutes * 60,
+    )
+
+    # Subscribe alias-enrichment to market_discovered events. The
+    # enricher only fires when ANTHROPIC_API_KEY is configured AND
+    # alias_enrichment.enabled is True; otherwise we install a no-op
+    # subscriber so the bus event isn't unhandled.
+    if (
+        cfg.alias_enrichment.enabled
+        and cfg.kalshi.api_key_id  # any LLM-enabled deployment will have keys
+    ):
+        # Build a thin async wrapper around anthropic.AsyncAnthropic
+        # that translates a 401 into _AnthropicAuthError.
+        from trumpbot.news.alias_enrichment import (
+            AliasEnricher,
+            AliasEnrichmentConfig,
+            _AnthropicAuthError,
+        )
+
+        async def _llm_call(system_prompt: str, user_prompt: str) -> tuple[int, int, str]:
+            import os
+
+            from anthropic import AsyncAnthropic
+            from anthropic._exceptions import AuthenticationError
+
+            client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+            try:
+                msg = await client.messages.create(
+                    model=cfg.alias_enrichment.model,
+                    max_tokens=cfg.alias_enrichment.max_tokens,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+            except AuthenticationError as exc:
+                raise _AnthropicAuthError(str(exc)) from exc
+            # msg.content is a list of TextBlock | ToolUseBlock; take
+            # the text from the first TextBlock we find.
+            text = ""
+            for block in msg.content:
+                if hasattr(block, "text"):
+                    text = block.text
+                    break
+            return (msg.usage.input_tokens, msg.usage.output_tokens, text)
+
+        enricher = AliasEnricher(
+            db=db,
+            cost_guard=cost_guard,
+            alerts=alert_dispatcher,
+            config=AliasEnrichmentConfig(
+                enabled=True,
+                prompt_path=cfg.alias_enrichment.prompt_path,
+                prompt_version=cfg.alias_enrichment.prompt_version,
+                model=cfg.alias_enrichment.model,
+                max_tokens=cfg.alias_enrichment.max_tokens,
+            ),
+            llm_call=_llm_call,
+        )
+        bus.subscribe("market_discovered", enricher.on_market_discovered)
+
+    # Scheduled loops: heartbeat, daily digest, settlement, source health.
+    # All four are silent-by-default (heartbeat etc.); only the source-
+    # health loop fires alerts (via the dispatcher), and only critical
+    # ones are audible.
+    if telegram_bot is not None:
+        from trumpbot.notifications.scheduled import (
+            daily_digest_loop,
+            heartbeat_loop,
+            settlement_notification_loop,
+            source_health_loop,
+        )
+
+        async def _send_text(text: str, silent: bool) -> None:
+            assert telegram_bot is not None  # guarded by outer if
+            await telegram_bot.send_text(text, silent=silent)
+
+        tasks["heartbeat_loop"] = asyncio.create_task(
+            _supervised(
+                lambda: heartbeat_loop(
+                    db=db,
+                    send_text=_send_text,
+                    cost_guard=cost_guard,
+                    interval_minutes=cfg.notifications.heartbeat_interval_minutes,
+                    stop_event=stop_event,
+                ),
+                "heartbeat_loop",
+                critical=False,
+            )
+        )
+        tasks["daily_digest_loop"] = asyncio.create_task(
+            _supervised(
+                lambda: daily_digest_loop(
+                    db=db,
+                    send_text=_send_text,
+                    cost_guard=cost_guard,
+                    digest_hour_utc=cfg.notifications.digest_hour_utc,
+                    stop_event=stop_event,
+                ),
+                "daily_digest_loop",
+                critical=False,
+            )
+        )
+        tasks["settlement_notification_loop"] = asyncio.create_task(
+            _supervised(
+                lambda: settlement_notification_loop(
+                    db=db,
+                    send_text=_send_text,
+                    interval_seconds=cfg.notifications.settlement_check_interval_seconds,
+                    stop_event=stop_event,
+                ),
+                "settlement_notification_loop",
+                critical=False,
+            )
+        )
+        tasks["source_health_loop"] = asyncio.create_task(
+            _supervised(
+                lambda: source_health_loop(
+                    db=db,
+                    dispatcher=alert_dispatcher,
+                    interval_seconds=cfg.notifications.source_health_check_interval_seconds,
+                    down_threshold_minutes=cfg.notifications.source_down_alert_threshold_minutes,
+                    stop_event=stop_event,
+                ),
+                "source_health_loop",
+                critical=False,
+            )
+        )
 
     log.info("trumpbot_started", task_count=len(tasks))
     exit_code = 0

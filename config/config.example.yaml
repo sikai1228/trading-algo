@@ -187,3 +187,40 @@ execution:
 
 bankroll:
   starting_amount_usd: 500.00  # adjust per actual deposit
+
+# ----- Phase 3 Part 2: operational features -----------------------------
+
+notifications:
+  # Send a one-line ✓ heartbeat to Telegram every N minutes.
+  heartbeat_interval_minutes: 15
+  # Daily-digest fires once at this UTC hour (12 UTC ≈ 8 AM ET in
+  # standard time; 13 UTC ≈ 9 AM ET in daylight time).
+  digest_hour_utc: 12
+  # How often to scan markets table for resolutions on tickers we hold.
+  settlement_check_interval_seconds: 300
+  # How often to check source_status for stale pollers.
+  source_health_check_interval_seconds: 300
+  # A source with no successful poll in this long fires
+  # alert_warning_source_down. Recovery fires alert_info_source_recovered.
+  source_down_alert_threshold_minutes: 30
+  db_slow_query_threshold_ms: 500
+  kalshi_disconnect_alert_threshold_minutes: 5
+  # AlertDispatcher dedup window. The same dedup_key under the same
+  # category is suppressed if it fires again inside this window.
+  alert_dedup_window_minutes: 60
+  # Defends the bot against a stolen Telegram session firing /halt
+  # /resume /halt in a loop.
+  rate_limit_commands_per_minute: 30
+
+alias_enrichment:
+  # Disable to skip the LLM call entirely (the matcher will still see
+  # the auto-extracted aliases from the market title).
+  enabled: true
+  prompt_path: "trumpbot/news/prompts/alias_enrichment_v1.txt"
+  prompt_version: "v1"
+  model: "claude-haiku-4-5"
+  max_tokens: 512
+  # Combined cap for ALL Anthropic spend in a calendar month
+  # (alias enrichment today; classifier in a future phase). Stored as
+  # USDCents — 1000 = $10.00.
+  monthly_cap_usd_cents: 1000

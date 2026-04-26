@@ -122,6 +122,43 @@ class BankrollConfig(BaseModel):
     starting_amount_usd: float = 500.00
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 Part 2 — operational features
+# ---------------------------------------------------------------------------
+
+
+class NotificationsConfig(BaseModel):
+    """Knobs for the heartbeat / digest / settlement / source-health
+    loops + the categorized alert dispatcher's dedup window."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    heartbeat_interval_minutes: int = 15
+    digest_hour_utc: int = 12  # 12 UTC ~ 8 AM ET in standard time
+    settlement_check_interval_seconds: int = 300  # 5 min
+    source_health_check_interval_seconds: int = 300
+    source_down_alert_threshold_minutes: int = 30
+    db_slow_query_threshold_ms: int = 500
+    kalshi_disconnect_alert_threshold_minutes: int = 5
+    alert_dedup_window_minutes: int = 60
+    rate_limit_commands_per_minute: int = 30
+
+
+class AliasEnrichmentConfig(BaseModel):
+    """LLM-enrichment knobs. ``monthly_cap_usd_cents`` doubles as the
+    cap for the future classifier -- one budget for all Anthropic
+    calls."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    prompt_path: str = "trumpbot/news/prompts/alias_enrichment_v1.txt"
+    prompt_version: str = "v1"
+    model: str = "claude-haiku-4-5"
+    max_tokens: int = 512
+    monthly_cap_usd_cents: int = 1000  # $10/month default
+
+
 class NewsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -183,6 +220,9 @@ class TrumpbotConfig(BaseModel):
     approval: ApprovalPhaseConfig = Field(default_factory=lambda: ApprovalPhaseConfig())
     execution: ExecutionPhaseConfig = Field(default_factory=lambda: ExecutionPhaseConfig())
     bankroll: BankrollConfig = Field(default_factory=lambda: BankrollConfig())
+    # Phase 3 Part 2.
+    notifications: NotificationsConfig = Field(default_factory=lambda: NotificationsConfig())
+    alias_enrichment: AliasEnrichmentConfig = Field(default_factory=lambda: AliasEnrichmentConfig())
 
 
 def _expand_env(value: Any) -> Any:

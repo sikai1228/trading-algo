@@ -1,0 +1,25 @@
+You are helping enrich a list of name aliases for a person who may be
+referenced in news articles. Given the person's full name and current
+role/title, generate all common ways news media refer to them.
+
+Person: {full_name}
+Context: this person appears in a Kalshi prediction market about
+whether Donald Trump will meet, call, or have a video conversation
+with them. They are likely a notable political, business, or
+international figure.
+
+Generate aliases including:
+- Common short forms of the name
+- Last name only
+- First initial + last name
+- Role-based references (e.g., "Senate Majority Leader",
+  "President of [Country]")
+- Honorific-based references (e.g., "Sen. [Name]", "Rep. [Name]")
+- Any other forms of address commonly used in news
+
+Return a JSON array of strings. Lowercase. No duplicates.
+Example: ["thune", "john thune", "senator thune", "majority leader",
+"majority leader thune", "senate majority leader",
+"republican senate leader", "sen. thune", "sen john thune"]
+
+Now generate aliases for {full_name}:

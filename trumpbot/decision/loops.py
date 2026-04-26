@@ -21,7 +21,9 @@ from trumpbot.db.connection import Database
 from trumpbot.db.repositories import (
     get_last_closed_trade_for_ticker,
     get_open_trade_for_ticker,
+    get_system_state,
     insert_system_event,
+    is_market_snoozed,
     list_open_trades,
     total_open_position_cost_cents,
     update_telegram_approval,
@@ -112,11 +114,29 @@ async def _run_decision_cycle(
     depth: DepthFn,
     starting_amount_usd: float,
 ) -> None:
+    # Phase 3 Part 2: respect /halt as the first thing every cycle.
+    # When the user has issued /halt the entire cycle is a no-op until
+    # /resume clears the flag. Stop-losses and re-entries are also
+    # gated (handled separately in their loops).
+    if _is_halted(db):
+        return
+
     matches = _fetch_unevaluated_matches(db)
     if not matches:
         return
     for match in matches:
         ticker = match["ticker"]
+        # Phase 3 Part 2: skip per-ticker if /snooze is active.
+        if is_market_snoozed(db, ticker):
+            insert_system_event(
+                db,
+                event_type="trade_skipped_snoozed",
+                severity="info",
+                component="decision_loop",
+                message=f"skipping match for snoozed ticker {ticker}",
+                detail={"ticker": ticker, "match_id": match["id"]},
+            )
+            continue
         market_row = _get_market_row(db, ticker)
         if market_row is None:
             continue
@@ -142,6 +162,12 @@ async def _run_decision_cycle(
             log.info("decision_loop_risk_rejected", reason=decision.reason)
             continue
         await _approve_and_submit(decision, gate, executor, db)
+
+
+def _is_halted(db: Database) -> bool:
+    """Read ``system_state.halt_flag``. Phase 3 Part 2 plumbing for
+    the /halt and /resume commands."""
+    return (get_system_state(db, "halt_flag") or "false").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -241,41 +267,28 @@ async def reentry_loop(
     log.info(f"{component}_started")
     while not stop_event.is_set():
         try:
-            for match in _fetch_unevaluated_matches(db):
-                ticker = match["ticker"]
-                # Only consider tickers where we don't currently hold and
-                # there's a closed-out prior trade.
-                if get_open_trade_for_ticker(db, ticker) is not None:
-                    continue
-                prior_row = get_last_closed_trade_for_ticker(db, ticker)
-                if prior_row is None:
-                    continue
-                market_row = _get_market_row(db, ticker)
-                if market_row is None:
-                    continue
-                snap = _row_to_snapshot(match, market_row)
-                market_state = _market_state(orderbook, ticker, db=db)
-                bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
-                prior_position = _row_to_position(prior_row)
-                if prior_position is None:
-                    continue
-                levels = depth(ticker) or []
-                intent = engine.evaluate_reentry(
-                    snap,
-                    market_state,
-                    prior_position,
-                    prior_row["status"],
-                    prior_row["realized_pnl_usd_cents"],
-                    bankroll,
-                    yes_ask_levels=levels,
-                )
-                if intent is None:
-                    continue
-                state = RiskState(bankroll=bankroll, open_position_tickers=_open_tickers(db))
-                decision = risk.evaluate(intent, state)
-                if isinstance(decision, RiskRejection):
-                    continue
-                await _approve_and_submit(decision, gate, executor, db)
+            # Phase 3 Part 2: respect /halt for re-entries (they ARE
+            # new trade proposals from the user's perspective).
+            if _is_halted(db):
+                pass  # fall through to the sleep at the end
+            else:
+                for match in _fetch_unevaluated_matches(db):
+                    ticker = match["ticker"]
+                    # Phase 3 Part 2: skip if /snooze is active.
+                    if is_market_snoozed(db, ticker):
+                        continue
+                    await _maybe_reentry(
+                        db=db,
+                        engine=engine,
+                        risk=risk,
+                        gate=gate,
+                        executor=executor,
+                        orderbook=orderbook,
+                        depth=depth,
+                        starting_amount_usd=starting_amount_usd,
+                        match=match,
+                        ticker=ticker,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -283,6 +296,55 @@ async def reentry_loop(
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=poll_interval_sec)
     log.info(f"{component}_stopped")
+
+
+async def _maybe_reentry(  # type: ignore[no-untyped-def]
+    *,
+    db: Database,
+    engine: DecisionEngine,
+    risk: RiskManager,
+    gate: ApprovalGate,
+    executor: DryRunExecutor,
+    orderbook: OrderbookFn,
+    depth: DepthFn,
+    starting_amount_usd: float,
+    match,
+    ticker: str,
+) -> None:
+    """Refactored body of the re-entry per-match loop. Pulled out so
+    the halt + snooze guards above can early-return without an
+    awkward indentation wrap."""
+    if get_open_trade_for_ticker(db, ticker) is not None:
+        return
+    prior_row = get_last_closed_trade_for_ticker(db, ticker)
+    if prior_row is None:
+        return
+    market_row = _get_market_row(db, ticker)
+    if market_row is None:
+        return
+    snap = _row_to_snapshot(match, market_row)
+    market_state = _market_state(orderbook, ticker, db=db)
+    bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
+    prior_position = _row_to_position(prior_row)
+    if prior_position is None:
+        return
+    levels = depth(ticker) or []
+    intent = engine.evaluate_reentry(
+        snap,
+        market_state,
+        prior_position,
+        prior_row["status"],
+        prior_row["realized_pnl_usd_cents"],
+        bankroll,
+        yes_ask_levels=levels,
+    )
+    if intent is None:
+        return
+    state = RiskState(bankroll=bankroll, open_position_tickers=_open_tickers(db))
+    decision = risk.evaluate(intent, state)
+    if isinstance(decision, RiskRejection):
+        return
+    await _approve_and_submit(decision, gate, executor, db)
 
 
 # ---------------------------------------------------------------------------

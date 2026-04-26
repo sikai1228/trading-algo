@@ -503,6 +503,44 @@ def get_subject(db: Database, subject_key: str) -> sqlite3.Row | None:
     return row
 
 
+def fetch_subject_aliases(db: Database, subject_key: str) -> tuple[bool, list[str]] | None:
+    """Return ``(llm_enriched, aliases)`` for ``subject_key`` or
+    ``None`` if the subject doesn't exist. Used by the alias enricher
+    to skip subjects that have already been processed and to merge
+    new aliases with the existing list."""
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT llm_enriched, aliases FROM subjects WHERE subject_key = ?",
+        (subject_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        aliases = json.loads(row["aliases"]) if row["aliases"] else []
+    except (json.JSONDecodeError, TypeError):
+        aliases = []
+    if not isinstance(aliases, list):
+        aliases = []
+    return bool(row["llm_enriched"]), [str(a) for a in aliases]
+
+
+def mark_subject_llm_enriched(db: Database, *, subject_key: str, aliases: list[str]) -> None:
+    """Mark a subject as LLM-enriched and replace its alias list. The
+    list is the union the caller has already computed (auto-extracted +
+    LLM-suggested) so we don't redo the union here."""
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            UPDATE subjects
+               SET aliases = ?,
+                   llm_enriched = 1,
+                   updated_at = ?
+             WHERE subject_key = ?
+            """,
+            (json.dumps(aliases), utcnow_iso(), subject_key),
+        )
+
+
 def list_subjects(db: Database) -> list[sqlite3.Row]:
     """All rows in the subjects table.
 
@@ -802,5 +840,299 @@ def total_open_position_cost_cents(db: Database) -> int:
     row = conn.execute(
         "SELECT COALESCE(SUM(cost_basis_usd_cents), 0) "
         "FROM trades WHERE status IN ('dry_run', 'live')"
+    ).fetchone()
+    return int(row[0])
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 Part 2: operational tables
+# ---------------------------------------------------------------------------
+
+
+# system_state — generic key/value bag (halt_flag etc.)
+
+
+def get_system_state(db: Database, key: str) -> str | None:
+    """Return the value for ``key`` from ``system_state`` or ``None``
+    if the row does not exist."""
+    conn = db.connect()
+    row = conn.execute("SELECT value FROM system_state WHERE key = ?", (key,)).fetchone()
+    return None if row is None else str(row[0])
+
+
+def set_system_state(db: Database, *, key: str, value: str) -> None:
+    """Upsert ``key=value`` in ``system_state`` and bump ``updated_at``."""
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO system_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (key, value, utcnow_iso()),
+        )
+
+
+# snoozed_markets — per-ticker /snooze state
+
+
+@dataclass(frozen=True)
+class SnoozedMarketRow:
+    ticker: str
+    snoozed_until: str
+    """ISO-8601 UTC timestamp at which the snooze expires."""
+
+    snoozed_at: str
+    reason: str | None
+
+
+def upsert_snoozed_market(
+    db: Database, *, ticker: str, snoozed_until: str, reason: str | None = None
+) -> None:
+    """Snooze (or extend the snooze on) ``ticker`` until ``snoozed_until``."""
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO snoozed_markets (ticker, snoozed_until, snoozed_at, reason)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(ticker) DO UPDATE SET
+                snoozed_until = excluded.snoozed_until,
+                snoozed_at = excluded.snoozed_at,
+                reason = excluded.reason
+            """,
+            (ticker, snoozed_until, utcnow_iso(), reason),
+        )
+
+
+def delete_snoozed_market(db: Database, *, ticker: str) -> bool:
+    """Remove the snooze on ``ticker``. Returns True if a row was deleted."""
+    with db.transaction() as conn:
+        cur = conn.execute("DELETE FROM snoozed_markets WHERE ticker = ?", (ticker,))
+        return cur.rowcount > 0
+
+
+def is_market_snoozed(db: Database, ticker: str, *, now_iso: str | None = None) -> bool:
+    """True iff ``ticker`` has a snooze row with ``snoozed_until > now``."""
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT snoozed_until FROM snoozed_markets WHERE ticker = ?",
+        (ticker,),
+    ).fetchone()
+    if row is None:
+        return False
+    now = now_iso or utcnow_iso()
+    return str(row[0]) > now
+
+
+def list_active_snoozed_markets(
+    db: Database, *, now_iso: str | None = None
+) -> list[SnoozedMarketRow]:
+    """All snoozes whose ``snoozed_until`` is in the future."""
+    conn = db.connect()
+    now = now_iso or utcnow_iso()
+    rows = conn.execute(
+        """
+        SELECT ticker, snoozed_until, snoozed_at, reason
+        FROM snoozed_markets
+        WHERE snoozed_until > ?
+        ORDER BY snoozed_until ASC
+        """,
+        (now,),
+    ).fetchall()
+    return [
+        SnoozedMarketRow(
+            ticker=r["ticker"],
+            snoozed_until=r["snoozed_until"],
+            snoozed_at=r["snoozed_at"],
+            reason=r["reason"],
+        )
+        for r in rows
+    ]
+
+
+# source_status — per-news-source health
+
+
+@dataclass(frozen=True)
+class SourceStatusRow:
+    source_name: str
+    current_status: str
+    last_successful_poll: str | None
+    last_alert_sent: str | None
+    consecutive_failures: int
+    updated_at: str
+
+
+def upsert_source_status(
+    db: Database,
+    *,
+    source_name: str,
+    current_status: str,
+    last_successful_poll: str | None = None,
+    last_alert_sent: str | None = None,
+    consecutive_failures: int = 0,
+) -> None:
+    """Upsert one row in ``source_status``. ``COALESCE`` on the
+    optional fields preserves prior values if the caller passes
+    ``None`` (i.e. a "just record a successful poll" call doesn't
+    clobber ``last_alert_sent``)."""
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO source_status (
+                source_name, current_status,
+                last_successful_poll, last_alert_sent,
+                consecutive_failures, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_name) DO UPDATE SET
+                current_status = excluded.current_status,
+                last_successful_poll = COALESCE(
+                    excluded.last_successful_poll, last_successful_poll
+                ),
+                last_alert_sent = COALESCE(
+                    excluded.last_alert_sent, last_alert_sent
+                ),
+                consecutive_failures = excluded.consecutive_failures,
+                updated_at = excluded.updated_at
+            """,
+            (
+                source_name,
+                current_status,
+                last_successful_poll,
+                last_alert_sent,
+                consecutive_failures,
+                utcnow_iso(),
+            ),
+        )
+
+
+def list_source_status(db: Database) -> list[SourceStatusRow]:
+    conn = db.connect()
+    rows = conn.execute("SELECT * FROM source_status ORDER BY source_name").fetchall()
+    return [
+        SourceStatusRow(
+            source_name=r["source_name"],
+            current_status=r["current_status"],
+            last_successful_poll=r["last_successful_poll"],
+            last_alert_sent=r["last_alert_sent"],
+            consecutive_failures=r["consecutive_failures"],
+            updated_at=r["updated_at"],
+        )
+        for r in rows
+    ]
+
+
+def get_source_status(db: Database, source_name: str) -> SourceStatusRow | None:
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT * FROM source_status WHERE source_name = ?", (source_name,)
+    ).fetchone()
+    if row is None:
+        return None
+    return SourceStatusRow(
+        source_name=row["source_name"],
+        current_status=row["current_status"],
+        last_successful_poll=row["last_successful_poll"],
+        last_alert_sent=row["last_alert_sent"],
+        consecutive_failures=row["consecutive_failures"],
+        updated_at=row["updated_at"],
+    )
+
+
+# alert_dedup — short-window dedup for the categorized-alert system
+
+
+def claim_alert_send(
+    db: Database,
+    *,
+    dedup_key: str,
+    category: str,
+    window_seconds: int,
+    now_iso_str: str | None = None,
+) -> bool:
+    """Atomically check + record an alert send. Returns True if the
+    alert SHOULD be sent (no recent send under this key); False if a
+    duplicate within ``window_seconds`` is suppressed.
+
+    Updates the row in either case so the most-recent send timestamp
+    is current — that way the dedup window slides forward on every
+    duplicate attempt rather than allowing a flood at the boundary.
+    """
+    now = now_iso_str or utcnow_iso()
+    with db.transaction() as conn:
+        prior = conn.execute(
+            "SELECT last_sent_at FROM alert_dedup WHERE dedup_key = ? AND category = ?",
+            (dedup_key, category),
+        ).fetchone()
+        # Decide first, then upsert. The transaction holds the row
+        # lock until the upsert completes so a second caller within
+        # the same transaction window sees the updated timestamp.
+        send_it = True
+        if prior is not None:
+            from datetime import datetime
+
+            last = datetime.fromisoformat(str(prior[0]).replace("Z", "+00:00"))
+            current = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            if (current - last).total_seconds() < window_seconds:
+                send_it = False
+        conn.execute(
+            """
+            INSERT INTO alert_dedup (dedup_key, category, last_sent_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(dedup_key, category) DO UPDATE SET
+                last_sent_at = excluded.last_sent_at
+            """,
+            (dedup_key, category, now),
+        )
+        return send_it
+
+
+# llm_spend_log — Anthropic API spend tracker
+
+
+def insert_llm_spend(
+    db: Database,
+    *,
+    component: str,
+    model: str,
+    cost_usd_cents: int,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> None:
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO llm_spend_log (
+                component, model, cost_usd_cents,
+                input_tokens, output_tokens, occurred_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (component, model, cost_usd_cents, input_tokens, output_tokens, utcnow_iso()),
+        )
+
+
+def llm_spend_since_cents(db: Database, *, since_iso: str) -> int:
+    """Sum of ``cost_usd_cents`` from ``llm_spend_log`` since
+    ``since_iso``. Used by the cost guard and the ``/spend``
+    command."""
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(cost_usd_cents), 0) FROM llm_spend_log WHERE occurred_at >= ?",
+        (since_iso,),
+    ).fetchone()
+    return int(row[0])
+
+
+def llm_spend_count_since(db: Database, *, since_iso: str) -> int:
+    """Number of LLM calls since ``since_iso``. Used to compute
+    average-per-call for the ``/spend`` command."""
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_log WHERE occurred_at >= ?",
+        (since_iso,),
     ).fetchone()
     return int(row[0])

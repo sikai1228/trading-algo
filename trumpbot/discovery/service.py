@@ -67,8 +67,17 @@ from trumpbot.kalshi.client import KalshiClient
 from trumpbot.kalshi.exceptions import KalshiError, StateError
 from trumpbot.kalshi.schemas import KalshiEventResponse, KalshiMarket
 from trumpbot.notifications.telegram import TelegramNotifier
+from trumpbot.notifications.templates import render_template
 from trumpbot.utils.logging import get_logger
 from trumpbot.utils.timeutil import parse_iso_to_str, utcnow
+
+
+def _render(name: str, data: dict) -> str:  # type: ignore[type-arg]
+    """Tiny adapter so call sites stay tidy. Single source of truth
+    for Telegram message text lives in
+    :mod:`trumpbot.notifications.templates`."""
+    return render_template(name, data).text
+
 
 log = get_logger(__name__)
 
@@ -233,8 +242,10 @@ class MarketDiscoveryService:
                 detail={"event_ticker": ticker_str, "market_count": len(pending)},
             )
             await self._telegram_alert(
-                f"⚠️ {ticker_str} returned markets with no resolution rules. "
-                "Skipping snapshot write; manual review required."
+                _render(
+                    "alert_warning_event_resolution_rules_missing",
+                    {"event_ticker": ticker_str},
+                )
             )
             return
 
@@ -290,12 +301,18 @@ class MarketDiscoveryService:
             )
             subjects_preview = ", ".join(r.subject_full_name for r in rows[:6])
             md_basename = ticker_str.lower().replace("-", "_")
+            preview_suffix = "..." if len(rows) > 6 else ""
             await self._telegram_alert(
-                f"🔔 New month detected: {ticker_str} just opened.\n"
-                f"Discovered {len(rows)} markets. "
-                f"Subjects: {subjects_preview}"
-                + ("…" if len(rows) > 6 else "")
-                + f"\nSnapshot saved to data/markets/{md_basename}_summary.md"
+                _render(
+                    "alert_info_market_discovered",
+                    {
+                        "event_ticker": ticker_str,
+                        "market_count": len(rows),
+                        "new_subjects_summary": (f"Subjects: {subjects_preview}{preview_suffix}"),
+                        "removed_subjects_summary": "",
+                        "snapshot_path": f"{md_basename}_summary.md",
+                    },
+                )
             )
             await self._bus.publish(
                 Event(
@@ -325,8 +342,13 @@ class MarketDiscoveryService:
                 detail={"ticker": market.ticker, "title": market.title},
             )
             await self._telegram_alert(
-                f"⚠️ Market {market.ticker} ({extracted.full_name}) returned with no "
-                "resolution rules. Not inserted."
+                _render(
+                    "alert_warning_market_resolution_rules_missing",
+                    {
+                        "ticker": market.ticker,
+                        "full_name": extracted.full_name,
+                    },
+                )
             )
             return False
 
@@ -351,8 +373,10 @@ class MarketDiscoveryService:
                 },
             )
             await self._telegram_alert(
-                f"⚠️ {market.ticker} title or resolution_rules changed mid-event. "
-                "Frozen original retained; manual review required."
+                _render(
+                    "alert_critical_resolution_rules_changed_midevent",
+                    {"ticker": market.ticker},
+                )
             )
             # Do still update price/status/volume — those are not the contract.
             update_market_market_data(

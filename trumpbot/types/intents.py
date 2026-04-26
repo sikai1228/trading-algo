@@ -144,6 +144,21 @@ class TradeIntent(_IntentBase):
     to empty list for fixtures."""
     # --------------------------------------------------------------
 
+    # Phase 4 Part 2.11 — article-context audit so trade-proposal
+    # Telegram messages can render "the article that fired this
+    # trade" without re-querying news_events + llm_classifications
+    # at render time. Defaulted to empty strings for back-compat
+    # with existing fixtures and pre-2.11 backlog rows.
+    triggering_article_url: str = ""
+    triggering_source: str = ""
+    triggering_headline: str = ""
+    triggering_key_quote: str = ""
+    triggering_published_ts: str = ""
+    """ISO-8601 UTC timestamp when the article was published. Empty
+    string when the source feed didn't carry a timestamp; the
+    article-age annotation in the Telegram template falls back to
+    'unknown' in that case."""
+
     is_reentry: Literal[False] = False
     prior_trade_id: None = None
 
@@ -177,6 +192,14 @@ class ReentryIntent(_IntentBase):
 
     slippage_cents: int = 0
     levels_consumed: list[tuple[int, int]] = []
+
+    # Phase 4 Part 2.11 — same article-context audit fields as
+    # TradeIntent. Renders into the re-entry Telegram template.
+    triggering_article_url: str = ""
+    triggering_source: str = ""
+    triggering_headline: str = ""
+    triggering_key_quote: str = ""
+    triggering_published_ts: str = ""
 
     is_reentry: Literal[True] = True
     prior_trade_id: int
@@ -286,7 +309,15 @@ class ApprovalDecision(BaseModel):
     intent_id: str
     decision: Literal["approved", "rejected", "expired"]
     decided_at: datetime
-    decision_source: Literal["telegram_button", "telegram_command", "timeout"]
+    decision_source: Literal[
+        "telegram_button",
+        "telegram_command",
+        "timeout",
+        # Phase 4 Part 2.11 — entry intents in approval.mode="auto"
+        # bypass Telegram and synthesize an audit row with this
+        # source. Stop-loss and re-entry never use this value.
+        "auto_approval",
+    ]
     rejected_reason: str | None = None
     approval_record_id: int | None = None
     """Row id in ``telegram_approvals``."""

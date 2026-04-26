@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -175,6 +176,7 @@ async def _amain(config_path: Path) -> int:
     from trumpbot.decision.engine import DecisionConfig as DecCfg
     from trumpbot.decision.engine import DecisionEngine
     from trumpbot.decision.loops import (
+        AutoNotifyFn,
         decision_loop,
         position_marking_loop,
         reentry_loop,
@@ -286,6 +288,7 @@ async def _amain(config_path: Path) -> int:
     approval_gate = ApprovalGate(
         db=db,
         config=ApprovalGateConfig(
+            mode=cfg.approval.mode,
             entry_timeout_sec=cfg.approval.entry_timeout_sec,
             stop_loss_timeout_sec=cfg.approval.stop_loss_timeout_sec,
             reentry_timeout_sec=cfg.approval.reentry_timeout_sec,
@@ -293,6 +296,32 @@ async def _amain(config_path: Path) -> int:
         requester=requester,  # type: ignore[arg-type]
         depth_fn=_depth,
     )
+
+    # Phase 4 Part 2.11 — log the approval mode prominently and fire
+    # a critical Telegram alert when auto-approval is enabled. Makes
+    # accidental auto-mode highly visible.
+    log.info(f"APPROVAL MODE: {cfg.approval.mode.upper()}")
+    if cfg.approval.mode == "auto":
+        log.warning(
+            "AUTO-APPROVAL ENABLED. Entry trades will fire without "
+            "Telegram approval. Stop-loss and re-entry still require "
+            "human approval."
+        )
+        insert_system_event(
+            db,
+            event_type="auto_approval_enabled",
+            severity="warning",
+            component="daemon",
+            message="Daemon started with approval.mode=auto",
+        )
+    else:
+        insert_system_event(
+            db,
+            event_type="human_approval_enabled",
+            severity="info",
+            component="daemon",
+            message="Daemon started with approval.mode=human",
+        )
 
     # ---- Phase 4 Part 1: live executor switch + reconciliation ----
     # Pick executor based on cfg.execution.mode. The two flavors
@@ -357,6 +386,24 @@ async def _amain(config_path: Path) -> int:
     await twitter_scraper.start()
     await truth_scraper.start()
 
+    # Phase 4 Part 2.11 — auto-approval Telegram confirmation hook
+    # used by ``decision_loop`` for entry intents whose approval
+    # source was 'auto_approval'. None when telegram isn't wired
+    # (the loop's auto path swallows the no-op silently).
+    auto_notify: AutoNotifyFn | None
+    if telegram_bot is not None:
+
+        async def _auto_notify(template_name: str, data: dict[str, object]) -> None:
+            from trumpbot.notifications.templates import render_template
+
+            assert telegram_bot is not None  # guarded by outer if
+            rendered = render_template(template_name, data)
+            await telegram_bot.send_text(rendered.text, silent=True)
+
+        auto_notify = _auto_notify
+    else:
+        auto_notify = None
+
     tasks: dict[str, asyncio.Task[None]] = {
         "discovery": asyncio.create_task(_supervised(discovery.run, "discovery", critical=True)),
         "kalshi_ws": asyncio.create_task(_supervised(ws_feed.run, "kalshi_ws", critical=True)),
@@ -376,6 +423,7 @@ async def _amain(config_path: Path) -> int:
                     execution_mode=cfg.execution.mode,
                     poll_interval_sec=cfg.decision.decision_loop_interval_sec,
                     stop_event=stop_event,
+                    auto_notify=auto_notify,
                 ),
                 "decision_loop",
                 critical=False,
@@ -442,6 +490,24 @@ async def _amain(config_path: Path) -> int:
         ),
         dedup_window_seconds=cfg.notifications.alert_dedup_window_minutes * 60,
     )
+
+    # Phase 4 Part 2.11 — fire the audible auto-approval-enabled
+    # alert once on startup so accidental auto-mode surfaces in
+    # Telegram immediately. Dispatcher needed Telegram wiring;
+    # we deferred this to here.
+    if cfg.approval.mode == "auto":
+        from zoneinfo import ZoneInfo
+
+        time_et = (
+            datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M ET")
+        )
+        with contextlib.suppress(Exception):
+            await alert_dispatcher.send(
+                template_name="alert_critical_auto_approval_enabled",
+                data={"time_et": time_et},
+                dedup_key="auto_approval_enabled",
+                component="daemon",
+            )
 
     # Subscribe alias-enrichment to market_discovered events. The
     # enricher only fires when ANTHROPIC_API_KEY is configured AND

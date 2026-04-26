@@ -104,3 +104,57 @@ a past state of the code.
    `tests/test_halt.py::test_snooze_repo_helpers_are_gone`).
 4. Update CLAUDE.md.
 5. Open a one-purpose PR; do NOT mix unrelated cleanups.
+
+---
+
+## Phase 4 Part 2.11 — auto-approval + standardized notifications follow-ups
+
+Items the 2.11 PR consciously deferred (none block trading; all are
+quality-of-life on the new templates):
+
+### Re-entry template — `prior_closed_age`
+
+The re-entry message template carries a `{prior_closed_age}` field
+intended to render `"6 h"` / `"2 d"` next to the prior-trade
+outcome. Today the data adapter renders `"unknown"` because
+`ReentryIntent` doesn't carry the prior-trade close timestamp.
+
+**To finish:** add `prior_trade_closed_at: str = ""` to
+`ReentryIntent`, populate it from `prior_trade.closed_at` in
+`engine.evaluate_reentry`, render with
+`humanize_age_since(intent.prior_trade_closed_at)`.
+
+### Stop-loss template — `news_context`
+
+The stop-loss message template carries a `{news_context}` field
+intended to summarize the last 6 hours of `news_market_matches` for
+the same ticker so the operator can see if a fresh signal might be
+counter-evidence to exiting. Today the adapter renders
+`"(no recent matches indexed)"`.
+
+**To finish:** add a small DB query helper
+(`fetch_recent_matches_for_ticker(db, ticker, hours=6)`) in
+`db/repositories.py`, thread the `Database` handle into
+`message_templates._stop_loss_data` (the adapter is currently pure;
+this is the only function that would need DB access), render the
+results as a 1-2 line summary.
+
+Risk: low. The stop-loss message renders cleanly as-is; this only
+adds context.
+
+### End-to-end auto-approval integration test
+
+The Phase 4 Part 2.11 spec asked for an "insert synthetic
+news_market_match → wait for decision_loop → verify trade row +
+trade_filled_auto Telegram message within 10 s" test. The unit
+tests pin gate behavior, template renders, and the helper math; an
+end-to-end test that runs the full loop with a mocked Anthropic +
+Telegram is deferred to a future integration suite that wires the
+existing `AutoNotifyFn` into a recorder rather than the real bot.
+
+### Switch `DecisionPhaseConfig` back to `extra="forbid"`
+
+After all deployed configs strip `position_size_base_pct:` and
+`llm_confidence_threshold:`, the schema can flip back from
+`extra="ignore"` to `extra="forbid"` so future legacy fields fail
+loudly. (Phase 4 Part 2.9 made the same trade-off.)

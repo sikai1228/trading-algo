@@ -275,6 +275,12 @@ class DryRunExecutor:
                 slippage_cents=rewalk.slippage_cents,
                 entry_fees_cents=rewalk.estimated_fees_cents,
                 levels_consumed_json=json.dumps(rewalk.levels_consumed),
+                # Phase 4 Part 2.11 — article-context audit columns.
+                triggering_article_url=intent.triggering_article_url or None,
+                triggering_source=intent.triggering_source or None,
+                triggering_headline=intent.triggering_headline or None,
+                triggering_key_quote=intent.triggering_key_quote or None,
+                triggering_published_ts=intent.triggering_published_ts or None,
             ),
         )
         return ExecutionResult(
@@ -321,6 +327,13 @@ class DryRunExecutor:
                 prior_trade_id=getattr(intent, "prior_trade_id", None),
                 reasoning_text=intent.reasoning_text,
                 entered_at=_utcnow_iso(),
+                # Phase 4 Part 2.11 — article-context audit columns
+                # (legacy top-of-book path; carries the same fields).
+                triggering_article_url=intent.triggering_article_url or None,
+                triggering_source=intent.triggering_source or None,
+                triggering_headline=intent.triggering_headline or None,
+                triggering_key_quote=intent.triggering_key_quote or None,
+                triggering_published_ts=intent.triggering_published_ts or None,
             ),
         )
         return ExecutionResult(

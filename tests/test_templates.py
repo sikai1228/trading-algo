@@ -95,6 +95,10 @@ def test_only_critical_alerts_are_audible() -> None:
         # mid-run by the LLM classifier. Operator must know whether
         # Kalshi updated the rules or the file was edited locally.
         "alert_critical_contract_rules_changed",
+        # Phase 4 Part 2.11: auto-approval mode active. Fired once
+        # on daemon startup whenever cfg.approval.mode == "auto"
+        # so accidental enable surfaces in Telegram immediately.
+        "alert_critical_auto_approval_enabled",
     }
     assert audible_names == expected
 

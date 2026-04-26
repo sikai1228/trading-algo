@@ -304,6 +304,12 @@ class KalshiExecutor:
                 entry_fees_cents=rewalk.estimated_fees_cents,
                 levels_consumed_json=json.dumps(rewalk.levels_consumed),
                 client_order_id=client_order_id,
+                # Phase 4 Part 2.11 — article-context audit columns.
+                triggering_article_url=intent.triggering_article_url or None,
+                triggering_source=intent.triggering_source or None,
+                triggering_headline=intent.triggering_headline or None,
+                triggering_key_quote=intent.triggering_key_quote or None,
+                triggering_published_ts=intent.triggering_published_ts or None,
             ),
         )
         log.info(

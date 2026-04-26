@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -184,20 +185,35 @@ def _check_risk_caps(cfg) -> CheckResult:  # type: ignore[no-untyped-def]
 
 
 def _check_approval_mode_hardcoded() -> CheckResult:
-    """Verify approval is hardcoded to human (not a config knob)."""
-    from trumpbot.approval.gate import APPROVAL_MODE
+    """Verify approval mode is the safe default ``"human"``.
 
-    if APPROVAL_MODE != "human":
+    Phase 4 Part 2.11 made the mode config-reachable; this check
+    asserts the operator hasn't flipped it before pre-live. Returns
+    ``passed=False`` if ``cfg.approval.mode != "human"`` so the
+    operator must explicitly acknowledge auto-approval before going
+    live."""
+    cfg = load_config(_default_config_path())
+    if cfg.approval.mode != "human":
         return CheckResult(
-            name="Approval mode hardcoded human",
+            name="Approval mode = human",
             passed=False,
-            detail=f"APPROVAL_MODE = {APPROVAL_MODE!r}; expected 'human'",
+            detail=(
+                f"cfg.approval.mode = {cfg.approval.mode!r}; expected 'human' "
+                "before live. Switch to auto only after the shadow_decisions "
+                "audit shows stable signals."
+            ),
         )
     return CheckResult(
-        name="Approval mode hardcoded human",
+        name="Approval mode = human",
         passed=True,
-        detail="APPROVAL_MODE constant == 'human'",
+        detail="cfg.approval.mode == 'human'",
     )
+
+
+def _default_config_path() -> Path:
+    """Best-effort: pick the config the operator most likely points
+    the daemon at. Mirrors the daemon's CLI default."""
+    return Path(os.environ.get("TRUMPBOT_CONFIG", "/etc/trumpbot/config.yaml")).expanduser()
 
 
 async def _amain(args: argparse.Namespace) -> int:

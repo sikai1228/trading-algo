@@ -247,7 +247,6 @@ async def handle_why(ctx: CommandContext) -> RenderedMessage:
             "total_cost": _dollars(int(row["cost_basis_usd_cents"])),
             "fees": _dollars(int(row["entry_fees_cents"] or 0)),
             "source": "news",
-            "source_weight": "1.0",
             "headline": "(see triggering_intent_json for details)",
             "published_time_et": "n/a",
             "lag": "n/a",

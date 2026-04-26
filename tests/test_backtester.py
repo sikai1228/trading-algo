@@ -48,7 +48,6 @@ def _seed(tmp_path: Path) -> Path:
         db,
         NewsEventRow(
             source="ap_via_gnews",
-            source_weight=1.0,
             is_kalshi_approved=True,
             headline="h",
             url="https://e.com/a",

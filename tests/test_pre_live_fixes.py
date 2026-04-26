@@ -77,7 +77,6 @@ def _db(tmp_path: Path) -> Database:
         db,
         NewsEventRow(
             source="reuters",
-            source_weight=1.0,
             is_kalshi_approved=True,
             headline="h",
             url="u",
@@ -214,7 +213,6 @@ class TestBankrollStateInReasoning:
             confidence=0.9,
             interaction_occurred=True,
             source_name="reuters",
-            source_weight=1.0,
             is_kalshi_approved=True,
             market_open_ts="2026-01-01T00:00:00Z",
             market_close_ts="2026-12-31T23:59:59Z",
@@ -429,7 +427,6 @@ def _intent_with_walk(*, qty: int = 10, avg: int = 50) -> TradeIntent:
         target_quantity=qty,
         target_size_usd_cents=avg * qty,
         triggering_match_id=1,
-        confirmation_weight=0.9,
         confidence_score=0.9,
         target_avg_fill_price_cents=avg,
         target_max_fill_price_cents=avg,

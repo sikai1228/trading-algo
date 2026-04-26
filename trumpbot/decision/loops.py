@@ -493,7 +493,6 @@ def _row_to_snapshot(match_row, market_row) -> MatchSnapshot:  # type: ignore[no
         # want to fire trades on keyword-only signal).
         interaction_occurred=classifier_type in {"llm_haiku", "llm_haiku_cached"},
         source_name="unknown",
-        source_weight=1.0,
         is_kalshi_approved=True,  # filter happens at ingestion
         market_open_ts=market_row["open_ts"],
         market_close_ts=market_row["close_ts"],

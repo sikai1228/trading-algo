@@ -49,7 +49,6 @@ class NewsEvidence(_BaseModel):
     news_event_id: int
     role: str  # 'trigger' | 'confirmation' | etc.
     source: str
-    source_weight: float
     headline: str
     url: str | None
     detected_ts: str
@@ -178,7 +177,7 @@ def get_trade_evidence(db_path: Path | str, trade_id: int) -> list[NewsEvidence]
     with _open_readonly(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT n.id AS news_event_id, l.role, n.source, n.source_weight,
+            SELECT n.id AS news_event_id, l.role, n.source,
                    n.headline, n.url, n.detected_ts
             FROM trade_news_links l
             JOIN news_events n ON n.id = l.news_event_id
@@ -192,7 +191,6 @@ def get_trade_evidence(db_path: Path | str, trade_id: int) -> list[NewsEvidence]
             news_event_id=r["news_event_id"],
             role=r["role"],
             source=r["source"],
-            source_weight=r["source_weight"],
             headline=r["headline"],
             url=r["url"],
             detected_ts=r["detected_ts"],

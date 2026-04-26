@@ -102,11 +102,11 @@ class TradeIntent(_IntentBase):
     fees, in USDCents. Equal to ``OrderbookWalkResult.total_cost_cents``."""
 
     triggering_match_id: int
-    confirmation_weight: float
-    """source_weight x llm_confidence."""
 
     confidence_score: float
-    """The matcher / LLM confidence (0..1)."""
+    """The LLM cascade's confidence (0..1). Phase 4 Part 2.7 dropped
+    the per-source weighting; this is the only "how strong is the
+    signal?" knob the engine consults now."""
 
     # ---- Phase 3 Part 1: walk + cap audit ------------------------
     target_avg_fill_price_cents: int = 0
@@ -162,7 +162,6 @@ class ReentryIntent(_IntentBase):
     target_quantity: int
     target_size_usd_cents: int
     triggering_match_id: int
-    confirmation_weight: float
     confidence_score: float
 
     # Phase 3 Part 1 — same walk audit fields as TradeIntent.

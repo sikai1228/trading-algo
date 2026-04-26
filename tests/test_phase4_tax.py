@@ -106,7 +106,6 @@ def _db(tmp_path: Path) -> Database:
         db,
         NewsEventRow(
             source="reuters_via_gnews",
-            source_weight=1.0,
             is_kalshi_approved=True,
             headline="h",
             url="https://e.com/1",

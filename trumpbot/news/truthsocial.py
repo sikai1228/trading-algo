@@ -88,7 +88,6 @@ class TruthSocialScraper(NewsMonitor):
         if False:  # pragma: no cover
             yield FetchedItem(
                 source="",
-                source_weight=0.0,
                 is_kalshi_approved=False,
                 headline="",
                 url=None,
@@ -169,7 +168,6 @@ class TruthSocialScraper(NewsMonitor):
         published_iso = parse_iso_to_str(status.get("created_at"))
         row = NewsEventRow(
             source=source.name,
-            source_weight=source.weight,
             is_kalshi_approved=source.is_kalshi_approved,
             headline=text[:280] or "(no text)",
             url=url,

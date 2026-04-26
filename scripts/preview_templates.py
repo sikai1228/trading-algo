@@ -59,7 +59,6 @@ _SAMPLES: dict[str, Any] = {
     "ticker": "KXTRUMPMEET-26APR-XJIN",
     "match_id": 1287,
     "confidence": 0.93,
-    "weight": 0.93,
     "cap_one_dollars": "$20.00",
     "cap_two_dollars": "$425.00",
     "cap_binding": "cap_one",
@@ -70,8 +69,8 @@ _SAMPLES: dict[str, Any] = {
     "fees_dollars": "$0.18",
     "total_cost_dollars": "$7.73",
     "reasoning_text": (
-        "Source reuters_via_gnews (weight=1.0) classified an article "
-        "matching KXTRUMPMEET-26APR-XJIN at confidence 0.93..."
+        "Source reuters_via_gnews classified an article matching "
+        "KXTRUMPMEET-26APR-XJIN at confidence 0.93..."
     ),
     "prior_trade_id": 42,
     "prior_trade_outcome": "dry_run_closed_stop",
@@ -165,7 +164,6 @@ _SAMPLES: dict[str, Any] = {
     "total_mtm": "+$8.10",
     "entry_time_et": "2026-04-25 12:14 ET",
     "fees": "$0.18",
-    "source_weight": 1.0,
     "headline": "Trump and Xi Jinping hold a phone call.",
     "published_time_et": "2026-04-25 12:09 ET",
     "lag": "5 min",

@@ -30,7 +30,6 @@ def _match(
     market_open_ts: str | None = "2026-04-01T00:00:00Z",
     market_close_ts: str | None = "2026-04-30T23:59:59Z",
     source_name: str = "ap_via_gnews",
-    source_weight: float = 1.0,
     ticker: str = "KXTRUMPMEET-26APR-VPUT",
     match_id: int = 1,
 ) -> MatchSnapshot:
@@ -40,7 +39,6 @@ def _match(
         confidence=confidence,
         interaction_occurred=interaction_occurred,
         source_name=source_name,
-        source_weight=source_weight,
         is_kalshi_approved=is_kalshi_approved,
         market_open_ts=market_open_ts,
         market_close_ts=market_close_ts,

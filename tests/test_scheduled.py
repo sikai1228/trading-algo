@@ -77,7 +77,6 @@ def _seed_match(db: Database) -> int:
         db,
         NewsEventRow(
             source="ap",
-            source_weight=1.0,
             is_kalshi_approved=True,
             headline="h",
             url="https://e.com/1",

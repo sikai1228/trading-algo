@@ -10,16 +10,25 @@ SourceKind = Literal["rss", "twitter", "truth_social"]
 
 
 class NewsSourceConfig(BaseModel):
-    """Configuration for a single news source."""
+    """Configuration for a single news source.
 
-    model_config = ConfigDict(extra="forbid")
+    Phase 4 Part 2.7: the per-source ``weight`` field was REMOVED.
+    All sources are now treated equally in the engine's confidence
+    math; the LLM cascade's confidence score is the only signal that
+    feeds into the entry rule. ``weight`` keys in older config files
+    are accepted-and-ignored via ``extra="allow"`` to keep deploys
+    smooth, but they have no effect on trading.
+    """
+
+    # Phase 4 Part 2.7 — accept (but ignore) legacy `weight` keys so
+    # an unmigrated config.yaml doesn't fail to load.
+    model_config = ConfigDict(extra="allow")
 
     name: str
     type: SourceKind
     url: str | None = None
     handle: str | None = None
     poll_interval_sec: int = Field(default=90, ge=10)
-    weight: float = Field(default=0.85, ge=0.0, le=1.0)
     is_kalshi_approved: bool = False
 
 
@@ -29,7 +38,6 @@ class FetchedItem(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     source: str
-    source_weight: float
     is_kalshi_approved: bool
     headline: str
     url: str | None

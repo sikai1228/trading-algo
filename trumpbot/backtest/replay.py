@@ -340,7 +340,6 @@ class Backtester:
             confidence=match_row["confidence"],
             interaction_occurred=True,
             source_name="backtest",
-            source_weight=1.0,
             is_kalshi_approved=True,
             market_open_ts=market_row["open_ts"] if market_row else None,
             market_close_ts=market_row["close_ts"] if market_row else None,

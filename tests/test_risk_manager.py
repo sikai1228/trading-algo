@@ -142,8 +142,10 @@ class TestRejections:
         assert out.reason == "trading_halted"
 
     def test_price_above_ceiling(self, tmp_path: Path) -> None:
+        # Phase 4 Part 2.5: ceiling raised from 80c to 90c.
+        # 91c is now the just-above-ceiling boundary.
         rm = RiskManager(db=_db(tmp_path), config=RiskConfig())
-        out = rm.evaluate(_intent(target_price_cents=81), _state())
+        out = rm.evaluate(_intent(target_price_cents=91), _state())
         assert isinstance(out, RiskRejection)
         assert out.reason == "price_above_ceiling"
 
@@ -215,14 +217,14 @@ class TestRejections:
 
     def test_size_cap_below_one_contract_rejects(self, tmp_path: Path) -> None:
         """Cap so tight that even one contract doesn't fit. Use a custom
-        config with a $0.50 cap and an 80c intent — 50/80 = 0 contracts
+        config with a $0.50 cap and a 90c intent — 50/90 = 0 contracts
         -> reject."""
         rm = RiskManager(
             db=_db(tmp_path),
             config=RiskConfig(position_size_hard_cap_cents=50),  # $0.50 cap
         )
         out = rm.evaluate(
-            _intent(target_price_cents=80, target_quantity=5),  # $4
+            _intent(target_price_cents=90, target_quantity=5),  # $4.50
             _state(bankroll=_bankroll(bankroll_usd_cents=50000)),
         )
         assert isinstance(out, RiskRejection)

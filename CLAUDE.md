@@ -55,7 +55,9 @@ A news match becomes a buy intent **only if all** of:
 4. No open position in this ticker (one entry per cycle)
 5. The article timestamp is inside the market's open/close window
    (fail-closed if the article is undated)
-6. `market_state.yes_ask_cents <= 80` (max buy price ceiling)
+6. `market_state.yes_ask_cents <= 90` (max buy price ceiling — raised
+   from 80 c to 90 c in Phase 4 Part 2.5 to capture the post-news leg
+   between 80-90 c)
 7. Sized position is at least 1 contract
 
 **Sizing — Phase 3 Part 1 two-cap system:**
@@ -171,7 +173,7 @@ comparable to v2.
 ### Walking the book — `trumpbot/execution/slippage.py`
 
 `walk_orderbook_for_buy(yes_ask_levels, target_dollars_cents,
-max_price_cents=80, fee_calculator=...)` returns an
+max_price_cents=90, fee_calculator=...)` returns an
 `OrderbookWalkResult` with `filled_quantity`, `total_cost_cents`,
 `average_fill_price_cents` (banker's-rounded), `levels_consumed`
 (audit trail of which prices we ate), `slippage_cents` (avg fill −
@@ -220,7 +222,7 @@ Every `TradeIntent` carries a reasoning string with this structure
 {source} (weight={w}) classified an article matching {ticker} at
 confidence {c}, with interaction_occurred=true.
 
-Current YES ask is {ask}c (max-buy ceiling 80c).
+Current YES ask is {ask}c (max-buy ceiling 90c).
 
 Cap analysis: cap_one=$X, cap_two=$Y (5 % of {volume} contracts of
 market volume). Binding: {cap_one|cap_two|tie}, sizing target $Z.
@@ -882,7 +884,7 @@ Per-trade limits are unchanged:
 - Cap two — 5 % of market volume
 - Bankroll sufficiency — refuses trades that won't fit the
   available cash
-- Price ceiling — refuses trades above 80 ¢
+- Price ceiling — refuses trades above 90 ¢ (Phase 4 Part 2.5)
 - Halt + snooze + all other risk gates
 
 ---

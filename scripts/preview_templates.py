@@ -127,7 +127,7 @@ _SAMPLES: dict[str, Any] = {
     "threshold": "500 ms",
     "source": "reuters_via_gnews",
     "rejection_reason": "size_cap_below_one_contract",
-    "rejection_detail": "per-trade cap of $0.50 too tight for one contract at 80c",
+    "rejection_detail": "per-trade cap of $0.50 too tight for one contract at 90c",
     # Info alerts
     "event_ticker": "KXTRUMPMEET-26MAY",
     "market_count": 9,

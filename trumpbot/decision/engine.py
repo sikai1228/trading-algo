@@ -41,7 +41,10 @@ class DecisionConfig:
     spec for the two-cap + walk + FOK pipeline."""
 
     llm_confidence_threshold: float = 0.85
-    max_buy_price_cents: int = 80
+    max_buy_price_cents: int = 90
+    """Phase 4 Part 2.5: raised from 80 to 90. See
+    :class:`trumpbot.config.DecisionPhaseConfig` docstring for
+    rationale."""
     position_size_base_pct: float = 0.08
     """Confidence-scaled target as a fraction of bankroll. Multiplied
     by ``match.confidence`` to set the dollar target before any cap
@@ -231,13 +234,14 @@ class DecisionEngine:
         3. Kalshi-approved source, else None.
         4. No open position, else None.
         5. Article inside the market's open/close window, else None.
-        6. Top-of-book ask ≤ ``max_buy_price_cents`` (80 c), else None
-           — fast guard before the walker.
+        6. Top-of-book ask ≤ ``max_buy_price_cents`` (90 c, raised
+           from 80 c in Phase 4 Part 2.5), else None — fast guard
+           before the walker.
         7. ``cap_one = config.position_size_hard_cap_cents`` ($20).
         8. ``cap_two = floor(market.volume_traded x 5)`` — 5 % of
            market volume treating one contract as $1 of notional.
         9. ``effective_cap = min(cap_one, cap_two)``.
-        10. Walk the order book for the effective cap with the 80 c
+        10. Walk the order book for the effective cap with the 90 c
             ceiling and the Kalshi fee calculator.
         11. Skip if walk filled fewer than ``min_trade_size_contracts``
             or below ``min_trade_value_cents``.
@@ -592,7 +596,7 @@ def _build_entry_reasoning(
         f"classified an article matching {match.ticker} at confidence "
         f"{match.confidence:.2f}, with interaction_occurred=true."
     )
-    ceiling = f"Current YES ask is {best_ask}c (max-buy ceiling 80c)."
+    ceiling = f"Current YES ask is {best_ask}c (max-buy ceiling 90c)."
 
     # Phase 4 Part 2.2 (pre-live fix #1): disclose where the bankroll
     # number came from so the operator can spot a stale-fallback

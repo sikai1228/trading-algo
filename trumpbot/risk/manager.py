@@ -44,7 +44,9 @@ class RiskConfig:
     """
 
     enabled: bool = True
-    max_buy_price_cents: int = 80
+    max_buy_price_cents: int = 90
+    """Phase 4 Part 2.5: raised from 80 to 90 to capture the post-
+    news leg between 80-90c that the old ceiling was clipping."""
     position_size_hard_cap_cents: int = 2000
     halted: bool = False
 

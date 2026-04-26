@@ -128,7 +128,7 @@ def walk_orderbook_for_buy(
     yes_ask_levels: Sequence[tuple[int, int]],
     *,
     target_dollars_cents: int,
-    max_price_cents: int = 80,
+    max_price_cents: int = 90,
     fee_calculator: FeeCalculator | None = None,
 ) -> OrderbookWalkResult:
     """Walk an ascending YES-ask book to figure out how many contracts a
@@ -144,7 +144,7 @@ def walk_orderbook_for_buy(
             USDCents.
         max_price_cents: Ceiling — any level priced strictly above this
             is filtered out before walking. Defaults to the locked
-            ``80`` per CLAUDE.md.
+            ``90`` per CLAUDE.md (raised from 80 in Phase 4 Part 2.5).
         fee_calculator: Optional ``(price_cents, quantity) -> fee_cents``
             function. When supplied, the result's ``estimated_fees_cents``
             sums the per-level fees. When ``None``, fees are reported

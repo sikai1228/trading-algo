@@ -89,9 +89,10 @@ class TradeIntent(_IntentBase):
     side: Literal["yes"] = "yes"
     action: Literal["buy"] = "buy"
     target_price_cents: int
-    """The price ceiling — strictly the locked 80 c max-buy. Each
-    individual fill level may be at or below this; the average is
-    captured separately in ``target_avg_fill_price_cents``."""
+    """The price ceiling — strictly the locked 90 c max-buy (raised
+    from 80 c in Phase 4 Part 2.5). Each individual fill level may
+    be at or below this; the average is captured separately in
+    ``target_avg_fill_price_cents``."""
 
     target_quantity: int
     """Number of contracts the engine's walk filled."""

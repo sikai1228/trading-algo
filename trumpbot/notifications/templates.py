@@ -675,6 +675,9 @@ _COMMAND_REPLY_HELP = MessageTemplate(
         "  /heartbeat                    quick liveness check\n"
         "  /shadow_report [Nd]           auto-approve simulation (default 7d)\n"
         "  /reconcile_resolve <trade_id> acknowledge a reconcile drift row\n"
+        "  /tax_summary [year]           year-to-date realized gains / losses\n"
+        "  /tax_export [year] [format]   filing-ready CSV / JSON / Form 8949\n"
+        "  /tax_reconcile [year]         Kalshi 1099-B reconciliation report\n"
         "  /help                         this list"
     ),
 )
@@ -871,6 +874,92 @@ _COMMAND_REPLY_RECONCILE_RESOLVE_NOT_FOUND = MessageTemplate(
 
 
 # ---------------------------------------------------------------------------
+# Phase 4 Part 2.1 — tax tracking + exports + monthly digest
+# ---------------------------------------------------------------------------
+
+_COMMAND_REPLY_TAX_SUMMARY = MessageTemplate(
+    category="command_reply",
+    audible=False,
+    # fields: year, total_trades, closed_trades, open_trades, wins,
+    #         losses, win_rate, total_gain, total_loss, net_pnl,
+    #         largest_gain, largest_gain_market, largest_loss,
+    #         largest_loss_market, total_fees, total_slippage,
+    #         avg_holding_days
+    format=(
+        "📊 Tax Summary -- {year}\n\n"
+        "Total trades: {total_trades}\n"
+        "Closed: {closed_trades} | Open: {open_trades}\n\n"
+        "Wins: {wins} | Losses: {losses}\n"
+        "Win rate: {win_rate}%\n\n"
+        "Total realized gain: {total_gain}\n"
+        "Total realized loss: {total_loss}\n"
+        "Net P&L: {net_pnl}\n\n"
+        "Largest single gain: ${largest_gain} ({largest_gain_market})\n"
+        "Largest single loss: ${largest_loss} ({largest_loss_market})\n\n"
+        "Total fees paid: {total_fees}\n"
+        "Total slippage: {total_slippage}\n\n"
+        "Average holding period: {avg_holding_days} days\n\n"
+        "All trades are short-term capital gains (held under 1 year).\n"
+        "Use /tax_export to generate filing-ready CSV."
+    ),
+)
+
+_COMMAND_REPLY_TAX_EXPORT = MessageTemplate(
+    category="command_reply",
+    audible=False,
+    # fields: year, format, count, net_pnl, file_path, use_case_description
+    format=(
+        "💾 Tax Export -- {year}\n\n"
+        "Format: {format}\n"
+        "Trades exported: {count}\n"
+        "Total P&L: {net_pnl}\n\n"
+        "File saved: {file_path}\n\n"
+        "This file is suitable for {use_case_description}.\n"
+        "Year-end totals match the /tax_summary output."
+    ),
+)
+
+_COMMAND_REPLY_TAX_RECONCILE = MessageTemplate(
+    category="command_reply",
+    audible=False,
+    # fields: year, total_proceeds, total_cost, net_pnl, line_count,
+    #         file_path
+    format=(
+        "🔍 Kalshi 1099-B Reconciliation -- {year}\n\n"
+        "Total proceeds:  {total_proceeds}\n"
+        "Total cost basis: {total_cost}\n"
+        "Net P&L:          {net_pnl}\n\n"
+        "Per-trade detail: {line_count} lines\n"
+        "File saved: {file_path}\n\n"
+        "Compare these totals against Kalshi's 1099-B when issued.\n"
+        "Use /tax_export 8949 for IRS Form 8949 layout."
+    ),
+)
+
+_MONTHLY_TAX_DIGEST = MessageTemplate(
+    category="digest",
+    audible=False,
+    # fields: month_name, year, count, wins, losses, win_rate, pnl,
+    #         fees, slippage, largest_gain, largest_gain_ticker,
+    #         largest_loss, largest_loss_ticker, avg_holding_days,
+    #         month, ytd_pnl
+    format=(
+        "📊 Monthly Tax Digest -- {month_name} {year}\n\n"
+        "Trades closed: {count}\n"
+        "Wins: {wins} | Losses: {losses} | Win rate: {win_rate}%\n\n"
+        "Realized P&L: {pnl}\n"
+        "Total fees paid: {fees}\n"
+        "Total slippage: {slippage}\n\n"
+        "Largest gain: ${largest_gain} on {largest_gain_ticker}\n"
+        "Largest loss: ${largest_loss} on {largest_loss_ticker}\n\n"
+        "Average holding period: {avg_holding_days} days\n\n"
+        "CSV export saved to data/exports/monthly/{year}-{month}.csv\n\n"
+        "Year-to-date P&L: {ytd_pnl}"
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
 # Catalog
 # ---------------------------------------------------------------------------
 
@@ -935,6 +1024,11 @@ TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
     "command_reply_shadow_report": _COMMAND_REPLY_SHADOW_REPORT,
     "command_reply_reconcile_resolve": _COMMAND_REPLY_RECONCILE_RESOLVE,
     "command_reply_reconcile_resolve_not_found": _COMMAND_REPLY_RECONCILE_RESOLVE_NOT_FOUND,
+    # Phase 4 Part 2.1 — tax tracking
+    "command_reply_tax_summary": _COMMAND_REPLY_TAX_SUMMARY,
+    "command_reply_tax_export": _COMMAND_REPLY_TAX_EXPORT,
+    "command_reply_tax_reconcile": _COMMAND_REPLY_TAX_RECONCILE,
+    "monthly_tax_digest": _MONTHLY_TAX_DIGEST,
     # Sub-templates exposed for callers that need to render rows /
     # lines that get joined into a parent template.
     "_position_line": _POSITION_LINE,

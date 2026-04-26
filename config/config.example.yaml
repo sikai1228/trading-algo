@@ -224,3 +224,19 @@ alias_enrichment:
   # (alias enrichment today; classifier in a future phase). Stored as
   # USDCents — 1000 = $10.00.
   monthly_cap_usd_cents: 1000
+
+# Phase 4 Part 2.1 — tax tracking + exports.
+tax_tracking:
+  enabled: true
+  # MM-DD that opens the operator's tax year. US calendar year by
+  # default. Configurable for non-US filers / fiscal-year operators.
+  user_tax_year_start: "01-01"
+  # /tax_export uses this format when the user omits the argument.
+  default_export_format: "csv"
+  # Set to false to skip the monthly_tax_digest_loop (the per-trade
+  # tax columns are still populated either way).
+  monthly_digest_enabled: true
+  # Day of month + ET time the digest fires. ET aligns with the
+  # rest of the operator-facing timestamps (CLAUDE.md macOS notes).
+  monthly_digest_day: 1
+  monthly_digest_time_et: "09:00"

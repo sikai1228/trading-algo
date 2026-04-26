@@ -32,6 +32,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from trumpbot.db.connection import Database
@@ -73,6 +74,12 @@ class CommandContext:
     daemon_started_at: datetime | None = None
     sources_total: int = 0
     sources_active: int = 0
+
+    # Phase 4 Part 2.1 — tax export needs a writable directory and
+    # the operator's preferred default format. Optional so legacy
+    # call sites (tests built before Phase 4 Part 2.1) don't break.
+    exports_dir: Path | None = None
+    default_export_format: str = "csv"
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[RenderedMessage]]
@@ -540,6 +547,145 @@ async def handle_reconcile_resolve(ctx: CommandContext) -> RenderedMessage:
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 Part 2.1 — /tax_summary, /tax_export, /tax_reconcile
+# ---------------------------------------------------------------------------
+
+
+def _parse_tax_year_arg(arg: str | None) -> int:
+    """Parse a year argument; default to current calendar year. Raises
+    :class:`ValueError` on malformed input so the caller renders the
+    standard usage hint instead of crashing."""
+    if arg is None:
+        return datetime.now(UTC).year
+    yr = int(arg)
+    if yr < 2000 or yr > 2100:
+        raise ValueError(f"year out of plausible range: {yr}")
+    return yr
+
+
+async def handle_tax_summary(ctx: CommandContext) -> RenderedMessage:
+    """``/tax_summary [year]`` — aggregated realized P&L for the year.
+
+    Defaults to the current calendar year. Never silent on bad input —
+    a malformed year falls through to the usage-hint template so the
+    user can correct.
+    """
+    from trumpbot.exports.tax_exports import TaxExporter, render_summary_template_data
+
+    try:
+        year = _parse_tax_year_arg(ctx.args[0] if ctx.args else None)
+    except ValueError:
+        return render_template(
+            "command_reply_usage_hint",
+            {"command": "/tax_summary", "usage": "[year]"},
+        )
+    summary = TaxExporter(ctx.db).export_yearly_summary(year)
+    data = render_summary_template_data(summary)
+    return render_template("command_reply_tax_summary", data)
+
+
+async def handle_tax_export(ctx: CommandContext) -> RenderedMessage:
+    """``/tax_export [year] [format]`` — write a filing-ready file to
+    ``data/exports/`` and tell the operator where it landed.
+
+    Format defaults to ``ctx.default_export_format`` (``csv`` unless
+    overridden in config). Supported: ``csv``, ``json``, ``form_8949``.
+    """
+    from trumpbot.exports.tax_exports import (
+        TaxExporter,
+        _bare_dollars,
+        write_export,
+    )
+
+    try:
+        year = _parse_tax_year_arg(ctx.args[0] if ctx.args else None)
+    except ValueError:
+        return render_template(
+            "command_reply_usage_hint",
+            {"command": "/tax_export", "usage": "[year] [csv|json|form_8949]"},
+        )
+    fmt = (ctx.args[1] if len(ctx.args) >= 2 else ctx.default_export_format).lower()
+    if fmt not in {"csv", "json", "form_8949"}:
+        return render_template(
+            "command_reply_usage_hint",
+            {"command": "/tax_export", "usage": "[year] [csv|json|form_8949]"},
+        )
+
+    exporter = TaxExporter(ctx.db)
+    exports_dir = ctx.exports_dir or Path("data/exports")
+    if fmt == "csv":
+        content = exporter.export_trade_log(year, format="csv")
+        path = exports_dir / "annual" / str(year) / "full_trade_log.csv"
+        use_case = "spreadsheet review or accountant import"
+    elif fmt == "json":
+        content = exporter.export_trade_log(year, format="json")
+        path = exports_dir / "annual" / str(year) / "full_trade_log.json"
+        use_case = "programmatic processing or web dashboard import"
+    else:  # form_8949
+        content = exporter.export_form_8949_format(year)
+        path = exports_dir / "annual" / str(year) / "form_8949_format.csv"
+        use_case = "IRS Form 8949 line-item entry"
+    write_export(path, content)
+
+    summary = exporter.export_yearly_summary(year)
+    # Each CSV row except the header is one trade; JSON has the count
+    # implicit in the trades array. Use the summary's closed_trades
+    # for an accurate count regardless of format.
+    return render_template(
+        "command_reply_tax_export",
+        {
+            "year": year,
+            "format": fmt,
+            "count": summary.closed_trades,
+            "net_pnl": _bare_dollars(summary.net_pnl_cents),
+            "file_path": str(path),
+            "use_case_description": use_case,
+        },
+    )
+
+
+async def handle_tax_reconcile(ctx: CommandContext) -> RenderedMessage:
+    """``/tax_reconcile [year]`` — write the Kalshi 1099-B
+    reconciliation JSON to ``data/exports/`` and report totals.
+
+    Run this once Kalshi issues the form (typically February). Any
+    discrepancy between the bot's totals and Kalshi's becomes
+    actionable evidence for the operator's accountant.
+    """
+    from trumpbot.exports.tax_exports import (
+        TaxExporter,
+        _bare_dollars,
+        write_export,
+    )
+
+    try:
+        year = _parse_tax_year_arg(ctx.args[0] if ctx.args else None)
+    except ValueError:
+        return render_template(
+            "command_reply_usage_hint",
+            {"command": "/tax_reconcile", "usage": "[year]"},
+        )
+    payload = TaxExporter(ctx.db).export_kalshi_reconciliation(year)
+    import json as _json
+
+    exports_dir = ctx.exports_dir or Path("data/exports")
+    path = exports_dir / "annual" / str(year) / "kalshi_reconciliation.json"
+    write_export(path, _json.dumps(payload, indent=2, sort_keys=True))
+    totals = payload["totals"]
+    return render_template(
+        "command_reply_tax_reconcile",
+        {
+            "year": year,
+            "total_proceeds": _bare_dollars(int(totals["proceeds_cents"])),
+            "total_cost": _bare_dollars(int(totals["cost_basis_cents"])),
+            "net_pnl": _bare_dollars(int(totals["net_pnl_cents"])),
+            "line_count": len(payload["line_items"]),
+            "file_path": str(path),
+        },
+    )
+
+
 @dataclass
 class CommandRateLimiter:
     """30 commands per minute per chat by default. Defends against a
@@ -583,6 +729,10 @@ _HANDLERS: dict[str, CommandHandler] = {
     # Phase 4 Part 1
     "shadow_report": handle_shadow_report,
     "reconcile_resolve": handle_reconcile_resolve,
+    # Phase 4 Part 2.1
+    "tax_summary": handle_tax_summary,
+    "tax_export": handle_tax_export,
+    "tax_reconcile": handle_tax_reconcile,
 }
 
 

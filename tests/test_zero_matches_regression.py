@@ -3,24 +3,28 @@
 Three root causes — pin behavior so they cannot silently regress:
 
 1. Subject-key bridge: discovery-side keys (``vladimirputin``) must
-   resolve via the subjects table, not the matcher's hardcoded
-   ``DEFAULT_SUBJECT_ALIASES`` (which uses short keys like ``putin``).
-   Pinned in ``test_matcher_subjects_bridge.py``.
+   resolve via the subjects table. Pinned in
+   ``test_matcher_subjects_bridge.py``.
 
-2. Case-sensitive verb proximity: ``_within_distance`` must lowercase
-   both operands so DB-loaded aliases (mixed case) match the
-   pre-lowercased text. Pinned in ``test_matcher_subjects_bridge.py``
-   too.
+2. Case-sensitive verb proximity: legacy issue from when the matcher
+   used a proximity check; eliminated entirely in Phase 4 Part 2.8.
 
 3. **This file** pins:
-   a. The verb list covers the contract-relevant interaction verbs the
+   a. The interaction-term list covers contract-relevant verbs the
       operator's diagnostic identified — ``briefed``, ``dined``,
-      ``lunch with``, ``dinner with`` — without which articles like
-      "Powell briefed Trump" silently scored 0.
+      ``lunch``, ``dinner``, ``breakfast`` — so a "Powell briefed Trump"
+      article actually passes the Stage-1 pre-filter and reaches
+      the LLM cascade.
    b. The matcher worker queries via ``list_markets_for_matching``
       (all markets with subject) rather than ``list_active_markets``
       (only ``status='active'``), so news mentioning settled-market
       subjects still produces match rows during the observation period.
+
+Phase 4 Part 2.8 changed the assertion shape:
+- Pre-2.8: matches scored 0.7..1.0 with ``direct_verb`` reasons.
+- Post-2.8: matches that pass the pre-filter score 0.0 with
+  ``match_reason="passed_pre_filter"``. The LLM cascade is what
+  ratchets confidence up to 0.85+.
 """
 
 from __future__ import annotations
@@ -42,7 +46,8 @@ from trumpbot.db.repositories import (
 )
 from trumpbot.discovery.subjects import DEFAULT_SUBJECT_ALIASES, SubjectExtractor
 from trumpbot.events.bus import EventBus
-from trumpbot.news.matcher import DIRECT_VERBS, MarketContext, NewsMatcher
+from trumpbot.news.interaction_terms import INTERACTION_TERMS
+from trumpbot.news.matcher import PASSED_REASON, MarketContext, NewsMatcher
 
 _NULL = SubjectExtractor(aliases={"_unused": ["unused"]})
 
@@ -83,31 +88,27 @@ def _seed(db: Database, ticker: str, subject_key: str, full_name: str, status: s
 
 
 # ---------------------------------------------------------------------------
-# 3a — verb list completeness
+# 3a — interaction-term list completeness
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "verb",
+    "term",
     [
         "briefed",
         "briefing",
         "dined",
-        "dined with",
-        "dinner with",
-        "had dinner with",
-        "lunch with",
+        "dinner",
+        "lunch",
         "lunched",
-        "lunched with",
-        "had lunch with",
-        "breakfast with",
-        "had breakfast with",
+        "breakfast",
     ],
 )
-def test_contract_relevant_verb_present(verb: str) -> None:
-    """The Phase-1 diagnostic identified these verbs as missing.
-    Adding each enables real news to actually produce matches."""
-    assert verb in DIRECT_VERBS, f"{verb!r} must remain in DIRECT_VERBS"
+def test_contract_relevant_term_present(term: str) -> None:
+    """The Phase-1 diagnostic identified these as missing from the
+    pre-filter list. Adding each enables the article to actually pass
+    the gate and reach the LLM cascade."""
+    assert term in INTERACTION_TERMS, f"{term!r} must remain in INTERACTION_TERMS"
 
 
 @pytest.fixture()
@@ -129,7 +130,8 @@ def matcher_with_subjects() -> NewsMatcher:
 
 
 class TestUserSpecifiedRegressionCases:
-    """The five cases the operator explicitly required to score >= 0.7."""
+    """The operator's original five cases must reach Stage 2 (i.e. pass
+    the pre-filter). The LLM is what sets the real confidence."""
 
     def test_thune_meeting(self, matcher_with_subjects: NewsMatcher) -> None:
         ctx = MarketContext(ticker="T", subject="johnthune")
@@ -138,7 +140,7 @@ class TestUserSpecifiedRegressionCases:
             body=None,
             markets=[ctx],
         )
-        assert r.confidence >= 0.7
+        assert r.match_reason == PASSED_REASON
 
     def test_putin_phone_call(self, matcher_with_subjects: NewsMatcher) -> None:
         ctx = MarketContext(ticker="T", subject="vladimirputin")
@@ -147,17 +149,18 @@ class TestUserSpecifiedRegressionCases:
             body=None,
             markets=[ctx],
         )
-        assert r.confidence >= 0.7
+        assert r.match_reason == PASSED_REASON
 
     def test_powell_briefed(self, matcher_with_subjects: NewsMatcher) -> None:
-        """`briefed` was missing from DIRECT_VERBS pre-fix — this scored 0."""
+        """``briefed`` was missing from DIRECT_VERBS pre-fix and would
+        have scored 0; under the pre-filter regime, it passes."""
         ctx = MarketContext(ticker="T", subject="jeromepowell")
         [r] = matcher_with_subjects.match(
             headline="Powell briefed Trump on rate decision during private meeting",
             body=None,
             markets=[ctx],
         )
-        assert r.confidence >= 0.7, f"got {r.confidence} reason={r.match_reason}"
+        assert r.match_reason == PASSED_REASON
 
     def test_netanyahu_called(self, matcher_with_subjects: NewsMatcher) -> None:
         ctx = MarketContext(ticker="T", subject="benjaminnetanyahu")
@@ -166,7 +169,7 @@ class TestUserSpecifiedRegressionCases:
             body=None,
             markets=[ctx],
         )
-        assert r.confidence >= 0.7
+        assert r.match_reason == PASSED_REASON
 
     def test_schumer_meeting(self, matcher_with_subjects: NewsMatcher) -> None:
         ctx = MarketContext(ticker="T", subject="chuckschumer")
@@ -175,12 +178,12 @@ class TestUserSpecifiedRegressionCases:
             body=None,
             markets=[ctx],
         )
-        assert r.confidence >= 0.7
+        assert r.match_reason == PASSED_REASON
 
 
 class TestMealsAndBriefings:
     """Contract explicitly says 'Working dinners, lunches, or other meal
-    meetings' qualify. Added these verbs so they actually do."""
+    meetings' qualify. The pre-filter must let these through."""
 
     def test_dined_with(self, matcher_with_subjects: NewsMatcher) -> None:
         ctx = MarketContext(ticker="T", subject="chuckschumer")
@@ -189,7 +192,7 @@ class TestMealsAndBriefings:
             body=None,
             markets=[ctx],
         )
-        assert r.confidence >= 0.7
+        assert r.match_reason == PASSED_REASON
 
     def test_had_lunch_with(self, matcher_with_subjects: NewsMatcher) -> None:
         ctx = MarketContext(ticker="T", subject="tigerwoods")
@@ -198,7 +201,7 @@ class TestMealsAndBriefings:
             body=None,
             markets=[ctx],
         )
-        assert r.confidence >= 0.7
+        assert r.match_reason == PASSED_REASON
 
     def test_briefing_alias(self, matcher_with_subjects: NewsMatcher) -> None:
         ctx = MarketContext(ticker="T", subject="jeromepowell")
@@ -207,7 +210,7 @@ class TestMealsAndBriefings:
             body=None,
             markets=[ctx],
         )
-        assert r.confidence >= 0.5
+        assert r.match_reason == PASSED_REASON
 
 
 # ---------------------------------------------------------------------------
@@ -272,100 +275,10 @@ class TestMatcherWorkerIncludesSettledMarkets:
             )
         )
         assert len(rows) == 1
-        # The finalized market is now visible to the matcher and the
-        # call+subject combination scores 1.0.
-        assert rows[0]["confidence"] == 1.0
+        # Phase 4 Part 2.8: pre-filter pass writes confidence=0.0; the
+        # LLM cascade (not active in this test) is what would set it
+        # to >= 0.85.
+        assert rows[0]["confidence"] == 0.0
         assert rows[0]["matched_subject"] == "benjaminnetanyahu"
+        assert rows[0]["match_reason"] == PASSED_REASON
         db.close()
-
-
-# ---------------------------------------------------------------------------
-# Phase 1.5 recheck — false-positive guards
-# ---------------------------------------------------------------------------
-
-
-class TestFalsePositiveGuards:
-    """The four cases the operator's recheck brief specified must score
-    LOW even though Trump+subject are both present. These are exactly
-    what the LLM cascade Stage 2 will refine, but the keyword stage
-    must already be conservative-enough to flag them as not-direct."""
-
-    def test_mention_with_explicit_negation(self, matcher_with_subjects: NewsMatcher) -> None:
-        """Praise with negation in body. The body explicitly says 'did
-        not call ... or meet'; negation must defeat any verb signal."""
-        ctx = MarketContext(ticker="T", subject="vladimirputin")
-        [r] = matcher_with_subjects.match(
-            headline="Trump praised Putin in his speech today",
-            body=(
-                "President Trump spoke at a rally on Monday and praised Russian "
-                "President Vladimir Putin's leadership style. Trump did not call "
-                "Putin or meet with him."
-            ),
-            markets=[ctx],
-        )
-        # Negation defeats the match outright per the matcher's rules.
-        assert r.confidence <= 0.2, f"got conf={r.confidence} reason={r.match_reason}"
-
-    def test_future_expected_to_call(self, matcher_with_subjects: NewsMatcher) -> None:
-        """`expected to call` is the canonical future-tense flag; must
-        score 0.2 (speculative future), not a confirmation."""
-        ctx = MarketContext(ticker="T", subject="xijinping")
-        [r] = matcher_with_subjects.match(
-            headline="Trump expected to call Xi next week",
-            body=(
-                "President Donald Trump is expected to call Chinese President Xi "
-                "Jinping next week to discuss trade negotiations."
-            ),
-            markets=[ctx],
-        )
-        assert r.confidence <= 0.3, f"got conf={r.confidence} reason={r.match_reason}"
-        assert "future_tense" in r.match_reason
-
-    def test_indirect_letter_only(self, matcher_with_subjects: NewsMatcher) -> None:
-        """`sent letter` is in INDIRECT_VERBS; the matcher emits 0.5
-        with an `indirect_communication` reason. The recheck brief
-        wants <=0.3 — that requires the Stage 2 LLM to ratchet down
-        further by reading the contract. Stage 1's role is to surface
-        the indirect-communication category so Stage 2 sees it."""
-        ctx = MarketContext(ticker="T", subject="kimjongun")
-        [r] = matcher_with_subjects.match(
-            headline="Trump sent letter to Kim Jong Un",
-            body=(
-                "President Trump sent a letter to North Korean leader Kim Jong Un "
-                "earlier this week. There has been no direct conversation between "
-                "the two leaders."
-            ),
-            markets=[ctx],
-        )
-        assert "indirect_communication" in r.match_reason, f"reason={r.match_reason}"
-        # Stage-1 ceiling is 0.5; Stage 2 (LLM) is the layer that gets
-        # this to <=0.3 by applying the verbatim contract rules.
-        assert r.confidence <= 0.5
-
-    def test_envoy_intermediary_is_stage_2_only(self, matcher_with_subjects: NewsMatcher) -> None:
-        """The keyword matcher CANNOT distinguish "Trump's envoy met"
-        from "Trump met" — the proximity-based rules see 'Trump',
-        'met', and 'Putin' all in close range and score 1.0. This is
-        a known false-positive that only the LLM cascade can catch by
-        reading the body and identifying that the actor is the envoy,
-        not Trump.
-
-        The test pins the *current* Stage-1 behavior (1.0) so a future
-        change is visible. The verification doc records this as
-        DEFER → Stage 2."""
-        ctx = MarketContext(ticker="T", subject="vladimirputin")
-        [r] = matcher_with_subjects.match(
-            headline="Trump's envoy met with Putin's team",
-            body=(
-                "U.S. envoy Steve Witkoff met with senior Russian officials in "
-                "Moscow on Tuesday. Witkoff was sent on Trump's behalf."
-            ),
-            markets=[ctx],
-        )
-        # Stage 1 produces a false positive here; documented gap.
-        assert r.confidence == 1.0, (
-            f"Expected the documented Stage-1 false positive (1.0); "
-            f"got conf={r.confidence} reason={r.match_reason}. If this "
-            f"changed without an LLM cascade landing, the matcher's "
-            f"behavior on intermediary cases needs re-review."
-        )

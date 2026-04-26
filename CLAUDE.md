@@ -19,8 +19,17 @@ far:
 - **Phase 0** — bootstrap, lint/type/test scaffolding.
 - **Phase 1** — read-only data collection (Kalshi REST/WS, news ingestion,
   matcher, daemon). No orders are placed.
-- **Phase 1.5** — LLM cascade enhanced ingestion (keyword shortlist -> Haiku
-  classifier -> match row).
+- **Phase 1.5** — LLM cascade. **Stage 1**
+  (`trumpbot/news/matcher.py`) is an aggressively-inclusive keyword
+  pre-filter: Trump alias + subject alias + interaction term anywhere
+  in the headline+body, all word-boundary case-insensitive. **Stage 2**
+  (`trumpbot/news/llm_classifier.py`) calls Claude Haiku 4.5 against
+  the verbatim Kalshi resolution rules and emits a structured
+  `ClassificationResult`. Stage 1 always writes `confidence=0.0`; the
+  LLM patches the row in place with `classifier_type='llm_cascade'`
+  and the real confidence. The decision engine still requires
+  `interaction_occurred=True` AND `confidence >= 0.85` — neither
+  trades by itself. **Built fully in Phase 4 Part 2.8.**
 - **Phase 2** — decision layer with human-in-the-loop. Engine -> Risk ->
   Approval -> DryRunExecutor pipeline.
 - **Phase 3 Part 1** — two-cap position sizing, order-book walking
@@ -1057,6 +1066,137 @@ builders, `weight=` in NewsSourceConfig fixtures). One
 - Existing config.yaml files keep working — the `weight: 1.0`
   keys are silently ignored. The example config has them
   removed; redeployments don't require config edits.
+
+---
+
+## Phase 4 Part 2.8 — Phase 1.5 LLM cascade end-to-end
+
+**The big fix.** Pre-2.8 the code documented Phase 1.5 but never
+implemented Stage 2: `interaction_occurred` was hardcoded `False` in
+`decision/loops.py:_row_to_snapshot`, so the engine returned `None`
+for every match and the trades table stayed empty. The investigation
+report at `docs/investigations/2026-04-26_reuters_putin_zelensky_miss.md`
+pins the missing pieces.
+
+Phase 4 Part 2.8 ships the cascade. Two architectural changes that
+together unblock all trade firing:
+
+### Stage 1 simplified — aggressive recall, no precision logic
+
+`trumpbot/news/matcher.py` now does ONE thing: a 3-condition
+pre-filter against the headline+body, all word-boundary,
+case-insensitive, anywhere in the text:
+
+A. `"trump"` (or another alias in `TRUMP_ALIASES`)
+B. At least one alias of the market's subject (loaded via the
+   `subjects` table merged on top of `DEFAULT_SUBJECT_ALIASES`)
+C. At least one term from
+   `trumpbot/news/interaction_terms.py:INTERACTION_TERMS`
+
+Pass -> `confidence=0.0`, `match_reason="passed_pre_filter"`. The LLM
+takes it from there.
+Fail -> `confidence=0.0`,
+`match_reason="failed_pre_filter:no_trump+no_subject"` (etc.). LLM is
+**not** called — that's the cost guard.
+
+What was removed (all migrated to the LLM): proximity windows,
+verb-class hierarchy (DIRECT/MENTION/INDIRECT/FUTURE), negation
+detection, future-tense detection, tier-based confidence scoring,
+the article-window check (which moved to `DecisionEngine` rule 4).
+
+The Reuters article that motivated the investigation
+("Trump says he speaks with Putin: Fox News") now correctly passes
+Stage 1 (Trump + Putin + "speaks") and is handed to the LLM, which
+correctly rejects it as a habitual self-claim with no specific
+dated event.
+
+### Stage 2 deployed — LLM cascade
+
+`trumpbot/news/llm_classifier.py` (`LLMClassifier`) calls Claude
+Haiku 4.5 with:
+
+- A system prompt locking the model to strict-JSON output
+- The verbatim contract rules from
+  `data/contracts/kxtrumpmeet_rules.txt` (re-read on every call;
+  `alert_critical_contract_rules_changed` fires once per drift)
+- The user prompt template at
+  `trumpbot/news/prompts/cascade_classifier_v1.txt`
+- The article headline + body excerpt + subject candidate aliases
+
+The response is parsed against `ClassificationResult` (Pydantic
+v2, `extra="forbid"`):
+
+```python
+class ClassificationResult(BaseModel):
+    subject: str | None
+    interaction_occurred: bool
+    interaction_type: Literal["in_person", "phone", "video"] | None
+    tense: Literal["past", "future", "ongoing", "ambiguous"]
+    negated: bool
+    indirect_only: bool
+    confidence: float  # 0.0..1.0
+    reasoning: str
+```
+
+On success: a row goes into `llm_classifications` (the audit table),
+and `news_market_matches.classifier_type` flips from `keyword_only`
+to `llm_cascade` with the LLM's confidence, picked subject, and FK
+to the classification row. The decision engine reads the joined view
+via `_row_to_snapshot` and the gate fires when
+`interaction_occurred=True` AND `confidence >= 0.85`.
+
+On failure (timeout / parse / API error): one retry, then return
+`None`; an audit row with non-NULL `error` is still written, the
+match row stays `keyword_only`, no trade. On 401: raises
+`AnthropicAuthError`, audit row written, daemon fires
+`alert_critical_anthropic_auth`. On cap-hit: skip silently, no LLM
+call, no audit row (the match row stays `keyword_only`).
+
+### Cost guard — four-tier `CapStatus`
+
+`trumpbot/notifications/llm_cost.py` adds:
+
+- `CapStatus.UNDER_50` — full speed
+- `CapStatus.BETWEEN_50_90` — full speed; one daily warning
+  (`alert_info_llm_spend_update`)
+- `CapStatus.BETWEEN_90_100` — every-other call; per-call alert
+- `CapStatus.OVER_CAP` — HARD HALT; calls return `None`
+
+The default cap was raised from $10/mo to $20/mo because the
+classifier issues one call per Stage-1 pre-filter pass (~hundreds
+per busy news day vs. tens per month for alias enrichment).
+
+Every `record_spend` writes to BOTH `llm_spend_log` (per-call audit)
+AND `llm_spend_daily` (the rollup the cap-status query reads). The
+two are kept in lockstep.
+
+### DB schema additions (migration 011)
+
+- `llm_classifications` — one row per LLM call (success OR failure),
+  with `parsed_*` columns matching `ClassificationResult` and
+  `error` for failures.
+- `news_market_matches` gains `classifier_type` (default
+  `'keyword_only'`) and `llm_classification_id` (FK to
+  `llm_classifications`). Both nullable; existing rows backfill
+  cleanly.
+- `llm_spend_daily` — denormalized day rollup (date PK + totals).
+  `llm_spend_log` (migration 006) remains the per-call audit trail;
+  both are written together.
+
+### Operator workflow
+
+1. After deploy, run `scripts/snapshot_contract.py` once to capture
+   the live Kalshi rules text and write
+   `data/contracts/kxtrumpmeet_rules.txt`. (The repo ships with the
+   user-provided text; running the snapshotter ensures the hash
+   matches Kalshi's current copy.)
+2. Run `scripts/backfill_classifications.py --hours 168` to
+   re-classify the last week's news_events. Cost is typically
+   under $1.
+3. Watch `/spend` in Telegram for daily totals.
+4. If the contract text changes mid-month, re-run
+   `scripts/snapshot_contract.py`; the daemon's hash-drift alert
+   will fire automatically on the next call.
 
 ---
 

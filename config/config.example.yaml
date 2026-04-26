@@ -236,9 +236,30 @@ alias_enrichment:
   model: "claude-haiku-4-5"
   max_tokens: 512
   # Combined cap for ALL Anthropic spend in a calendar month
-  # (alias enrichment today; classifier in a future phase). Stored as
-  # USDCents — 1000 = $10.00.
-  monthly_cap_usd_cents: 1000
+  # (alias enrichment + news classifier). Stored as USDCents —
+  # 2000 = $20.00. Phase 4 Part 2.8 raised this from $10 because
+  # the news classifier issues one call per pre-filter pass
+  # (~hundreds/day on a busy news cycle vs. tens/month for alias
+  # enrichment).
+  monthly_cap_usd_cents: 2000
+
+# Phase 4 Part 2.8 — Stage 2 LLM cascade for the news classifier.
+# Stage 1 (the keyword matcher) is aggressively inclusive; Stage 2
+# (this) calls Claude Haiku against the verbatim Kalshi resolution
+# rules to decide whether the article describes a qualifying meeting.
+# Disable by setting enabled=false — every match then stays
+# 'keyword_only' and the decision engine never sees
+# interaction_occurred=True, so no trades fire (same behavior as
+# pre-Phase-4-Part-2.8).
+llm_classifier:
+  enabled: true
+  model: "claude-haiku-4-5"
+  max_input_tokens: 2000
+  max_output_tokens: 250
+  timeout_sec: 10
+  prompt_path: "trumpbot/news/prompts/cascade_classifier_v1.txt"
+  prompt_version: "v1"
+  contract_path: "data/contracts/kxtrumpmeet_rules.txt"
 
 # Phase 4 Part 2.1 — tax tracking + exports.
 tax_tracking:

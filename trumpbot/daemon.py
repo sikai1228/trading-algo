@@ -17,20 +17,24 @@ import sys
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from prometheus_client import Counter, Gauge
 
 from trumpbot.config import TrumpbotConfig, load_config
 from trumpbot.db.connection import Database
 from trumpbot.db.repositories import (
+    LLMMatchUpdate,
     NewsMatchRow,
     SubjectRow,
     fetch_news_events_without_matches,
+    insert_news_match_returning_id,
     insert_news_matches,
     insert_system_event,
     list_active_markets,
     list_markets_for_matching,
     recent_news_events,
+    update_match_with_classification,
     upsert_subject,
 )
 from trumpbot.discovery.service import MarketDiscoveryService
@@ -41,7 +45,13 @@ from trumpbot.kalshi.auth import load_private_key
 from trumpbot.kalshi.client import KalshiClient
 from trumpbot.kalshi.exceptions import StateError
 from trumpbot.market_data.kalshi_ws import KalshiWebSocketFeed
-from trumpbot.news.matcher import MarketContext, NewsMatcher
+from trumpbot.news.llm_classifier import (
+    AnthropicAuthError as ClassifierAuthError,
+)
+from trumpbot.news.llm_classifier import (
+    LLMClassifier,
+)
+from trumpbot.news.matcher import PASSED_REASON, MarketContext, NewsMatcher
 from trumpbot.news.rss import RSSPoller
 from trumpbot.news.truthsocial import TruthSocialScraper
 from trumpbot.news.twitter import TwitterScraper
@@ -431,9 +441,12 @@ async def _amain(config_path: Path) -> int:
     # enricher only fires when ANTHROPIC_API_KEY is configured AND
     # alias_enrichment.enabled is True; otherwise we install a no-op
     # subscriber so the bus event isn't unhandled.
+    anthropic_key_present = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
     if (
         cfg.alias_enrichment.enabled
         and cfg.kalshi.api_key_id  # any LLM-enabled deployment will have keys
+        and anthropic_key_present
     ):
         # Build a thin async wrapper around anthropic.AsyncAnthropic
         # that translates a 401 into _AnthropicAuthError.
@@ -443,30 +456,34 @@ async def _amain(config_path: Path) -> int:
             _AnthropicAuthError,
         )
 
-        async def _llm_call(system_prompt: str, user_prompt: str) -> tuple[int, int, str]:
-            import os
+        def _make_llm_call(
+            *,
+            model: str,
+            max_tokens: int,
+            auth_error: type[Exception],
+        ) -> Callable[[str, str], Awaitable[tuple[int, int, str]]]:
+            async def _llm_call(system_prompt: str, user_prompt: str) -> tuple[int, int, str]:
+                from anthropic import AsyncAnthropic
+                from anthropic._exceptions import AuthenticationError
 
-            from anthropic import AsyncAnthropic
-            from anthropic._exceptions import AuthenticationError
+                client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+                try:
+                    msg = await client.messages.create(
+                        model=model,
+                        max_tokens=max_tokens,
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": user_prompt}],
+                    )
+                except AuthenticationError as exc:
+                    raise auth_error(str(exc)) from exc
+                text = ""
+                for block in msg.content:
+                    if hasattr(block, "text"):
+                        text = block.text
+                        break
+                return (msg.usage.input_tokens, msg.usage.output_tokens, text)
 
-            client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-            try:
-                msg = await client.messages.create(
-                    model=cfg.alias_enrichment.model,
-                    max_tokens=cfg.alias_enrichment.max_tokens,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}],
-                )
-            except AuthenticationError as exc:
-                raise _AnthropicAuthError(str(exc)) from exc
-            # msg.content is a list of TextBlock | ToolUseBlock; take
-            # the text from the first TextBlock we find.
-            text = ""
-            for block in msg.content:
-                if hasattr(block, "text"):
-                    text = block.text
-                    break
-            return (msg.usage.input_tokens, msg.usage.output_tokens, text)
+            return _llm_call
 
         enricher = AliasEnricher(
             db=db,
@@ -479,9 +496,73 @@ async def _amain(config_path: Path) -> int:
                 model=cfg.alias_enrichment.model,
                 max_tokens=cfg.alias_enrichment.max_tokens,
             ),
-            llm_call=_llm_call,
+            llm_call=_make_llm_call(
+                model=cfg.alias_enrichment.model,
+                max_tokens=cfg.alias_enrichment.max_tokens,
+                auth_error=_AnthropicAuthError,
+            ),
         )
         bus.subscribe("market_discovered", enricher.on_market_discovered)
+
+    # ---- Phase 4 Part 2.8 — Stage 2 LLM cascade (news classifier) ----
+    # Built here (after cost_guard + alert_dispatcher exist) and
+    # attached to the matcher worker before its task is scheduled.
+    if cfg.llm_classifier.enabled and anthropic_key_present:
+        from trumpbot.news.llm_classifier import (
+            AnthropicAuthError as _ClsAuthError,
+        )
+        from trumpbot.news.llm_classifier import (
+            LLMClassifierConfig,
+        )
+
+        async def _cls_llm_call(system_prompt: str, user_prompt: str) -> tuple[int, int, str]:
+            from anthropic import AsyncAnthropic
+            from anthropic._exceptions import AuthenticationError
+
+            client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+            try:
+                msg = await client.messages.create(
+                    model=cfg.llm_classifier.model,
+                    max_tokens=cfg.llm_classifier.max_output_tokens,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+            except AuthenticationError as exc:
+                raise _ClsAuthError(str(exc)) from exc
+            text = ""
+            for block in msg.content:
+                if hasattr(block, "text"):
+                    text = block.text
+                    break
+            return (msg.usage.input_tokens, msg.usage.output_tokens, text)
+
+        classifier = LLMClassifier(
+            db=db,
+            cost_guard=cost_guard,
+            alerts=alert_dispatcher,
+            config=LLMClassifierConfig(
+                enabled=True,
+                model=cfg.llm_classifier.model,
+                max_input_tokens=cfg.llm_classifier.max_input_tokens,
+                max_output_tokens=cfg.llm_classifier.max_output_tokens,
+                timeout_sec=cfg.llm_classifier.timeout_sec,
+                prompt_path=cfg.llm_classifier.prompt_path,
+                prompt_version=cfg.llm_classifier.prompt_version,
+                contract_path=cfg.llm_classifier.contract_path,
+            ),
+            llm_call=_cls_llm_call,
+        )
+        matcher_worker.attach_classifier(
+            classifier=classifier,
+            alert_dispatcher=alert_dispatcher,
+        )
+        log.info("llm_classifier_attached", model=cfg.llm_classifier.model)
+    else:
+        log.info(
+            "llm_classifier_disabled",
+            cfg_enabled=cfg.llm_classifier.enabled,
+            anthropic_key_present=anthropic_key_present,
+        )
 
     # Scheduled loops: heartbeat, daily digest, settlement, source health.
     # All four are silent-by-default (heartbeat etc.); only the source-
@@ -878,7 +959,15 @@ def _load_extractor(cfg: TrumpbotConfig) -> SubjectExtractor:
 
 
 class MatcherWorker:
-    """Consumes new news events, runs the matcher, writes news_market_matches."""
+    """Consumes new news events, runs the matcher, writes news_market_matches.
+
+    Phase 4 Part 2.8: when an :class:`LLMClassifier` is injected, every
+    Stage-1 ``passed_pre_filter`` row is upgraded by calling the LLM
+    against the verbatim contract rules. The keyword row is inserted
+    first (so we always have an audit trail) and patched in place with
+    ``classifier_type='llm_cascade'`` + the LLM's confidence + the
+    ``llm_classification_id`` FK.
+    """
 
     component = "matcher_worker"
 
@@ -890,13 +979,32 @@ class MatcherWorker:
         event_bus: EventBus,
         poll_interval_sec: int = 5,
         batch_size: int = 100,
+        classifier: LLMClassifier | None = None,
+        alert_dispatcher: Any | None = None,
     ) -> None:
         self._db = db
         self._matcher = matcher
         self._bus = event_bus
         self._poll_interval = poll_interval_sec
         self._batch_size = batch_size
+        self._classifier = classifier
+        self._alerts = alert_dispatcher
         self._stop = asyncio.Event()
+
+    def attach_classifier(
+        self,
+        *,
+        classifier: LLMClassifier,
+        alert_dispatcher: Any | None,
+    ) -> None:
+        """Wire the LLM classifier in after construction.
+
+        The daemon builds the cost guard, the Telegram bot, and the
+        alert dispatcher AFTER the matcher worker (the worker doesn't
+        depend on them). This setter lets us hand them in once they
+        exist, before the worker's task is started."""
+        self._classifier = classifier
+        self._alerts = alert_dispatcher
 
     async def run(self) -> None:
         log.info("matcher_worker_started")
@@ -963,7 +1071,14 @@ class MatcherWorker:
         merged_aliases = self._build_merged_aliases()
         matcher = NewsMatcher(extractor=SubjectExtractor(aliases=merged_aliases))
 
-        rows: list[NewsMatchRow] = []
+        # Stage 1 — keyword pre-filter, written to DB. Stage 2 (LLM)
+        # patches passed_pre_filter rows in place.
+        # For each event with at least one passed_pre_filter result, we
+        # do a single LLM call against the union of its subject
+        # candidates, then patch every match row for that event.
+        bulk_rows: list[NewsMatchRow] = []
+        events_needing_llm: list[dict[str, Any]] = []
+
         for evt in events:
             results = matcher.match(
                 headline=evt["headline"],
@@ -971,8 +1086,17 @@ class MatcherWorker:
                 markets=contexts,
                 article_published_ts=evt["raw_published_ts"],
             )
+            event_passed: list[Any] = []  # list of MatchResult that passed pre-filter
+            event_failed: list[Any] = []
             for r in results:
-                rows.append(
+                if r.match_reason == PASSED_REASON:
+                    event_passed.append(r)
+                else:
+                    event_failed.append(r)
+
+            # All FAILED rows go through the bulk insert path (cheap).
+            for r in event_failed:
+                bulk_rows.append(
                     NewsMatchRow(
                         news_event_id=evt["id"],
                         ticker=r.ticker,
@@ -982,10 +1106,120 @@ class MatcherWorker:
                         match_reason=r.match_reason,
                     )
                 )
-                bucket = _bucket(r.confidence)
-                MATCHES_WRITTEN.labels(confidence_bucket=bucket).inc()
-        insert_news_matches(self._db, rows)
+                MATCHES_WRITTEN.labels(confidence_bucket=_bucket(r.confidence)).inc()
+
+            if not event_passed:
+                continue
+
+            # PASSED rows: insert one-by-one to capture row ids for LLM patching.
+            inserted: list[tuple[int, Any]] = []
+            for r in event_passed:
+                row_id = insert_news_match_returning_id(
+                    self._db,
+                    NewsMatchRow(
+                        news_event_id=evt["id"],
+                        ticker=r.ticker,
+                        confidence=r.confidence,
+                        matched_subject=r.matched_subject,
+                        matched_keywords=r.matched_keywords or None,
+                        match_reason=r.match_reason,
+                    ),
+                )
+                MATCHES_WRITTEN.labels(confidence_bucket=_bucket(r.confidence)).inc()
+                inserted.append((row_id, r))
+
+            events_needing_llm.append(
+                {
+                    "evt": evt,
+                    "inserted": inserted,
+                    "subject_candidates": {
+                        r.matched_subject: merged_aliases.get(r.matched_subject, [])
+                        for r in event_passed
+                        if r.matched_subject is not None
+                    },
+                }
+            )
+
+        if bulk_rows:
+            insert_news_matches(self._db, bulk_rows)
+
+        # Stage 2 — LLM classify each event with at least one passed row.
+        if self._classifier is not None and events_needing_llm:
+            await self._classify_and_patch(events_needing_llm)
+
         return len(events)
+
+    async def _classify_and_patch(self, events_needing_llm: list[dict[str, Any]]) -> None:
+        """Call the LLM for each event and patch the corresponding match rows."""
+        assert self._classifier is not None
+        for item in events_needing_llm:
+            evt = item["evt"]
+            inserted: list[tuple[int, Any]] = item["inserted"]
+            candidates: dict[str, list[str]] = item["subject_candidates"]
+            try:
+                classified = await self._classifier.classify(
+                    news_event_id=evt["id"],
+                    headline=evt["headline"],
+                    body=evt["body_excerpt"],
+                    subject_candidates=candidates,
+                )
+            except ClassifierAuthError as exc:
+                log.error("llm_classifier_auth_error", error=repr(exc))
+                if self._alerts is not None:
+                    with contextlib.suppress(Exception):
+                        await self._alerts.send(
+                            template_name="alert_critical_anthropic_auth",
+                            data={},
+                            dedup_key="anthropic_auth",
+                            component="news_classifier",
+                        )
+                # Leave keyword_only rows intact (they're already inserted
+                # with confidence=0.0). Continue with the next event.
+                continue
+
+            if classified is None:
+                # Cap hit, parse failure, or transient error — leave the
+                # keyword rows in place. The /spend command + the
+                # llm_classifications row record what happened.
+                continue
+
+            result, classification_id = classified
+            picked_subject = result.subject
+
+            # Patch every passed row for this event. The picked subject
+            # becomes the row's matched_subject (the LLM chose one out of
+            # the candidate set); rows for OTHER subjects are downgraded
+            # back to keyword_only with a "stage_2_picked_other_subject"
+            # reason so the audit trail is clear.
+            for row_id, mr in inserted:
+                if picked_subject is not None and mr.matched_subject == picked_subject:
+                    update_match_with_classification(
+                        self._db,
+                        match_id=row_id,
+                        update=LLMMatchUpdate(
+                            classifier_type="llm_cascade",
+                            confidence=float(result.confidence),
+                            matched_subject=picked_subject,
+                            match_reason=(
+                                f"llm_cascade:interaction={result.interaction_occurred}"
+                                f"|tense={result.tense}|negated={result.negated}"
+                                f"|indirect={result.indirect_only}"
+                            ),
+                            llm_classification_id=classification_id,
+                        ),
+                    )
+                else:
+                    update_match_with_classification(
+                        self._db,
+                        match_id=row_id,
+                        update=LLMMatchUpdate(
+                            classifier_type="llm_cascade",
+                            confidence=0.0,
+                            matched_subject=mr.matched_subject,
+                            match_reason="llm_cascade:not_picked_subject",
+                            llm_classification_id=classification_id,
+                        ),
+                    )
 
     def _build_merged_aliases(self) -> dict[str, list[str]]:
         """Discovery-service subjects layered on top of DEFAULT_SUBJECT_ALIASES."""

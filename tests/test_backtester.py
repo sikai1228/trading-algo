@@ -130,8 +130,8 @@ def test_backtester_uses_same_decision_engine_class() -> None:
 
 def test_backtester_uses_same_risk_manager_class() -> None:
     """Pin: the backtester also runs the production RiskManager (no
-    shadow logic for sizing caps / exposure caps), with db=None so the
-    audit table isn't polluted from a backtest run."""
+    shadow logic for sizing caps), with db=None so the audit table
+    isn't polluted from a backtest run."""
     from trumpbot.backtest.replay import Backtester as B
     from trumpbot.risk.manager import RiskManager as ProdRisk
 

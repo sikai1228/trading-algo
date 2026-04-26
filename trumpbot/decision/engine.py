@@ -79,7 +79,12 @@ class DecisionConfig:
     ``min_trade_size_contracts``."""
     # --------------------------------------------------------------
 
-    total_exposure_cap_pct: float = 0.30
+    # Phase 4 Part 2.3: ``total_exposure_cap_pct`` was REMOVED. The
+    # engine no longer references aggregate exposure for sizing.
+    # Per-trade caps (cap_one + cap_two) plus bankroll sufficiency
+    # provide the per-trade ceiling; aggregate exposure is bounded by
+    # the operator's Kalshi deposit. See CLAUDE.md.
+
     stop_loss_drop_cents: int = 50
 
 

@@ -45,7 +45,6 @@ class RiskConfig:
 
     enabled: bool = True
     max_buy_price_cents: int = 80
-    total_exposure_cap_pct: float = 0.30
     position_size_hard_cap_cents: int = 2000
     halted: bool = False
 
@@ -77,7 +76,24 @@ class RiskManager:
     # -- public API ---------------------------------------------------
 
     def evaluate(self, intent: AnyIntent, state: RiskState) -> RiskApprovedOrder | RiskRejection:
-        """Run the 6-check guard chain. First failure rejects."""
+        """Run the per-intent guard chain. First failure rejects.
+
+        Phase 4 Part 2.3 dropped the aggregate "total exposure cap"
+        check. The remaining guards are:
+
+        - ``enabled`` (kill-switch)
+        - ``halted``  (kill-switch)
+        - Price ceiling (max-buy ¢)
+        - Bankroll sufficiency (per-trade)
+        - Per-trade size cap (cap_one — adjustment, not rejection)
+
+        Aggregate exposure is now bounded by the operator's actual
+        Kalshi deposit (the bankroll-sufficiency check refuses any
+        trade that wouldn't fit) plus the two per-trade caps. The
+        explicit "30 % of bankroll" aggregate cap was removed because
+        it duplicated the protection the deposit amount already
+        provides for a single-account operator.
+        """
         # If the manager itself is disabled, every flow is rejected.
         if not self._cfg.enabled:
             return self._reject(intent, "risk_disabled", "RiskManager.enabled = False", "enabled")
@@ -115,18 +131,14 @@ class RiskManager:
                 "available_bankroll",
             )
 
-        # 2. Total exposure cap
-        new_total = state.bankroll.open_position_cost_usd_cents + intent.target_size_usd_cents
-        cap_cents = int(state.bankroll.bankroll_usd_cents * self._cfg.total_exposure_cap_pct)
-        if new_total > cap_cents:
-            return self._reject(
-                intent,
-                "exposure_cap_exceeded",
-                f"new total ${new_total/100:.2f} > exposure cap "
-                f"${cap_cents/100:.2f} "
-                f"({self._cfg.total_exposure_cap_pct*100:.0f}% of bankroll)",
-                "total_exposure_cap_pct",
-            )
+        # NOTE (Phase 4 Part 2.3): the aggregate "total exposure cap"
+        # check (sum of open positions + this trade vs. N % of bankroll)
+        # was REMOVED. Aggregate exposure is now managed by the operator
+        # via Kalshi deposit amount; the bankroll-sufficiency check
+        # above plus the two per-trade caps below provide the per-trade
+        # ceiling, and that's all the risk gate enforces. See
+        # CLAUDE.md "Phase 4 Part 2.3 — exposure cap removal" for
+        # the rationale.
 
         # 3. Per-trade size cap (fixed dollar amount; engages adjustment,
         # does not reject unless the cap is too tight for one contract).

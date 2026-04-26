@@ -165,7 +165,11 @@ decision:
   min_trade_size_contracts: 5
   min_trade_value_cents: 200
 
-  total_exposure_cap_pct: 0.30
+  # Phase 4 Part 2.3: the aggregate ``total_exposure_cap_pct`` field
+  # was REMOVED. Aggregate exposure is bounded by the operator's
+  # actual Kalshi deposit; the per-trade caps above provide the
+  # per-trade ceiling. See CLAUDE.md "Phase 4 Part 2.3".
+
   stop_loss_drop_cents: 50
   decision_loop_interval_sec: 10
   stop_loss_loop_interval_sec: 60

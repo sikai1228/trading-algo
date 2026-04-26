@@ -159,7 +159,7 @@ class TestRejections:
 
     def test_exposure_cap_exceeded(self, tmp_path: Path) -> None:
         rm = RiskManager(db=_db(tmp_path), config=RiskConfig())
-        # Bankroll $500; 30% cap = $150. Already $140 deployed, new $20 → busts.
+        # Bankroll $500; 30% cap = $150. Already $140 deployed, new $20 -> busts.
         out = rm.evaluate(
             _intent(target_price_cents=50, target_quantity=40),  # $20
             _state(
@@ -176,7 +176,7 @@ class TestRejections:
     def test_size_cap_engages_with_quantity_adjustment(self, tmp_path: Path) -> None:
         """Fixed $20 cap binds — risk APPROVES with adjusted_quantity.
 
-        $30 intent (60 contracts at 50c) > $20 cap → reduces qty to
+        $30 intent (60 contracts at 50c) > $20 cap -> reduces qty to
         $20/50c = 40 contracts."""
         rm = RiskManager(db=_db(tmp_path), config=RiskConfig())
         out = rm.evaluate(
@@ -189,10 +189,10 @@ class TestRejections:
     def test_size_cap_below_one_contract_rejects(self, tmp_path: Path) -> None:
         """Cap so tight that even one contract doesn't fit. Use a custom
         config with a $0.50 cap and an 80c intent — 50/80 = 0 contracts
-        → reject."""
+        -> reject."""
         rm = RiskManager(
             db=_db(tmp_path),
-            config=RiskConfig(position_size_cap_usd_cents=50),  # $0.50 cap
+            config=RiskConfig(position_size_hard_cap_cents=50),  # $0.50 cap
         )
         out = rm.evaluate(
             _intent(target_price_cents=80, target_quantity=5),  # $4
@@ -202,12 +202,12 @@ class TestRejections:
         assert out.reason == "size_cap_below_one_contract"
 
     def test_size_cap_value_read_from_config(self, tmp_path: Path) -> None:
-        """Override `position_size_cap_usd_cents` and confirm the
+        """Override `position_size_hard_cap_cents` and confirm the
         adjustment math respects it. $50 cap, $30 intent (60 contracts
-        at 50c) → no adjustment because $30 < $50."""
+        at 50c) -> no adjustment because $30 < $50."""
         rm = RiskManager(
             db=_db(tmp_path),
-            config=RiskConfig(position_size_cap_usd_cents=5000),  # $50 cap
+            config=RiskConfig(position_size_hard_cap_cents=5000),  # $50 cap
         )
         out = rm.evaluate(
             _intent(target_price_cents=50, target_quantity=60),  # $30

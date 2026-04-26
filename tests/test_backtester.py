@@ -63,7 +63,7 @@ def _seed(tmp_path: Path) -> Path:
         ),
     )
     assert eid is not None
-    # A price snapshot at 50¢ before the match, then a high-confidence match.
+    # A price snapshot at 50c before the match, then a high-confidence match.
     insert_price_snapshot(
         db,
         PriceSnapshotRow(
@@ -99,7 +99,7 @@ def test_backtester_uses_engine_and_settles_yes(tmp_path: Path) -> None:
     result = bt.run(start_ts="2026-04-01T00:00:00Z", end_ts="2026-04-30T23:59:59Z")
     assert result.total_trades == 1
     trade = result.trade_log[0]
-    # Settled YES — payoff = 100¢. Entry @ 50¢ — realized = +50¢ * qty.
+    # Settled YES — payoff = 100c. Entry @ 50c — realized = +50c * qty.
     assert trade.exit_price_cents == 100
     assert trade.realized_pnl_usd_cents > 0
     assert result.win_rate == 1.0
@@ -169,9 +169,9 @@ def test_backtester_emits_sharpe_and_max_drawdown(tmp_path: Path) -> None:
     db_path = _seed(tmp_path)
     bt = Backtester(db_path=db_path, starting_bankroll_usd=500.0)
     result = bt.run(start_ts="2026-04-01T00:00:00Z", end_ts="2026-04-30T23:59:59Z")
-    # Single positive-P&L trade → variance is zero → Sharpe is 0.0.
+    # Single positive-P&L trade -> variance is zero -> Sharpe is 0.0.
     assert result.sharpe_ratio == 0.0
-    # Single-trade equity curve only goes up → max drawdown is 0.
+    # Single-trade equity curve only goes up -> max drawdown is 0.
     assert result.max_drawdown_usd_cents == 0
 
 
@@ -195,7 +195,7 @@ def test_backtester_populates_by_source_breakdown(tmp_path: Path) -> None:
 
 
 def test_max_drawdown_helper_handles_peak_and_trough() -> None:
-    """Equity curve +100, +50, -200 → peak 150, trough -50, max
+    """Equity curve +100, +50, -200 -> peak 150, trough -50, max
     drawdown 200 from the running max."""
     from trumpbot.backtest.replay import BacktestTrade, _max_drawdown_usd_cents
 

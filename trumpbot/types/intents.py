@@ -2,10 +2,10 @@
 
 Unit conventions (enforced by these types — do not deviate):
 
-- ``PriceCents`` — integer cents per contract (1¢..99¢ for Kalshi).
+- ``PriceCents`` — integer cents per contract (1c..99c for Kalshi).
 - ``QuantityContracts`` — integer count of contracts.
 - ``USDCents`` — integer hundredths of a US dollar (so $1.00 = 100,
-  and a contract bought at 42¢ x 10 contracts = 420 USDCents).
+  and a contract bought at 42c x 10 contracts = 420 USDCents).
 
 All persisted USD amounts are USDCents so SQLite cannot reintroduce
 float drift via a REAL column. Display/Telegram formatting converts
@@ -75,20 +75,30 @@ class _IntentBase(BaseModel):
 
 
 class TradeIntent(_IntentBase):
-    """Initial-entry signal proposed by the DecisionEngine."""
+    """Initial-entry signal proposed by the DecisionEngine.
+
+    Phase 3 Part 1 added the order-book-walk fields below
+    (``target_avg_fill_price_cents``, ``cap_*``, ``slippage_cents``,
+    etc.). The walker computes them once at decision time; the
+    executor re-walks at submission time and may produce different
+    actuals if the book moved (FOK semantics).
+    """
 
     intent_type: Literal["entry"] = "entry"
     ticker: str
     side: Literal["yes"] = "yes"
     action: Literal["buy"] = "buy"
     target_price_cents: int
-    """Maximum price (cents) we'd pay per contract."""
+    """The price ceiling — strictly the locked 80 c max-buy. Each
+    individual fill level may be at or below this; the average is
+    captured separately in ``target_avg_fill_price_cents``."""
 
     target_quantity: int
-    """Number of contracts."""
+    """Number of contracts the engine's walk filled."""
 
     target_size_usd_cents: int
-    """Total cost basis in USDCents at target price + quantity."""
+    """Total cost (sum of price x qty across consumed levels), excluding
+    fees, in USDCents. Equal to ``OrderbookWalkResult.total_cost_cents``."""
 
     triggering_match_id: int
     confirmation_weight: float
@@ -97,13 +107,44 @@ class TradeIntent(_IntentBase):
     confidence_score: float
     """The matcher / LLM confidence (0..1)."""
 
+    # ---- Phase 3 Part 1: walk + cap audit ------------------------
+    target_avg_fill_price_cents: int = 0
+    """Average fill price the engine's walk predicted, banker's-rounded.
+    Defaulted to 0 for back-compat with synthetic test fixtures that
+    don't supply it; production engine always populates it."""
+
+    target_max_fill_price_cents: int = 0
+    """Highest price level the walk reached — i.e. the deepest fill."""
+
+    estimated_fees_cents: int = 0
+    """Sum of per-level Kalshi entry fees from the walk."""
+
+    estimated_total_cost_cents: int = 0
+    """``target_size_usd_cents + estimated_fees_cents``, for audit."""
+
+    cap_binding: Literal["cap_one", "cap_two", "tie", "unknown"] = "unknown"
+    """Which cap (hard $20 or 5 % of volume) was binding at decision
+    time. ``tie`` when both equal; ``unknown`` for back-compat fixtures."""
+
+    cap_one_value_cents: int = 0
+    cap_two_value_cents: int = 0
+    slippage_cents: int = 0
+    """Average fill price minus best ask — the cost of depth."""
+
+    levels_consumed: list[tuple[int, int]] = []
+    """Ordered ``(price_cents, contracts)`` pairs from the walk. Defaults
+    to empty list for fixtures."""
+    # --------------------------------------------------------------
+
     is_reentry: Literal[False] = False
     prior_trade_id: None = None
 
 
 class ReentryIntent(_IntentBase):
     """Re-entry signal: a fresh match against a market where we previously
-    held and closed a position."""
+    held and closed a position. Carries the same Phase 3 walk fields as
+    :class:`TradeIntent` so the executor / message templates can branch
+    on intent type without a fork in the data shape."""
 
     intent_type: Literal["reentry"] = "reentry"
     ticker: str
@@ -115,6 +156,17 @@ class ReentryIntent(_IntentBase):
     triggering_match_id: int
     confirmation_weight: float
     confidence_score: float
+
+    # Phase 3 Part 1 — same walk audit fields as TradeIntent.
+    target_avg_fill_price_cents: int = 0
+    target_max_fill_price_cents: int = 0
+    estimated_fees_cents: int = 0
+    estimated_total_cost_cents: int = 0
+    cap_binding: Literal["cap_one", "cap_two", "tie", "unknown"] = "unknown"
+    cap_one_value_cents: int = 0
+    cap_two_value_cents: int = 0
+    slippage_cents: int = 0
+    levels_consumed: list[tuple[int, int]] = []
 
     is_reentry: Literal[True] = True
     prior_trade_id: int
@@ -129,7 +181,7 @@ class ReentryIntent(_IntentBase):
 
 
 class StopLossIntent(_IntentBase):
-    """Stop-loss signal: the YES bid has dropped 50¢+ below our entry."""
+    """Stop-loss signal: the YES bid has dropped 50c+ below our entry."""
 
     intent_type: Literal["stop_loss"] = "stop_loss"
     ticker: str

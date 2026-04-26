@@ -6,19 +6,26 @@ is no parallel "backtest engine"; the only place a strategy rule lives
 is in :class:`DecisionEngine` and :class:`RiskManager`. If a rule
 changes, the backtest result changes accordingly.
 
-Phase 2 backtester:
-- Runs every engine intent through :class:`RiskManager` (with
-  ``db=None`` so the audit table isn't written from a backtest run);
-  rejected intents are skipped, adjusted-quantity approvals respected
-- Auto-approves the gate stage (no Telegram in backtest)
-- Uses the closest price_snapshot to the match's classified_at_ts
-- Closes positions on stop-loss trigger or market resolution
-  (YES @ 100¢, NO @ 0¢)
-- Reports total trades, win/loss/win-rate, realized + unrealized P&L,
-  per-day Sharpe, max drawdown, by-subject and by-source breakdowns
+Phase 3 Part 1 added the **walk-aware, fee-aware** path:
 
-Slippage modeling, fees, partial fills, and P&L attribution are all
-Phase 3+ (out of scope per CLAUDE.md).
+- The backtester now goes through the production walker
+  (:func:`walk_orderbook_for_buy`) and the production fee model
+  (:func:`calculate_entry_fee_cents`). Fees are deducted from the
+  realized P&L on every trade.
+- ``markets.volume`` flows through to the engine so cap_two engages
+  on thin markets exactly as it does in production.
+
+**Caveat (documented):** ``price_snapshots`` only stores top-of-book
+bid/ask, so the backtester synthesizes a single-level book at the
+historical ask. That means the walker always fills entirely at top of
+book and slippage is zero. This *under*-states slippage relative to
+real Kalshi books (which are typically 3-5 levels deep). Fees alone
+still produce the documented v2-vs-v1 delta. A future Phase will add
+an ``orderbook_snapshots`` table and let the backtester replay
+realistic depth.
+
+Phase 4 will add live execution. Backtests run through the same
+engine + risk + walker code so historical replays remain meaningful.
 """
 
 from __future__ import annotations
@@ -41,6 +48,9 @@ from trumpbot.decision.engine import (
     MatchSnapshot,
     Position,
 )
+from trumpbot.execution.fees import (
+    calculate_exit_fee_cents,
+)
 from trumpbot.risk.manager import RiskConfig, RiskManager, RiskState
 from trumpbot.types.intents import RiskRejection, StopLossIntent
 
@@ -62,6 +72,12 @@ class BacktestTrade:
     triggering_source: str | None = None
     """Name of the news source (e.g. 'reuters', 'ap_via_gnews').
     Powers by_source_breakdown."""
+
+    # Phase 3 Part 1 — fee + slippage audit per trade.
+    entry_fees_cents: int = 0
+    exit_fees_cents: int = 0
+    slippage_cents: int = 0
+    cap_binding: str = "unknown"
 
 
 @dataclass
@@ -88,6 +104,27 @@ class BacktestResult:
     risk_rejections: int = 0
     """Number of intents the risk manager rejected during the run."""
 
+    # ---- Phase 3 Part 1 — fee/slippage audit (v2 metrics) ----
+    schema_version: int = 2
+    """Bumped from 1 -> 2 in Phase 3 Part 1 when the backtester became
+    walk-aware and fee-aware. Old v1 backtest results are no longer
+    comparable to v2 — re-run them."""
+
+    total_entry_fees_cents: int = 0
+    total_exit_fees_cents: int = 0
+    total_slippage_cents: int = 0
+    """Sum of (avg fill - best ask) x qty across all entries.
+    Always 0 in v2 because we synthesize a single-level book from
+    historical top-of-book snapshots; will be > 0 once the future
+    ``orderbook_snapshots`` table is available."""
+
+    ideal_realized_pnl_usd_cents: int = 0
+    """What ``total_realized_pnl_usd_cents`` would be with zero fees
+    and zero slippage — i.e. the v1 (Phase 2) metric. Subtract this
+    from the v2 realized P&L to see the dollar cost of slippage + fees
+    on the strategy's edge."""
+    # ----------------------------------------------------------
+
     trade_log: list[BacktestTrade] = field(default_factory=list)
     by_subject: dict[str, dict[str, Any]] = field(default_factory=dict)
     by_source: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -112,11 +149,11 @@ class Backtester:
             enabled=True,
             max_buy_price_cents=self._cfg.max_buy_price_cents,
             total_exposure_cap_pct=self._cfg.total_exposure_cap_pct,
-            position_size_cap_usd_cents=self._cfg.position_size_cap_usd_cents,
+            position_size_hard_cap_cents=self._cfg.position_size_hard_cap_cents,
             halted=False,
         )
         self._engine = DecisionEngine(self._cfg)
-        # db=None → RiskManager runs the in-memory check chain but does
+        # db=None -> RiskManager runs the in-memory check chain but does
         # NOT persist risk_decisions; backtests must not pollute the
         # production audit table.
         self._risk = RiskManager(db=None, config=self._risk_cfg)
@@ -135,8 +172,14 @@ class Backtester:
                 quote = self._closest_quote(conn, ticker, row["created_at"])
                 if quote is None:
                     continue
+                # Phase 3: thread market.volume into the engine for
+                # cap_two computation. Default 0 if missing.
+                volume = (market_row["volume"] if market_row else None) or 0
                 market_state = MarketState(
-                    ticker=ticker, yes_bid_cents=quote[0], yes_ask_cents=quote[1]
+                    ticker=ticker,
+                    yes_bid_cents=quote[0],
+                    yes_ask_cents=quote[1],
+                    total_volume_traded_contracts=int(volume),
                 )
                 if ticker in open_positions:
                     # Check stop-loss first.
@@ -160,11 +203,22 @@ class Backtester:
                         t.entry_price_cents * t.quantity for t in open_positions.values()
                     ),
                 )
-                intent = self._engine.evaluate_news_match(snap, market_state, None, bankroll)
+                # Phase 3 walk-aware path: synthesize a single-level
+                # book at the historical ask. (See module docstring for
+                # the slippage caveat.)
+                yes_ask_levels: list[tuple[int, int]] = (
+                    [(quote[1], 10_000)] if quote[1] is not None else []
+                )
+                intent = self._engine.evaluate_news_match(
+                    snap,
+                    market_state,
+                    None,
+                    bankroll,
+                    yes_ask_levels=yes_ask_levels,
+                )
                 if intent is None:
                     continue
-                # Run the production RiskManager. Skip the trade on
-                # rejection; honour adjusted_quantity on approval.
+                # Run the production RiskManager.
                 risk_state = RiskState(
                     bankroll=bankroll,
                     open_position_tickers=frozenset(open_positions.keys()),
@@ -174,27 +228,37 @@ class Backtester:
                     result.risk_rejections += 1
                     continue
                 actual_qty = approved.adjusted_quantity or intent.target_quantity
+                # The engine's walk already computed the avg fill price
+                # and entry fees. Persist them so v2 metrics work.
+                entry_price = intent.target_avg_fill_price_cents or (quote[1] or 0)
                 trade = BacktestTrade(
                     ticker=ticker,
                     entered_at=row["created_at"],
-                    entry_price_cents=intent.target_price_cents,
+                    entry_price_cents=entry_price,
                     quantity=actual_qty,
                     triggering_match_id=intent.triggering_match_id,
                     triggering_subject=row["matched_subject"],
                     triggering_source=_row_source_name(row),
+                    entry_fees_cents=intent.estimated_fees_cents,
+                    slippage_cents=intent.slippage_cents,
+                    cap_binding=intent.cap_binding,
                 )
                 open_positions[ticker] = trade
                 next_trade_id += 1
 
             # Close any remaining open positions at market resolution if known.
+            # Phase 3: net the exit fees off realized P&L for v2 metrics.
             for ticker, trade in list(open_positions.items()):
                 resolution = self._market_resolution(conn, ticker)
                 if resolution is not None:
                     payoff = 100 if resolution == "settled_yes" else 0
-                    realized = (payoff - trade.entry_price_cents) * trade.quantity
+                    gross = (payoff - trade.entry_price_cents) * trade.quantity
+                    exit_fees = calculate_exit_fee_cents(payoff, trade.quantity)
                     trade.exit_price_cents = payoff
                     trade.exit_at = end_ts
-                    trade.realized_pnl_usd_cents = realized
+                    # Realized P&L = gross - entry fees - exit fees.
+                    trade.exit_fees_cents = exit_fees
+                    trade.realized_pnl_usd_cents = gross - trade.entry_fees_cents - exit_fees
                     result.trade_log.append(trade)
                     open_positions.pop(ticker)
                 else:
@@ -236,7 +300,7 @@ class Backtester:
 
     def _market(self, conn: sqlite3.Connection, ticker: str):  # type: ignore[no-untyped-def]
         return conn.execute(
-            "SELECT ticker, open_ts, close_ts, status FROM markets WHERE ticker = ?",
+            "SELECT ticker, open_ts, close_ts, status, volume FROM markets WHERE ticker = ?",
             (ticker,),
         ).fetchone()
 
@@ -295,12 +359,16 @@ class Backtester:
         when_ts: str,
         result: BacktestResult,
     ) -> None:
+        """Close at the current bid. Phase 3 nets exit fees off the
+        realized P&L."""
         trade = positions.pop(ticker)
+        gross = (stop.current_bid_cents - trade.entry_price_cents) * trade.quantity
+        exit_fees = calculate_exit_fee_cents(stop.current_bid_cents, trade.quantity)
         trade.exit_price_cents = stop.current_bid_cents
         trade.exit_at = when_ts
-        trade.realized_pnl_usd_cents = (
-            stop.current_bid_cents - trade.entry_price_cents
-        ) * trade.quantity
+        trade.exit_fees_cents = exit_fees
+        # Realized = gross - entry fees - exit fees.
+        trade.realized_pnl_usd_cents = gross - trade.entry_fees_cents - exit_fees
         result.trade_log.append(trade)
 
     def _aggregate(self, result: BacktestResult) -> None:
@@ -354,6 +422,21 @@ class Backtester:
         # ---- Sharpe + max drawdown over daily P&L ----
         result.sharpe_ratio = _annualized_sharpe(result.trade_log)
         result.max_drawdown_usd_cents = _max_drawdown_usd_cents(result.trade_log)
+
+        # ---- Phase 3 v2 metrics: fee + slippage totals ----
+        result.total_entry_fees_cents = sum(t.entry_fees_cents for t in result.trade_log)
+        result.total_exit_fees_cents = sum(t.exit_fees_cents for t in result.trade_log)
+        result.total_slippage_cents = sum(t.slippage_cents for t in result.trade_log)
+        # Ideal P&L = realized + entry fees + exit fees + slippage cost.
+        # Slippage cost per trade ≈ slippage_cents x quantity (the
+        # extra dollars we paid above best ask).
+        slippage_cost = sum(t.slippage_cents * t.quantity for t in result.trade_log)
+        result.ideal_realized_pnl_usd_cents = (
+            result.total_realized_pnl_usd_cents
+            + result.total_entry_fees_cents
+            + result.total_exit_fees_cents
+            + slippage_cost
+        )
 
     # -- output --------------------------------------------------------
 

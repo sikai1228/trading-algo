@@ -50,7 +50,7 @@ def main() -> int:
     print()
     line = "─" * 60
     print(line)
-    print(f" backtest {start} → {end}")
+    print(f" backtest {start} -> {end}")
     print(line)
     print(f"  total trades:        {result.total_trades}")
     print(f"  winning trades:      {result.winning_trades}")
@@ -64,6 +64,17 @@ def main() -> int:
     print(f"  Sharpe (annualized): {result.sharpe_ratio:.2f}")
     print(f"  max drawdown:        ${result.max_drawdown_usd_cents/100:.2f}")
     print(f"  risk rejections:     {result.risk_rejections}")
+    print()
+    # Phase 3 Part 1 v2 metrics: fee + slippage cost on the strategy's edge.
+    print(f"  schema version:      v{result.schema_version}")
+    print(f"  total entry fees:    ${result.total_entry_fees_cents/100:.2f}")
+    print(f"  total exit fees:     ${result.total_exit_fees_cents/100:.2f}")
+    print(f"  total slippage:      ${result.total_slippage_cents/100:.2f}")
+    delta = result.ideal_realized_pnl_usd_cents - result.total_realized_pnl_usd_cents
+    print(
+        f"  ideal P&L (no fees): ${result.ideal_realized_pnl_usd_cents/100:+.2f}  "
+        f"(delta vs realized: ${delta/100:+.2f})"
+    )
     if result.by_source:
         print("  by source:")
         for source, agg in sorted(result.by_source.items()):

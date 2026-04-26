@@ -70,10 +70,21 @@ class DecisionPhaseConfig(BaseModel):
     llm_confidence_threshold: float = 0.85
     max_buy_price_cents: int = 80
     position_size_base_pct: float = 0.08
-    position_size_cap_usd_cents: int = 2000
-    """Hard fixed-dollar cap on per-trade size, in USDCents. Default
-    $20.00 = 2000c. The user controls strategy exposure by managing
-    the deposit on Kalshi rather than via percentage caps."""
+    # Phase 3 Part 1: two-cap system (was a single fixed cap in PR #10).
+    position_size_hard_cap_cents: int = 2000
+    """Cap one — hard fixed-dollar ceiling per trade, in USDCents.
+    Default $20.00. Configurable via the YAML field
+    ``decision.position_size_hard_cap_usd``."""
+
+    position_size_volume_pct: float = 0.05
+    """Cap two — fraction of the market's total traded volume the
+    bot is willing to take in a single trade. Default 5 %."""
+
+    min_trade_size_contracts: int = 5
+    """Skip the trade entirely if the walk fills fewer than this."""
+
+    min_trade_value_cents: int = 200
+    """Skip if the walk's total cost is below this. Default $2.00."""
 
     total_exposure_cap_pct: float = 0.30
     stop_loss_drop_cents: int = 50

@@ -8,35 +8,76 @@ property that makes the backtester valid.
 All money math uses :class:`int` (cents). No :class:`float` anywhere on
 prices or USD amounts.
 
-The exact rules implemented here are the LOCKED Phase-2 strategy from
-`CLAUDE.md`. Any change to a numeric threshold must update both the
-test suite and the rules section together.
+Phase 3 Part 1 added the two-cap sizing system + order-book walking +
+fee-aware total-cost reasoning. The locked Phase-3 strategy in
+``CLAUDE.md`` is the spec. Any change to a numeric threshold must
+update both the test suite and the rules section together.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
+from trumpbot.execution.fees import calculate_entry_fee_cents
+from trumpbot.execution.slippage import (
+    OrderbookWalkResult,
+    walk_orderbook_for_buy,
+)
 from trumpbot.types.intents import (
     ReentryIntent,
     StopLossIntent,
     TradeIntent,
 )
 
+CapBinding = Literal["cap_one", "cap_two", "tie", "unknown"]
+
 
 @dataclass(frozen=True)
 class DecisionConfig:
-    """Strategy parameters. Phase 2 rules section in CLAUDE.md is the spec."""
+    """Strategy parameters. Phase 3 rules section in CLAUDE.md is the
+    spec for the two-cap + walk + FOK pipeline."""
 
     llm_confidence_threshold: float = 0.85
     max_buy_price_cents: int = 80
     position_size_base_pct: float = 0.08
-    position_size_cap_usd_cents: int = 2000
-    """Hard fixed-dollar cap on per-trade size, in USDCents. Default
-    $20.00 = 2000c. Replaces the previous time-windowed percentage cap;
-    the user controls strategy exposure by managing the deposit on
-    Kalshi rather than via per-trade percentage knobs."""
+    """Confidence-scaled target as a fraction of bankroll. Multiplied
+    by ``match.confidence`` to set the dollar target before any cap
+    applies (so a 1.0-confidence match wants 8 % of bankroll, scaling
+    down with confidence)."""
+
+    # ---- Two-cap system (Phase 3 Part 1) -------------------------
+    position_size_hard_cap_cents: int = 2000
+    """Cap one — hard fixed-dollar ceiling per trade, in USDCents.
+    Default $20.00. Designed to be raised to $500-1000 once the
+    strategy has live-traded data; configurable via the YAML field
+    ``decision.position_size_hard_cap_usd``."""
+
+    position_size_volume_pct: float = 0.05
+    """Cap two — fraction of the market's total traded volume the
+    bot is willing to take in a single trade. Default 5 %.
+
+    .. note::
+       ``markets.volume`` is captured from Kalshi as a count of
+       contracts. We convert to a dollar-equivalent cap by treating
+       one contract as $1 of notional (i.e.,
+       ``cap_two_cents = volume * 100 * 0.05``). For a brand-new
+       market with no recorded volume, cap two evaluates to $0 and
+       trading on that ticker is effectively disabled until volume
+       develops.
+    """
+
+    min_trade_size_contracts: int = 5
+    """Skip the trade entirely if the walk fills fewer than this
+    many contracts. Phase-3 spec default."""
+
+    min_trade_value_cents: int = 200
+    """Skip the trade entirely if the walk's total cost is below
+    this. Default $2.00. Belt-and-suspenders alongside
+    ``min_trade_size_contracts``."""
+    # --------------------------------------------------------------
 
     total_exposure_cap_pct: float = 0.30
     stop_loss_drop_cents: int = 50
@@ -70,12 +111,17 @@ class MatchSnapshot:
 
 @dataclass(frozen=True)
 class MarketState:
-    """Snapshot of the orderbook at evaluation time."""
+    """Snapshot of the orderbook + market metadata at evaluation time."""
 
     ticker: str
     yes_bid_cents: int | None
     yes_ask_cents: int | None
     yes_ask_size: int | None = None
+
+    total_volume_traded_contracts: int = 0
+    """Cumulative number of YES contracts traded over the market's
+    lifetime, sourced from ``markets.volume``. Phase 3 Part 1 uses
+    this to compute cap two = 5 % x volume x $1/contract."""
 
 
 @dataclass(frozen=True)
@@ -134,24 +180,46 @@ class DecisionEngine:
         current_position: Position | None,
         bankroll: BankrollState,
         *,
+        yes_ask_levels: Sequence[tuple[int, int]] = (),
         now_utc: datetime | None = None,
     ) -> TradeIntent | None:
-        """Return a :class:`TradeIntent` or ``None`` per the strategy rules.
+        """Return a :class:`TradeIntent` or ``None`` per the locked
+        Phase 3 Part 1 strategy.
 
-        See ``CLAUDE.md`` §"Phase 2 Strategy Rules" for the canonical
-        spec these checks implement. ``now_utc`` is retained for
-        backwards compatibility with callers (and for future
-        timestamp-aware checks); the fixed-cap migration removed the
-        only place it was actually used.
+        Logic chain (all integer-cents arithmetic):
+
+        1. Confidence ≥ 0.85, else None.
+        2. ``interaction_occurred`` true, else None.
+        3. Kalshi-approved source, else None.
+        4. No open position, else None.
+        5. Article inside the market's open/close window, else None.
+        6. Top-of-book ask ≤ ``max_buy_price_cents`` (80 c), else None
+           — fast guard before the walker.
+        7. ``cap_one = config.position_size_hard_cap_cents`` ($20).
+        8. ``cap_two = floor(market.volume_traded x 5)`` — 5 % of
+           market volume treating one contract as $1 of notional.
+        9. ``effective_cap = min(cap_one, cap_two)``.
+        10. Walk the order book for the effective cap with the 80 c
+            ceiling and the Kalshi fee calculator.
+        11. Skip if walk filled fewer than ``min_trade_size_contracts``
+            or below ``min_trade_value_cents``.
+        12. Build :class:`TradeIntent` with the full walk audit
+            (avg fill, max fill, slippage, fees, levels consumed,
+            cap binding).
+
+        ``yes_ask_levels`` is the merged YES-ask side of the book
+        (NO bids already inverted via
+        :func:`merge_to_yes_asks`). Pass an empty sequence to skip
+        the walker — used only by legacy fixtures; production code
+        always passes the live book.
         """
-        del now_utc  # currently unused after the fixed-cap migration
+        del now_utc  # unused — retained for caller compatibility
 
         # Rule 1 — confidence threshold
         if match.confidence < self._cfg.llm_confidence_threshold:
             return None
         # Rule 1b — must come from the LLM cascade with a positive
-        # interaction classification. Keyword-only rows have
-        # interaction_occurred=False and never trigger trades.
+        # interaction classification.
         if not match.interaction_occurred:
             return None
 
@@ -171,50 +239,70 @@ class DecisionEngine:
         ):
             return None
 
-        # Rule 5 — price ceiling
+        # Rule 5 — price ceiling (top-of-book pre-check; the walker
+        # also enforces this per-level)
         if market_state.yes_ask_cents is None:
             return None
         if market_state.yes_ask_cents > self._cfg.max_buy_price_cents:
             return None
 
-        # Rule 6/7/8 — confidence-scaled sizing capped at a fixed
-        # dollar amount (default $20.00). Integer-cents arithmetic
-        # everywhere; the only float is the percentage used to size
-        # against bankroll, and we round once to int cents at the
-        # boundary so there's no float drift.
-        target_pct = self._cfg.position_size_base_pct * match.confidence
-        unconstrained_size_cents = int(round(bankroll.bankroll_usd_cents * target_pct))
-        cap_engaged = unconstrained_size_cents > self._cfg.position_size_cap_usd_cents
-        target_size_usd_cents = min(unconstrained_size_cents, self._cfg.position_size_cap_usd_cents)
+        # ---- Rule 7/8/9 — two-cap system ----
+        cap_one_cents = self._cfg.position_size_hard_cap_cents
+        # Cap two: 5 % of market volume. ``markets.volume`` is captured
+        # from Kalshi as a contract count; we treat 1 contract ≈ $1 of
+        # notional, so cap_two_cents = volume x 100 x 0.05 = volume x 5.
+        # See DecisionConfig.position_size_volume_pct for the rationale.
+        volume_dollars_cents = market_state.total_volume_traded_contracts * 100
+        cap_two_cents = int(volume_dollars_cents * self._cfg.position_size_volume_pct)
+        effective_cap_cents = min(cap_one_cents, cap_two_cents)
+        cap_binding = _which_cap_binds(cap_one_cents, cap_two_cents)
 
-        # Rule 9/10 — convert to integer contracts at the ask
-        ask = market_state.yes_ask_cents
-        target_quantity = target_size_usd_cents // ask
-        if target_quantity < 1:
+        # Cap-two-zero (brand-new market): trading is effectively
+        # disabled until volume develops. Drop with reasoning logged.
+        if effective_cap_cents <= 0:
             return None
 
-        actual_cost_cents = target_quantity * ask
+        # ---- Rule 10 — walk the book ----
+        walk = walk_orderbook_for_buy(
+            yes_ask_levels,
+            target_dollars_cents=effective_cap_cents,
+            max_price_cents=self._cfg.max_buy_price_cents,
+            fee_calculator=calculate_entry_fee_cents,
+        )
 
-        # Build the intent with full reasoning.
+        # ---- Rule 11/12 — minimum-trade-size guard ----
+        if walk.filled_quantity < self._cfg.min_trade_size_contracts:
+            return None
+        if walk.total_cost_cents < self._cfg.min_trade_value_cents:
+            return None
+
         reasoning = _build_entry_reasoning(
             match=match,
             market_state=market_state,
-            target_pct=target_pct,
-            unconstrained_size_cents=unconstrained_size_cents,
-            cap_cents=self._cfg.position_size_cap_usd_cents,
-            cap_engaged=cap_engaged,
-            target_quantity=target_quantity,
-            cost_cents=actual_cost_cents,
-            bankroll=bankroll,
+            cap_one_cents=cap_one_cents,
+            cap_two_cents=cap_two_cents,
+            cap_binding=cap_binding,
+            effective_cap_cents=effective_cap_cents,
+            walk=walk,
         )
+
         return TradeIntent(
             ticker=match.ticker,
-            target_price_cents=ask,
-            target_quantity=target_quantity,
-            target_size_usd_cents=actual_cost_cents,
+            target_price_cents=self._cfg.max_buy_price_cents,
+            target_quantity=walk.filled_quantity,
+            target_size_usd_cents=walk.total_cost_cents,
             triggering_match_id=match.match_id,
             confirmation_weight=match.source_weight * match.confidence,
             confidence_score=match.confidence,
+            target_avg_fill_price_cents=walk.average_fill_price_cents,
+            target_max_fill_price_cents=walk.max_price_reached_cents,
+            estimated_fees_cents=walk.estimated_fees_cents,
+            estimated_total_cost_cents=walk.total_cost_with_fees_cents,
+            cap_binding=cap_binding,
+            cap_one_value_cents=cap_one_cents,
+            cap_two_value_cents=cap_two_cents,
+            slippage_cents=walk.slippage_cents,
+            levels_consumed=list(walk.levels_consumed),
             reasoning_text=reasoning,
         )
 
@@ -267,10 +355,20 @@ class DecisionEngine:
         prior_trade_realized_pnl_cents: int | None,
         bankroll: BankrollState,
         *,
+        yes_ask_levels: Sequence[tuple[int, int]] = (),
         now_utc: datetime | None = None,
     ) -> ReentryIntent | None:
         """Return a :class:`ReentryIntent` if the rules permit re-entering
-        a market we previously held and exited."""
+        a market we previously held and exited.
+
+        Re-entry runs the SAME ``evaluate_news_match`` pipeline (so any
+        change to entry rules — two-cap, walker, fee model — applies
+        identically to re-entries) and re-packages the resulting
+        :class:`TradeIntent` as a :class:`ReentryIntent` with the
+        prior-trade audit fields attached. The walk fields
+        (``target_avg_fill_price_cents``, etc.) are forwarded so the
+        executor's FOK logic treats both intent types uniformly.
+        """
         # Rule 1 — must have a prior trade record to "re-enter from".
         if prior_trade is None or prior_trade_outcome is None:
             return None
@@ -289,17 +387,12 @@ class DecisionEngine:
         if match.match_id == prior_trade.triggering_match_id:
             return None
 
-        # Apply the same logic as evaluate_news_match for the new entry.
-        # Use a synthetic "no current position" call: at this point the
-        # prior position is closed so the engine should be willing to
-        # propose. We piggy-back on the same evaluation by inlining the
-        # checks (so a future change to entry rules automatically
-        # applies to re-entries too).
         synthetic_intent = self.evaluate_news_match(
             match=match,
             market_state=market_state,
             current_position=None,
             bankroll=bankroll,
+            yes_ask_levels=yes_ask_levels,
             now_utc=now_utc,
         )
         if synthetic_intent is None:
@@ -313,6 +406,15 @@ class DecisionEngine:
             triggering_match_id=synthetic_intent.triggering_match_id,
             confirmation_weight=synthetic_intent.confirmation_weight,
             confidence_score=synthetic_intent.confidence_score,
+            target_avg_fill_price_cents=synthetic_intent.target_avg_fill_price_cents,
+            target_max_fill_price_cents=synthetic_intent.target_max_fill_price_cents,
+            estimated_fees_cents=synthetic_intent.estimated_fees_cents,
+            estimated_total_cost_cents=synthetic_intent.estimated_total_cost_cents,
+            cap_binding=synthetic_intent.cap_binding,
+            cap_one_value_cents=synthetic_intent.cap_one_value_cents,
+            cap_two_value_cents=synthetic_intent.cap_two_value_cents,
+            slippage_cents=synthetic_intent.slippage_cents,
+            levels_consumed=list(synthetic_intent.levels_consumed),
             reasoning_text=(
                 f"Re-entry into {match.ticker}. "
                 f"Prior trade #{prior_trade.trade_id} closed via "
@@ -371,48 +473,88 @@ def _article_within_window(
     return True
 
 
+def _which_cap_binds(cap_one_cents: int, cap_two_cents: int) -> CapBinding:
+    """Return 'cap_one' / 'cap_two' / 'tie'. Used both in the engine's
+    pipeline and in the reasoning-text builder so the labels stay
+    consistent."""
+    if cap_one_cents == cap_two_cents:
+        return "tie"
+    return "cap_one" if cap_one_cents < cap_two_cents else "cap_two"
+
+
 def _build_entry_reasoning(
     *,
     match: MatchSnapshot,
     market_state: MarketState,
-    target_pct: float,
-    unconstrained_size_cents: int,
-    cap_cents: int,
-    cap_engaged: bool,
-    target_quantity: int,
-    cost_cents: int,
-    bankroll: BankrollState,
+    cap_one_cents: int,
+    cap_two_cents: int,
+    cap_binding: CapBinding,
+    effective_cap_cents: int,
+    walk: OrderbookWalkResult,
 ) -> str:
-    """Multi-line human-readable rationale for the future Telegram message
-    and the trades.reasoning_text audit row.
+    """Phase 3 reasoning text — multi-paragraph audit log.
 
-    The size justification line distinguishes the two cases: cap engaged
-    vs cap not engaged. The format matches the spec in CLAUDE.md
-    §"Phase 2 strategy rules — sizing".
-    """
-    if cap_engaged:
-        size_line = (
-            f"Position size: ${cost_cents / 100:.2f} "
-            f"({target_quantity} contracts at {market_state.yes_ask_cents}c each). "
-            f"Confidence-scaled target was ${unconstrained_size_cents / 100:.2f} "
-            f"but capped at fixed ${cap_cents / 100:.2f} limit per "
-            f"config.position_size_cap_usd."
-        )
-    else:
-        size_line = (
-            f"Position size: ${cost_cents / 100:.2f} "
-            f"({target_quantity} contracts at {market_state.yes_ask_cents}c each). "
-            f"Confidence-scaled at {target_pct * 100:.1f}% of bankroll, "
-            f"under ${cap_cents / 100:.2f} cap."
-        )
-    lines = [
-        f"Source {match.source_name} (weight={match.source_weight}) classified an article "
-        f"matching {match.ticker} at confidence {match.confidence:.2f}, with "
-        f"interaction_occurred=true.",
-        f"Current YES ask is {market_state.yes_ask_cents}c (max-buy ceiling 80c).",
-        size_line,
-    ]
-    return "\n".join(lines)
+    The format is the contract documented in CLAUDE.md §"Phase 3 Part
+    1 — reasoning text". The Telegram message and the
+    ``trades.reasoning_text`` row use the same string. Each section
+    cites integer cents in dollars-formatted strings; nothing here
+    feeds back into the engine's arithmetic."""
+    best_ask = market_state.yes_ask_cents or 0
+    volume = market_state.total_volume_traded_contracts
+    cap_one_dollars = f"${cap_one_cents / 100:.2f}"
+    cap_two_dollars = f"${cap_two_cents / 100:.2f}"
+    binding_label = {
+        "cap_one": "Cap_one (hard $20)",
+        "cap_two": "Cap_two (5 % of volume)",
+        "tie": "Tie — both caps equal",
+    }.get(cap_binding, cap_binding)
+
+    cap_para = (
+        f"Cap analysis: cap_one={cap_one_dollars}, "
+        f"cap_two={cap_two_dollars} (5 % of {volume} contracts of market "
+        f"volume). Binding: {binding_label}, sizing target "
+        f"${effective_cap_cents / 100:.2f}."
+    )
+
+    levels_str = ", ".join(f"{q} @ {p}c" for p, q in walk.levels_consumed) or "none"
+    walk_para = (
+        f"Order-book walk for ${effective_cap_cents / 100:.2f}: "
+        f"{walk.filled_quantity} contracts filled across {len(walk.levels_consumed)} "
+        f"levels [{levels_str}] at avg "
+        f"{walk.average_fill_price_cents}c (best ask: {best_ask}c, "
+        f"slippage: {walk.slippage_cents}c). "
+        f"Estimated Kalshi entry fees: ${walk.estimated_fees_cents / 100:.2f}."
+    )
+
+    cost_para = (
+        f"Total expected cost: ${walk.total_cost_cents / 100:.2f} "
+        f"(entry) + ${walk.estimated_fees_cents / 100:.2f} (fees) = "
+        f"${walk.total_cost_with_fees_cents / 100:.2f}."
+    )
+
+    # Hypothetical YES-resolution P&L: payoff = 100c x qty, gross = payoff
+    # - total_cost (incl. fees). ROI = gross / total_cost_with_fees.
+    payoff_cents = 100 * walk.filled_quantity
+    gross_pnl_cents = payoff_cents - walk.total_cost_with_fees_cents
+    roi_pct = (
+        (gross_pnl_cents / walk.total_cost_with_fees_cents * 100)
+        if walk.total_cost_with_fees_cents > 0
+        else 0.0
+    )
+    pnl_para = (
+        f"If resolves YES at $1.00, gross P&L = "
+        f"${payoff_cents / 100:.2f} - ${walk.total_cost_with_fees_cents / 100:.2f} "
+        f"= ${gross_pnl_cents / 100:+.2f}, ROI = {roi_pct:.0f}%."
+    )
+
+    header = (
+        f"Source {match.source_name} (weight={match.source_weight}) "
+        f"classified an article matching {match.ticker} at confidence "
+        f"{match.confidence:.2f}, with interaction_occurred=true."
+    )
+    ceiling = f"Current YES ask is {best_ask}c (max-buy ceiling 80c)."
+
+    return "\n\n".join([header, ceiling, cap_para, walk_para, cost_para, pnl_para])
 
 
 __all__ = [

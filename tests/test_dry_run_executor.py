@@ -205,7 +205,7 @@ class TestStopLossSubmission:
         entry_result = executor.submit(approved)
         assert entry_result.fill_quantity is not None
 
-        # Now stop-loss it: bid drops to 20¢.
+        # Now stop-loss it: bid drops to 20c.
         stop = StopLossIntent(
             ticker="X",
             trade_id=entry_result.trade_id,
@@ -258,7 +258,7 @@ class TestUpdatePositionMarks:
         executor = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=50, ask=50))
         executor.submit(approved)
 
-        # Now bid moved to 70¢ — unrealized P&L should be +200¢.
+        # Now bid moved to 70c — unrealized P&L should be +200c.
         executor2 = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=70, ask=72))
         updated = executor2.update_position_marks()
         assert updated == 1
@@ -317,3 +317,140 @@ class TestCloseResolved:
         assert result is not None
         assert result.fill_price_cents == 0
         assert result.realized_pnl_usd_cents == -420
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 Part 1 — FOK semantics
+# ---------------------------------------------------------------------------
+
+
+def _entry_intent_with_walk(
+    *,
+    match_id: int,
+    target_avg: int = 50,
+    target_qty: int = 40,
+    target_budget: int = 2000,
+) -> TradeIntent:
+    """Construct a TradeIntent that *looks like* the engine's
+    walk-aware output. The FOK gate keys off ``target_avg_fill_price_cents``
+    and ``target_size_usd_cents`` so this fixture sets both."""
+    return TradeIntent(
+        ticker="X",
+        target_price_cents=80,
+        target_quantity=target_qty,
+        target_size_usd_cents=target_budget,
+        triggering_match_id=match_id,
+        confirmation_weight=0.9,
+        confidence_score=0.9,
+        target_avg_fill_price_cents=target_avg,
+        target_max_fill_price_cents=target_avg,
+        estimated_fees_cents=10,
+        estimated_total_cost_cents=target_budget + 10,
+        cap_binding="cap_one",
+        cap_one_value_cents=2000,
+        cap_two_value_cents=500_000,
+        slippage_cents=0,
+        levels_consumed=[(target_avg, target_qty)],
+        reasoning_text="phase-3 test fixture",
+    )
+
+
+class TestFokGate:
+    def test_fok_fill_when_book_unchanged(self, tmp_path: Path) -> None:
+        """Re-walk produces same numbers -> FOK passes -> trade row
+        written with the audit columns from the re-walk."""
+        db = _db(tmp_path)
+        match_id = _seed_match(db)
+        intent = _entry_intent_with_walk(match_id=match_id)
+        approved = _approve(db, intent)
+        executor = DryRunExecutor(
+            db=db,
+            orderbook_fn=lambda _t: _book(bid=49, ask=50),
+            depth_fn=lambda _t: [(50, 1000)],
+        )
+        result = executor.submit(approved)
+        assert result.status == "filled"
+        assert result.fill_price_cents == 50
+        assert result.fill_quantity == 40
+        # Audit columns should be populated.
+        row = (
+            db.connect().execute("SELECT * FROM trades WHERE id = ?", (result.trade_id,)).fetchone()
+        )
+        assert row["actual_avg_fill_price_cents"] == 50
+        assert row["target_avg_fill_price_cents"] == 50
+        assert row["cap_binding"] == "cap_one"
+        assert row["entry_fees_cents"] is not None
+        assert row["levels_consumed_json"] is not None
+
+    def test_fok_killed_when_book_moves_unfavorably(self, tmp_path: Path) -> None:
+        """Re-walk fills the target QUANTITY but at a HIGHER avg than
+        the engine targeted -> KILL with 'fok_killed_book_moved'.
+
+        Engine sized for target_qty=20, $14 budget, avg=50c. New book
+        has plenty of depth at 70c -> re-walk fills 20 contracts at
+        70c (1400/70 = 20 exact), avg = 70 > 50 -> KILL."""
+        db = _db(tmp_path)
+        match_id = _seed_match(db)
+        intent = _entry_intent_with_walk(
+            match_id=match_id, target_avg=50, target_qty=20, target_budget=1400
+        )
+        approved = _approve(db, intent)
+        executor = DryRunExecutor(
+            db=db,
+            orderbook_fn=lambda _t: _book(bid=68, ask=70),
+            depth_fn=lambda _t: [(70, 1000)],
+        )
+        result = executor.submit(approved)
+        assert result.status == "rejected"
+        assert "FOK killed" in result.notes
+        # No trade row written.
+        rows = list(db.connect().execute("SELECT id FROM trades"))
+        assert rows == []
+        # system_event row written with the right type.
+        events = list(
+            db.connect().execute(
+                "SELECT event_type FROM system_events WHERE event_type LIKE 'fok_killed%'"
+            )
+        )
+        assert len(events) == 1
+        assert events[0]["event_type"] == "fok_killed_book_moved"
+
+    def test_fok_killed_when_insufficient_liquidity(self, tmp_path: Path) -> None:
+        """Re-walk fills fewer contracts than target -> KILL with
+        'fok_killed_insufficient_liquidity'."""
+        db = _db(tmp_path)
+        match_id = _seed_match(db)
+        intent = _entry_intent_with_walk(match_id=match_id, target_qty=40)
+        approved = _approve(db, intent)
+        # Book only has 5 contracts available — far below target 40.
+        executor = DryRunExecutor(
+            db=db,
+            orderbook_fn=lambda _t: _book(bid=49, ask=50),
+            depth_fn=lambda _t: [(50, 5)],
+        )
+        result = executor.submit(approved)
+        assert result.status == "rejected"
+        rows = list(db.connect().execute("SELECT id FROM trades"))
+        assert rows == []
+        events = list(
+            db.connect().execute(
+                "SELECT event_type FROM system_events WHERE event_type LIKE 'fok_killed%'"
+            )
+        )
+        assert events[0]["event_type"] == "fok_killed_insufficient_liquidity"
+
+    def test_fok_killed_when_no_depth_at_all(self, tmp_path: Path) -> None:
+        """depth_fn returns None / empty -> KILL with insufficient_liquidity."""
+        db = _db(tmp_path)
+        match_id = _seed_match(db)
+        intent = _entry_intent_with_walk(match_id=match_id)
+        approved = _approve(db, intent)
+        executor = DryRunExecutor(
+            db=db,
+            orderbook_fn=lambda _t: _book(bid=None, ask=None),
+            depth_fn=lambda _t: None,
+        )
+        result = executor.submit(approved)
+        assert result.status == "rejected"
+        rows = list(db.connect().execute("SELECT id FROM trades"))
+        assert rows == []

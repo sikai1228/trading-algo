@@ -670,6 +670,28 @@ class TradeInsertRow:
     reasoning_text: str
     entered_at: str
 
+    # Phase 3 Part 1 — order-book-walk + fees + FOK audit columns
+    # (added by migration 005). All optional so existing call sites
+    # that don't yet emit them keep working.
+    cap_binding: str | None = None
+    """One of 'cap_one' / 'cap_two' / 'tie' — which cap was active
+    in the engine's sizing decision."""
+
+    cap_one_value_cents: int | None = None
+    cap_two_value_cents: int | None = None
+    target_avg_fill_price_cents: int | None = None
+    """The avg fill price the engine's walk predicted (decision time)."""
+
+    actual_avg_fill_price_cents: int | None = None
+    """The avg fill price the executor's re-walk produced
+    (submission time). Equal to target when the book was stable."""
+
+    slippage_cents: int | None = None
+    entry_fees_cents: int | None = None
+    levels_consumed_json: str | None = None
+    """JSON-encoded list of [price_cents, qty] pairs the executor's
+    re-walk actually consumed."""
+
 
 def insert_trade(db: Database, row: TradeInsertRow) -> int:
     sql = """
@@ -678,13 +700,19 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         entry_price_cents, quantity, cost_basis_usd_cents,
         triggering_match_id, triggering_intent_json,
         risk_decision_id, approval_id, is_reentry, prior_trade_id,
-        reasoning_text, entered_at, created_at
+        reasoning_text, entered_at, created_at,
+        cap_binding, cap_one_value_cents, cap_two_value_cents,
+        target_avg_fill_price_cents, actual_avg_fill_price_cents,
+        slippage_cents, entry_fees_cents, levels_consumed_json
     ) VALUES (
         :ticker, 'yes', 'buy', :status,
         :entry_price_cents, :quantity, :cost_basis_usd_cents,
         :triggering_match_id, :triggering_intent_json,
         :risk_decision_id, :approval_id, :is_reentry, :prior_trade_id,
-        :reasoning_text, :entered_at, :now
+        :reasoning_text, :entered_at, :now,
+        :cap_binding, :cap_one_value_cents, :cap_two_value_cents,
+        :target_avg_fill_price_cents, :actual_avg_fill_price_cents,
+        :slippage_cents, :entry_fees_cents, :levels_consumed_json
     )
     """
     params = {

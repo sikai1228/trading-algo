@@ -175,7 +175,10 @@ async def _amain(config_path: Path) -> int:
             llm_confidence_threshold=cfg.decision.llm_confidence_threshold,
             max_buy_price_cents=cfg.decision.max_buy_price_cents,
             position_size_base_pct=cfg.decision.position_size_base_pct,
-            position_size_cap_usd_cents=cfg.decision.position_size_cap_usd_cents,
+            position_size_hard_cap_cents=cfg.decision.position_size_hard_cap_cents,
+            position_size_volume_pct=cfg.decision.position_size_volume_pct,
+            min_trade_size_contracts=cfg.decision.min_trade_size_contracts,
+            min_trade_value_cents=cfg.decision.min_trade_value_cents,
             total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
             stop_loss_drop_cents=cfg.decision.stop_loss_drop_cents,
         )
@@ -186,7 +189,7 @@ async def _amain(config_path: Path) -> int:
             enabled=cfg.risk.enabled,
             max_buy_price_cents=cfg.decision.max_buy_price_cents,
             total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
-            position_size_cap_usd_cents=cfg.decision.position_size_cap_usd_cents,
+            position_size_hard_cap_cents=cfg.decision.position_size_hard_cap_cents,
             halted=cfg.risk.halted,
         ),
     )
@@ -221,6 +224,28 @@ async def _amain(config_path: Path) -> int:
 
         requester = _StubRequester()
 
+    def _orderbook(ticker: str) -> Quote:
+        # Read from the WS feed's in-memory book if available; fall back
+        # to (None, None) if the ticker isn't subscribed.
+        book = ws_feed._books.get(ticker)  # direct internal read
+        if book is None:
+            return Quote(yes_bid_cents=None, yes_ask_cents=None)
+        return Quote(yes_bid_cents=book.best_yes_bid(), yes_ask_cents=book.best_yes_ask())
+
+    def _depth(ticker: str) -> list[tuple[int, int]] | None:
+        """Phase 3 Part 1: full YES-ask depth for the walker. NO bids
+        are inverted to implied YES asks via :func:`merge_to_yes_asks`
+        and merged with the YES side."""
+        from trumpbot.execution.slippage import merge_to_yes_asks
+
+        book = ws_feed._books.get(ticker)
+        if book is None:
+            return None
+        return merge_to_yes_asks(
+            book.yes_levels_sorted(),
+            book.no_levels_sorted(),
+        )
+
     approval_gate = ApprovalGate(
         db=db,
         config=ApprovalGateConfig(
@@ -230,17 +255,10 @@ async def _amain(config_path: Path) -> int:
             reentry_timeout_sec=cfg.approval.reentry_timeout_sec,
         ),
         requester=requester,  # type: ignore[arg-type]
+        depth_fn=_depth,
     )
 
-    def _orderbook(ticker: str) -> Quote:
-        # Read from the WS feed's in-memory book if available; fall back
-        # to (None, None) if the ticker isn't subscribed.
-        book = ws_feed._books.get(ticker)  # direct internal read
-        if book is None:
-            return Quote(yes_bid_cents=None, yes_ask_cents=None)
-        return Quote(yes_bid_cents=book.best_yes_bid(), yes_ask_cents=book.best_yes_ask())
-
-    dry_run_executor = DryRunExecutor(db=db, orderbook_fn=_orderbook)
+    dry_run_executor = DryRunExecutor(db=db, orderbook_fn=_orderbook, depth_fn=_depth)
 
     bus.subscribe("news_event_ingested", _make_news_metric_handler())
     bus.subscribe("market_discovered", _make_market_metric_handler(db))
@@ -285,6 +303,7 @@ async def _amain(config_path: Path) -> int:
                     gate=approval_gate,
                     executor=dry_run_executor,
                     orderbook=_orderbook,
+                    depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
                     poll_interval_sec=cfg.decision.decision_loop_interval_sec,
                     stop_event=stop_event,
@@ -302,6 +321,7 @@ async def _amain(config_path: Path) -> int:
                     gate=approval_gate,
                     executor=dry_run_executor,
                     orderbook=_orderbook,
+                    depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
                     poll_interval_sec=cfg.decision.stop_loss_loop_interval_sec,
                     stop_event=stop_event,
@@ -330,6 +350,7 @@ async def _amain(config_path: Path) -> int:
                     gate=approval_gate,
                     executor=dry_run_executor,
                     orderbook=_orderbook,
+                    depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
                     poll_interval_sec=cfg.decision.reentry_loop_interval_sec,
                     stop_event=stop_event,

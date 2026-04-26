@@ -149,10 +149,22 @@ decision:
   llm_confidence_threshold: 0.85
   max_buy_price_cents: 80
   position_size_base_pct: 0.08
-  # Hard fixed-dollar cap on per-trade size, in cents. Default $20.00 =
-  # 2000c. The user controls strategy exposure by managing the deposit
-  # on Kalshi rather than via percentage caps that ramp on a date.
-  position_size_cap_usd_cents: 2000
+
+  # ----- Phase 3 Part 1: two-cap sizing system -----
+  # Cap one — hard fixed-dollar ceiling per trade (in cents). Default
+  # $20.00 = 2000c. Easy to raise (e.g. to 50000 = $500) once the
+  # strategy proves itself.
+  position_size_hard_cap_cents: 2000
+  # Cap two — fraction of the market's total traded volume the bot
+  # will take in a single trade. Default 5 %. Cap two evaluates against
+  # ``markets.volume`` × $1/contract, so a brand-new market with no
+  # volume yet effectively disables itself.
+  position_size_volume_pct: 0.05
+  # Skip the trade entirely if the order-book walk fills fewer
+  # contracts than this, OR fewer dollars than min_trade_value_cents.
+  min_trade_size_contracts: 5
+  min_trade_value_cents: 200
+
   total_exposure_cap_pct: 0.30
   stop_loss_drop_cents: 50
   decision_loop_interval_sec: 10

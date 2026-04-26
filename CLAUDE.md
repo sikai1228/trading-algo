@@ -19,11 +19,14 @@ far:
 - **Phase 0** — bootstrap, lint/type/test scaffolding.
 - **Phase 1** — read-only data collection (Kalshi REST/WS, news ingestion,
   matcher, daemon). No orders are placed.
-- **Phase 1.5** — LLM cascade enhanced ingestion (keyword shortlist → Haiku
-  classifier → match row).
-- **Phase 2 (current)** — decision layer with human-in-the-loop. Engine →
-  Risk → Approval → DryRunExecutor pipeline. **Still dry-run only** until
-  the user explicitly enables live trading.
+- **Phase 1.5** — LLM cascade enhanced ingestion (keyword shortlist -> Haiku
+  classifier -> match row).
+- **Phase 2** — decision layer with human-in-the-loop. Engine -> Risk ->
+  Approval -> DryRunExecutor pipeline.
+- **Phase 3 Part 1 (current)** — two-cap position sizing,
+  order-book walking for slippage modeling, Kalshi fee modeling, FOK
+  semantics in dry-run. **Still dry-run only** until Phase 4
+  explicitly enables live order placement.
 
 ---
 
@@ -48,26 +51,33 @@ A news match becomes a buy intent **only if all** of:
 6. `market_state.yes_ask_cents <= 80` (max buy price ceiling)
 7. Sized position is at least 1 contract
 
-**Sizing**:
+**Sizing — Phase 3 Part 1 two-cap system:**
 
-- Base: `8% × confidence` of total bankroll
-- Cap: **fixed dollar amount**, default `$20.00` per trade
-  (`decision.position_size_cap_usd_cents = 2000`). The user controls
-  strategy exposure by managing the deposit on Kalshi rather than via
-  percentage knobs that ramp on a date.
-- Quantity: `floor(target_size_usd_cents / yes_ask_cents)`; if the result is
-  zero, the intent is dropped
-- No date-based cap ramping. No `live_trading_started_at` field.
+The trade size is the **lower** of two caps. Once the cap is chosen,
+the dollar budget feeds an order-book walk (see "Walking the book"
+below) that produces the actual quantity, average fill price,
+slippage, and fees.
 
-**Why a fixed dollar cap.** A percentage cap conflates two unrelated
-controls — "how much of my Kalshi balance is at risk per trade" and
-"how aggressively does the strategy size on signal strength." With a
-fixed cap, those two are orthogonal: signal strength (confidence)
-scales the target up to the ceiling, and the user adjusts strategy
-exposure by depositing more or less on Kalshi. Bankroll still
-governs the **30 % total-exposure cap** across all open positions
-and is referenced in reasoning text, but no longer dictates per-
-trade sizing.
+- **Cap one — hard fixed-dollar ceiling.** Default `$20.00`
+  (`decision.position_size_hard_cap_cents = 2000`). Designed to be
+  raised to $500–1000 once the strategy proves itself. Single
+  config edit.
+- **Cap two — 5 % of market volume.** Default 5 %
+  (`decision.position_size_volume_pct = 0.05`). `markets.volume` is
+  Kalshi's contract-count field; we treat one contract as $1 of
+  notional, so `cap_two_cents = volume x 100 x 0.05 = volume x 5`.
+  Brand-new market with no recorded volume -> cap_two evaluates to
+  $0 -> trading on that ticker is effectively disabled until volume
+  develops.
+- **Effective cap** = `min(cap_one, cap_two)`. Engine records which
+  bound on the intent (`cap_binding ∈ cap_one / cap_two / tie`).
+- **Minimum trade guards.** Skip if walk fills fewer than
+  `min_trade_size_contracts` (default 5) OR walk total cost is below
+  `min_trade_value_cents` (default $2.00).
+
+Bankroll still governs the **30 % total-exposure cap** across all
+open positions and is referenced in reasoning text. It no longer
+dictates per-trade sizing.
 
 ### Stop-loss rules — `DecisionEngine.evaluate_stop_loss`
 
@@ -133,7 +143,96 @@ emits a `RiskApprovedOrder` for the close.
   endpoints. It records simulated fills into `trades` (`status='dry_run'`).
 - Position marks update every 60 s using the WS in-memory book
   (`update_position_marks`).
-- On market resolution, `close_resolved` settles YES at 100 ¢ and NO at 0 ¢.
+- On market resolution, `close_resolved` settles YES at 100 c and NO at 0 c.
+
+---
+
+## Phase 3 Part 1 — walking the book, fees, FOK
+
+Phase 3 Part 1 turned the dry-run pipeline from "simulated fill at the
+top-of-book ask" into "walk the actual depth, charge Kalshi fees,
+submit FOK so book drift kills the trade." Same code runs in the
+backtester; v1 backtest results from before this change are no longer
+comparable to v2.
+
+### Walking the book — `trumpbot/execution/slippage.py`
+
+`walk_orderbook_for_buy(yes_ask_levels, target_dollars_cents,
+max_price_cents=80, fee_calculator=...)` returns an
+`OrderbookWalkResult` with `filled_quantity`, `total_cost_cents`,
+`average_fill_price_cents` (banker's-rounded), `levels_consumed`
+(audit trail of which prices we ate), `slippage_cents` (avg fill −
+best ask), `estimated_fees_cents`, `max_price_reached_cents`. All
+math integer-cents; banker's rounding for determinism (two identical
+walks always produce byte-identical results).
+
+`merge_to_yes_asks(yes_levels, no_levels)` does the standard NO-bid
+inversion: a NO bid at 35 c becomes an implied YES ask at 65 c. The
+walker takes the merged unified ask side.
+
+### Kalshi fees — `trumpbot/execution/fees.py`
+
+`calculate_entry_fee_cents(price_cents, quantity)` and
+`calculate_exit_fee_cents(...)`. Formula: `ceil(0.07 x Q x P x (100 −
+P) / 100)` in cents. Peaks at P = 50 c (1.75 c/contract), tapers
+toward zero at the resolution extremes. The 0.07 constant is from
+https://kalshi.com/docs/fees as of 2026-04-25; if Kalshi updates the
+schedule, update `FEE_RATE` and the test fixtures together.
+
+### FOK semantics — two layers of re-walk
+
+The dry-run executor mirrors what we'll do in Phase 4 with real
+Fill-or-Kill orders:
+
+1. **Engine** walks at decision time and writes the predicted
+   `target_avg_fill_price_cents` onto the `TradeIntent`.
+2. **ApprovalGate** re-walks at user-approval time. If avg fill drifts
+   > 5 c from the original target OR quantity drifts > 20 %, the
+   approval is downgraded to "rejected" and a
+   `fok_killed_book_moved` system event is logged. The user
+   effectively approves "trade this signal under current rules", not
+   "trade these specific contracts".
+3. **DryRunExecutor.submit** re-walks again at submission time. Strict
+   rule: re-walk must fill `target_quantity` at average ≤
+   `target_avg_fill_price_cents`. Anything less -> kill, no row
+   written, `fok_killed_book_moved` or
+   `fok_killed_insufficient_liquidity` system event logged.
+
+### Reasoning-text format
+
+Every `TradeIntent` carries a reasoning string with this structure
+(rendered into Telegram and persisted to `trades.reasoning_text`):
+
+```
+{source} (weight={w}) classified an article matching {ticker} at
+confidence {c}, with interaction_occurred=true.
+
+Current YES ask is {ask}c (max-buy ceiling 80c).
+
+Cap analysis: cap_one=$X, cap_two=$Y (5 % of {volume} contracts of
+market volume). Binding: {cap_one|cap_two|tie}, sizing target $Z.
+
+Order-book walk for $Z: N contracts filled across L levels [N1 @ P1,
+N2 @ P2, ...] at avg P_avg c (best ask: {best}, slippage: {slip}c).
+Estimated Kalshi entry fees: $F.
+
+Total expected cost: $cost (entry) + $F (fees) = $total.
+
+If resolves YES at $1.00, gross P&L = $payoff − $total = $pnl,
+ROI = R%.
+```
+
+### DB columns added by migration 005
+
+`trades` gains `cap_binding`, `cap_one_value_cents`,
+`cap_two_value_cents`, `target_avg_fill_price_cents`,
+`actual_avg_fill_price_cents`, `slippage_cents`, `entry_fees_cents`,
+`exit_fees_cents`, `levels_consumed_json` (JSON array of [price, qty]
+pairs). All NULLABLE -> existing Phase-2 dry-run rows remain valid.
+
+New `system_events.event_type` values:
+- `fok_killed_book_moved` — gate or executor re-walk rejected
+- `fok_killed_insufficient_liquidity` — executor re-walk found no depth
 
 ---
 
@@ -193,7 +292,7 @@ All cross-module data uses Pydantic v2 models with `model_config = ConfigDict(ex
 Every intent flows through this pipeline (in `trumpbot/decision/loops.py`):
 
 ```
-DecisionEngine.evaluate_*  →  RiskManager.check_intent  →  ApprovalGate.request_approval  →  DryRunExecutor.submit
+DecisionEngine.evaluate_*  ->  RiskManager.check_intent  ->  ApprovalGate.request_approval  ->  DryRunExecutor.submit
        (pure)                  (gate, can adjust qty)         (Telegram, blocks)               (records to DB)
 ```
 
@@ -202,7 +301,7 @@ Four daemon loops drive this, all started from `daemon.py`:
 - `decision_loop` — pulls unevaluated `news_market_matches`, runs the entry
   pipeline. Sleeps `decision.poll_interval_sec` between cycles.
 - `stop_loss_loop` — for every open position, runs `evaluate_stop_loss` and
-  the same gate → executor pipeline if triggered.
+  the same gate -> executor pipeline if triggered.
 - `position_marking_loop` — every 60 s, updates `unrealized_pnl_usd_cents`
   for every open position from the WS book.
 - `reentry_loop` — for every closed position, looks for a fresh match in the
@@ -267,7 +366,7 @@ Outputs a summary to stdout and a per-trade CSV to
 5. **One source of truth for subjects** — the matcher merges
    `DEFAULT_SUBJECT_ALIASES` with `subjects_alias_map(db)`. Discovery writes
    to the DB; never bypass.
-6. **Subject-key normalization** — NFKD → ASCII → lowercase → `[a-z]`.
+6. **Subject-key normalization** — NFKD -> ASCII -> lowercase -> `[a-z]`.
 7. **Verb proximity is case-insensitive** — both phrases are lowercased
    before the distance check (regression fix in PR #7).
 8. **Run all four gates before pushing**: `uv run black --check .` ·

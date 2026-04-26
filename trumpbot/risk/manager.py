@@ -36,16 +36,17 @@ class RiskConfig:
     leaves it False; setting it True makes every check fail with
     ``trading_halted`` and is how Phase 3 will plug in the kill switch.
 
-    The per-trade size cap is a fixed dollar amount
-    (``position_size_cap_usd_cents``), default $20.00 = 2000c. The user
-    controls strategy exposure by managing the deposit on Kalshi rather
-    than via percentage caps that ramp on a date.
+    Phase 3 Part 1 renamed ``position_size_cap_usd_cents`` to
+    ``position_size_hard_cap_cents`` to match the engine and to make
+    clear that this is "cap one" of the two-cap system. The walk-aware
+    engine sizes intents below this value, so the risk-side check is a
+    defense-in-depth guard rather than the primary enforcer.
     """
 
     enabled: bool = True
     max_buy_price_cents: int = 80
     total_exposure_cap_pct: float = 0.30
-    position_size_cap_usd_cents: int = 2000
+    position_size_hard_cap_cents: int = 2000
     halted: bool = False
 
 
@@ -131,7 +132,7 @@ class RiskManager:
         # does not reject unless the cap is too tight for one contract).
         adjusted_quantity: int | None = None
         adjustment_reason: str | None = None
-        per_trade_cap_cents = self._cfg.position_size_cap_usd_cents
+        per_trade_cap_cents = self._cfg.position_size_hard_cap_cents
         if intent.target_size_usd_cents > per_trade_cap_cents:
             new_qty = per_trade_cap_cents // intent.target_price_cents
             if new_qty < 1:
@@ -141,7 +142,7 @@ class RiskManager:
                     "size_cap_below_one_contract",
                     f"per-trade cap ${per_trade_cap_cents/100:.2f} less than one "
                     f"contract at {intent.target_price_cents}c",
-                    "position_size_cap_usd_cents",
+                    "position_size_hard_cap_cents",
                 )
             adjustment_reason = (
                 f"fixed-dollar cap reduced quantity from {intent.target_quantity} to "

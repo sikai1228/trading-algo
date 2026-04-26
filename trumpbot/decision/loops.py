@@ -41,6 +41,9 @@ from trumpbot.utils.logging import get_logger
 log = get_logger(__name__)
 
 OrderbookFn = Callable[[str], Quote]
+DepthFn = Callable[[str], list[tuple[int, int]] | None]
+"""Phase 3 Part 1: full YES-ask depth for the engine's walker. The
+daemon wires this to a thin wrapper over the WS feed."""
 
 
 def _bankroll_state(db: Database, *, starting_amount_usd: float) -> BankrollState:
@@ -63,6 +66,7 @@ async def decision_loop(
     gate: ApprovalGate,
     executor: DryRunExecutor,
     orderbook: OrderbookFn,
+    depth: DepthFn,
     starting_amount_usd: float,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
@@ -78,6 +82,7 @@ async def decision_loop(
                 gate=gate,
                 executor=executor,
                 orderbook=orderbook,
+                depth=depth,
                 starting_amount_usd=starting_amount_usd,
             )
         except asyncio.CancelledError:
@@ -104,6 +109,7 @@ async def _run_decision_cycle(
     gate: ApprovalGate,
     executor: DryRunExecutor,
     orderbook: OrderbookFn,
+    depth: DepthFn,
     starting_amount_usd: float,
 ) -> None:
     matches = _fetch_unevaluated_matches(db)
@@ -118,8 +124,11 @@ async def _run_decision_cycle(
         position = _row_to_position(position_row)
         bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
         snap = _row_to_snapshot(match, market_row)
-        market_state = _market_state(orderbook, ticker)
-        intent = engine.evaluate_news_match(snap, market_state, position, bankroll)
+        market_state = _market_state(orderbook, ticker, db=db)
+        levels = depth(ticker) or []
+        intent = engine.evaluate_news_match(
+            snap, market_state, position, bankroll, yes_ask_levels=levels
+        )
         if intent is None:
             continue
         decision = risk.evaluate(
@@ -148,6 +157,7 @@ async def stop_loss_loop(
     gate: ApprovalGate,
     executor: DryRunExecutor,
     orderbook: OrderbookFn,
+    depth: DepthFn,
     starting_amount_usd: float,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
@@ -222,6 +232,7 @@ async def reentry_loop(
     gate: ApprovalGate,
     executor: DryRunExecutor,
     orderbook: OrderbookFn,
+    depth: DepthFn,
     starting_amount_usd: float,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
@@ -243,11 +254,12 @@ async def reentry_loop(
                 if market_row is None:
                     continue
                 snap = _row_to_snapshot(match, market_row)
-                market_state = _market_state(orderbook, ticker)
+                market_state = _market_state(orderbook, ticker, db=db)
                 bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
                 prior_position = _row_to_position(prior_row)
                 if prior_position is None:
                     continue
+                levels = depth(ticker) or []
                 intent = engine.evaluate_reentry(
                     snap,
                     market_state,
@@ -255,6 +267,7 @@ async def reentry_loop(
                     prior_row["status"],
                     prior_row["realized_pnl_usd_cents"],
                     bankroll,
+                    yes_ask_levels=levels,
                 )
                 if intent is None:
                     continue
@@ -311,7 +324,10 @@ def _fetch_unevaluated_matches(db: Database) -> list:  # type: ignore[type-arg]
 def _get_market_row(db: Database, ticker: str):  # type: ignore[no-untyped-def]
     return (
         db.connect()
-        .execute("SELECT ticker, open_ts, close_ts FROM markets WHERE ticker = ?", (ticker,))
+        .execute(
+            "SELECT ticker, open_ts, close_ts, volume FROM markets WHERE ticker = ?",
+            (ticker,),
+        )
         .fetchone()
     )
 
@@ -352,12 +368,20 @@ def _row_to_position(row) -> Position | None:  # type: ignore[no-untyped-def]
     )
 
 
-def _market_state(orderbook: OrderbookFn, ticker: str) -> MarketState:
+def _market_state(
+    orderbook: OrderbookFn, ticker: str, *, db: Database | None = None
+) -> MarketState:
     quote = orderbook(ticker)
+    volume = 0
+    if db is not None:
+        row = _get_market_row(db, ticker)
+        if row is not None:
+            volume = int(row["volume"] or 0)
     return MarketState(
         ticker=ticker,
         yes_bid_cents=quote.yes_bid_cents,
         yes_ask_cents=quote.yes_ask_cents,
+        total_volume_traded_contracts=volume,
     )
 
 

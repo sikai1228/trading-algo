@@ -61,9 +61,27 @@ def _bankroll(
 
 
 def _market(
-    *, yes_bid: int | None = 50, yes_ask: int | None = 50, ticker: str = "KXTRUMPMEET-26APR-VPUT"
+    *,
+    yes_bid: int | None = 50,
+    yes_ask: int | None = 50,
+    ticker: str = "KXTRUMPMEET-26APR-VPUT",
+    volume: int = 100_000,
 ) -> MarketState:
-    return MarketState(ticker=ticker, yes_bid_cents=yes_bid, yes_ask_cents=yes_ask)
+    """Default market has 100 000 contracts of historical volume so
+    cap two = 5 % x 100 000 x $1 = $5 000 — well above the $20 cap_one.
+    Tests that want cap_two to bind override ``volume``."""
+    return MarketState(
+        ticker=ticker,
+        yes_bid_cents=yes_bid,
+        yes_ask_cents=yes_ask,
+        total_volume_traded_contracts=volume,
+    )
+
+
+def _levels(price: int = 50, qty: int = 10_000) -> list[tuple[int, int]]:
+    """Single-level deep book at ``price``. Phase-3 walker needs this
+    to size every intent."""
+    return [(price, qty)]
 
 
 def _engine() -> DecisionEngine:
@@ -77,26 +95,43 @@ def _engine() -> DecisionEngine:
 
 class TestEvaluateNewsMatch:
     def test_happy_path_produces_intent(self) -> None:
-        intent = _engine().evaluate_news_match(_match(confidence=0.9), _market(), None, _bankroll())
+        intent = _engine().evaluate_news_match(
+            _match(confidence=0.9),
+            _market(),
+            None,
+            _bankroll(),
+            yes_ask_levels=_levels(),
+        )
         assert intent is not None
         assert intent.ticker == "KXTRUMPMEET-26APR-VPUT"
         assert intent.target_quantity >= 1
-        assert intent.target_price_cents == 50
+        # target_price_cents is the ceiling now (max-buy 80), not best ask.
+        assert intent.target_price_cents == 80
+        assert intent.target_avg_fill_price_cents == 50  # walked at 50c
+        assert intent.cap_binding == "cap_one"  # $20 < $5000
 
     def test_below_confidence_threshold_returns_none(self) -> None:
         assert (
-            _engine().evaluate_news_match(_match(confidence=0.84), _market(), None, _bankroll())
+            _engine().evaluate_news_match(
+                _match(confidence=0.84), _market(), None, _bankroll(), yes_ask_levels=_levels()
+            )
             is None
         )
 
     def test_at_threshold_passes(self) -> None:
-        out = _engine().evaluate_news_match(_match(confidence=0.85), _market(), None, _bankroll())
+        out = _engine().evaluate_news_match(
+            _match(confidence=0.85), _market(), None, _bankroll(), yes_ask_levels=_levels()
+        )
         assert out is not None
 
     def test_interaction_occurred_false_returns_none(self) -> None:
         assert (
             _engine().evaluate_news_match(
-                _match(interaction_occurred=False), _market(), None, _bankroll()
+                _match(interaction_occurred=False),
+                _market(),
+                None,
+                _bankroll(),
+                yes_ask_levels=_levels(),
             )
             is None
         )
@@ -104,7 +139,11 @@ class TestEvaluateNewsMatch:
     def test_non_approved_source_returns_none(self) -> None:
         assert (
             _engine().evaluate_news_match(
-                _match(is_kalshi_approved=False), _market(), None, _bankroll()
+                _match(is_kalshi_approved=False),
+                _market(),
+                None,
+                _bankroll(),
+                yes_ask_levels=_levels(),
             )
             is None
         )
@@ -118,86 +157,196 @@ class TestEvaluateNewsMatch:
             cost_basis_usd_cents=400,
             triggering_match_id=99,
         )
-        assert _engine().evaluate_news_match(_match(), _market(), position, _bankroll()) is None
+        assert (
+            _engine().evaluate_news_match(
+                _match(), _market(), position, _bankroll(), yes_ask_levels=_levels()
+            )
+            is None
+        )
 
     def test_price_above_ceiling_returns_none(self) -> None:
+        # Top-of-book 81c -> engine fast-fails before walking.
         assert (
-            _engine().evaluate_news_match(_match(), _market(yes_ask=81), None, _bankroll()) is None
+            _engine().evaluate_news_match(
+                _match(),
+                _market(yes_ask=81),
+                None,
+                _bankroll(),
+                yes_ask_levels=_levels(price=81),
+            )
+            is None
         )
 
     def test_price_at_ceiling_passes(self) -> None:
         assert (
-            _engine().evaluate_news_match(_match(), _market(yes_ask=80), None, _bankroll())
+            _engine().evaluate_news_match(
+                _match(),
+                _market(yes_ask=80),
+                None,
+                _bankroll(),
+                yes_ask_levels=_levels(price=80),
+            )
             is not None
         )
 
     def test_no_ask_returns_none(self) -> None:
         assert (
-            _engine().evaluate_news_match(_match(), _market(yes_ask=None), None, _bankroll())
+            _engine().evaluate_news_match(
+                _match(), _market(yes_ask=None), None, _bankroll(), yes_ask_levels=[]
+            )
             is None
         )
 
-    def test_fixed_cap_engages_when_target_above_20_dollars(self) -> None:
-        """$500 bankroll x 8% x 0.95 = $38 unconstrained → cap to $20.
-        At 50c/contract that's 40 contracts ($20.00) exactly."""
-        bank = _bankroll(bankroll_usd_cents=50000)
-        intent = _engine().evaluate_news_match(_match(confidence=0.95), _market(), None, bank)
+    # ---- Two-cap system (Phase 3 Part 1) ----
+
+    def test_cap_one_binds_when_market_volume_is_huge(self) -> None:
+        """Default $20 hard cap should bind on a high-volume market.
+        $20 budget at 50c -> 40 contracts ($20.00)."""
+        intent = _engine().evaluate_news_match(
+            _match(confidence=0.9),
+            _market(volume=100_000),  # cap_two = 5% x 100k x $1 = $5000
+            None,
+            _bankroll(),
+            yes_ask_levels=_levels(qty=10_000),
+        )
         assert intent is not None
+        assert intent.cap_binding == "cap_one"
+        assert intent.cap_one_value_cents == 2000
+        assert intent.cap_two_value_cents == 500_000
         assert intent.target_size_usd_cents == 2000
         assert intent.target_quantity == 40
 
-    def test_fixed_cap_not_engaged_when_target_below_cap(self) -> None:
-        """$200 bankroll x 8% x 0.5 = $8 unconstrained → cap NOT engaged.
-        $8 / 50c = 16 contracts ($8.00).
-
-        Note: confidence=0.5 is below the LLM threshold (0.85), so the
-        engine would normally drop the match before sizing. We override
-        the threshold here to isolate the sizing behavior."""
-        from trumpbot.decision.engine import DecisionConfig
-
-        eng = DecisionEngine(DecisionConfig(llm_confidence_threshold=0.5))
-        bank = _bankroll(bankroll_usd_cents=20000)
-        intent = eng.evaluate_news_match(_match(confidence=0.5), _market(), None, bank)
+    def test_cap_two_binds_when_market_volume_is_thin(self) -> None:
+        """Volume = 200 contracts -> cap_two = 5 % x 200 x $1 = $10.
+        That's < $20 cap_one, so cap_two binds. $10 at 50c = 20 contracts."""
+        intent = _engine().evaluate_news_match(
+            _match(confidence=0.9),
+            _market(volume=200),
+            None,
+            _bankroll(),
+            yes_ask_levels=_levels(qty=10_000),
+        )
         assert intent is not None
-        assert intent.target_size_usd_cents == 800
-        assert intent.target_quantity == 16
+        assert intent.cap_binding == "cap_two"
+        assert intent.cap_one_value_cents == 2000
+        assert intent.cap_two_value_cents == 1000
+        assert intent.target_size_usd_cents == 1000
+        assert intent.target_quantity == 20
+
+    def test_cap_two_zero_disables_trading_on_brand_new_market(self) -> None:
+        """No volume at all -> cap_two = 0 -> effective cap = 0 -> drop."""
+        out = _engine().evaluate_news_match(
+            _match(),
+            _market(volume=0),
+            None,
+            _bankroll(),
+            yes_ask_levels=_levels(qty=10_000),
+        )
+        assert out is None
+
+    def test_caps_equal_reports_tie_binding(self) -> None:
+        """cap_one and cap_two equal -> binding = 'tie'.
+        Volume = 400 -> cap_two = $20 = cap_one."""
+        intent = _engine().evaluate_news_match(
+            _match(confidence=0.9),
+            _market(volume=400),
+            None,
+            _bankroll(),
+            yes_ask_levels=_levels(qty=10_000),
+        )
+        assert intent is not None
+        assert intent.cap_binding == "tie"
+        assert intent.cap_one_value_cents == intent.cap_two_value_cents == 2000
 
     def test_cap_value_read_from_config(self) -> None:
-        """Override `position_size_cap_usd_cents` and confirm the
-        engine respects it. $500 x 8% x 0.95 = $38 → cap at $10 = 1000c
-        → 20 contracts at 50c."""
-        from trumpbot.decision.engine import DecisionConfig
-
-        eng = DecisionEngine(DecisionConfig(position_size_cap_usd_cents=1000))
-        bank = _bankroll(bankroll_usd_cents=50000)
-        intent = eng.evaluate_news_match(_match(confidence=0.95), _market(), None, bank)
+        """Override the hard cap and confirm the engine respects it."""
+        eng = DecisionEngine(DecisionConfig(position_size_hard_cap_cents=1000))
+        intent = eng.evaluate_news_match(
+            _match(confidence=0.95),
+            _market(volume=100_000),
+            None,
+            _bankroll(),
+            yes_ask_levels=_levels(qty=10_000),
+        )
         assert intent is not None
         assert intent.target_size_usd_cents == 1000
         assert intent.target_quantity == 20
 
-    def test_reasoning_text_says_cap_engaged_when_engaged(self) -> None:
-        bank = _bankroll(bankroll_usd_cents=50000)
-        intent = _engine().evaluate_news_match(_match(confidence=0.95), _market(), None, bank)
+    def test_volume_pct_value_read_from_config(self) -> None:
+        """Override cap_two pct and confirm the engine respects it.
+        10 % x 200 contracts x $1 = $20 — same as cap_one -> tie."""
+        eng = DecisionEngine(DecisionConfig(position_size_volume_pct=0.10))
+        intent = eng.evaluate_news_match(
+            _match(confidence=0.9),
+            _market(volume=200),
+            None,
+            _bankroll(),
+            yes_ask_levels=_levels(qty=10_000),
+        )
         assert intent is not None
-        # When the cap is engaged the text cites the unconstrained
-        # confidence-scaled target ($38) and the $20 cap.
-        assert "capped at fixed $20.00" in intent.reasoning_text
-        assert "$38" in intent.reasoning_text
+        assert intent.cap_two_value_cents == 2000
 
-    def test_reasoning_text_says_under_cap_when_not_engaged(self) -> None:
-        from trumpbot.decision.engine import DecisionConfig
+    # ---- Walker integration ----
 
-        eng = DecisionEngine(DecisionConfig(llm_confidence_threshold=0.5))
-        bank = _bankroll(bankroll_usd_cents=20000)
-        intent = eng.evaluate_news_match(_match(confidence=0.5), _market(), None, bank)
+    def test_intent_carries_walk_audit_fields(self) -> None:
+        """Walking a multi-level book populates levels_consumed,
+        slippage_cents, estimated_fees_cents."""
+        intent = _engine().evaluate_news_match(
+            _match(confidence=0.9),
+            _market(volume=100_000),
+            None,
+            _bankroll(),
+            yes_ask_levels=[(50, 5), (60, 5), (70, 100)],
+        )
         assert intent is not None
-        assert "under $20.00 cap" in intent.reasoning_text
+        # Walked: 5 @ 50 ($2.50), 5 @ 60 ($3.00), then 22 @ 70 ($15.40)
+        # for total $20.90 — wait, budget is $20 so we stop earlier:
+        # 5 @ 50 = 250, 5 @ 60 = 300 (running 550), at 70 affordable =
+        # (2000-550)//70 = 20, take 20 @ 70 = 1400. Total = 1950, qty = 30.
+        assert intent.target_size_usd_cents == 1950
+        assert intent.target_quantity == 30
+        assert intent.levels_consumed == [(50, 5), (60, 5), (70, 20)]
+        assert intent.slippage_cents > 0
+        assert intent.estimated_fees_cents > 0
+        assert intent.target_avg_fill_price_cents == 65  # 1950/30 = 65 exact
 
-    def test_below_one_contract_returns_none(self) -> None:
-        # $5 bankroll cannot afford a single contract at 80¢.
-        bank = _bankroll(bankroll_usd_cents=500)
-        out = _engine().evaluate_news_match(_match(), _market(yes_ask=80), None, bank)
+    def test_walk_with_no_acceptable_levels_returns_none(self) -> None:
+        """Top-of-book passes the ceiling check (80c) but ALL levels
+        are above it after merging — walker fills 0."""
+        out = _engine().evaluate_news_match(
+            _match(),
+            _market(yes_ask=80),
+            None,
+            _bankroll(),
+            yes_ask_levels=[(85, 1000)],  # no level <= 80c
+        )
         assert out is None
+
+    def test_min_trade_size_skips_when_walk_too_small(self) -> None:
+        """Walker fills 2 contracts (under min 5) -> drop."""
+        out = _engine().evaluate_news_match(
+            _match(),
+            _market(volume=100_000),
+            None,
+            _bankroll(),
+            yes_ask_levels=[(50, 2)],  # only 2 contracts available
+        )
+        assert out is None
+
+    def test_min_trade_value_skips_when_walk_too_cheap(self) -> None:
+        """Override min_trade_size_contracts to allow few contracts but
+        keep min_trade_value_cents at default $2.00. Walk: 5 @ 30c = $1.50 < $2.00."""
+        eng = DecisionEngine(DecisionConfig(min_trade_size_contracts=1, min_trade_value_cents=200))
+        out = eng.evaluate_news_match(
+            _match(),
+            _market(yes_ask=30, volume=100_000),
+            None,
+            _bankroll(),
+            yes_ask_levels=[(30, 5)],
+        )
+        assert out is None
+
+    # ---- Article-window + reasoning ----
 
     def test_article_outside_market_window_returns_none(self) -> None:
         m = _match(
@@ -205,29 +354,42 @@ class TestEvaluateNewsMatch:
             market_open_ts="2026-04-01T00:00:00Z",
             market_close_ts="2026-04-30T23:59:59Z",
         )
-        assert _engine().evaluate_news_match(m, _market(), None, _bankroll()) is None
+        assert (
+            _engine().evaluate_news_match(m, _market(), None, _bankroll(), yes_ask_levels=_levels())
+            is None
+        )
 
     def test_article_undated_fails_closed(self) -> None:
         m = _match(article_published_ts=None)
-        assert _engine().evaluate_news_match(m, _market(), None, _bankroll()) is None
+        assert (
+            _engine().evaluate_news_match(m, _market(), None, _bankroll(), yes_ask_levels=_levels())
+            is None
+        )
 
     def test_reasoning_text_cites_required_components(self) -> None:
         intent = _engine().evaluate_news_match(
             _match(confidence=0.9, source_name="reuters_via_gnews"),
-            _market(yes_ask=42),
+            _market(yes_ask=42, volume=100_000),
             None,
             _bankroll(),
+            yes_ask_levels=_levels(price=42, qty=10_000),
         )
         assert intent is not None
         text = intent.reasoning_text
-        # Source named, confidence stated, ceiling cited, sizing
-        # rationale shown — these are the auditability requirements
-        # from the strategy spec.
+        # Phase 3 reasoning text must include: source, confidence, ceiling,
+        # cap analysis, walk depth + avg + slippage + fees, total cost,
+        # YES-resolution P&L scenario.
         assert "reuters_via_gnews" in text
         assert "0.9" in text
         assert "80c" in text
-        # Sizing rationale always quotes the dollar cap.
-        assert "$20.00" in text
+        assert "Cap analysis" in text
+        assert "cap_one" in text
+        assert "cap_two" in text
+        assert "Order-book walk" in text
+        assert "slippage" in text
+        assert "fees" in text
+        assert "Total expected cost" in text
+        assert "ROI" in text
 
 
 # ---------------------------------------------------------------------------
@@ -247,14 +409,14 @@ class TestEvaluateStopLoss:
         )
 
     def test_drop_below_threshold_returns_none(self) -> None:
-        # Entry 80, bid 31 → drop 49, below 50 threshold.
+        # Entry 80, bid 31 -> drop 49, below 50 threshold.
         out = _engine().evaluate_stop_loss(
             self._pos(entry=80), MarketState(ticker="X", yes_bid_cents=31, yes_ask_cents=33)
         )
         assert out is None
 
     def test_drop_exactly_at_threshold_fires(self) -> None:
-        # Entry 80, bid 30 → drop 50, exactly at threshold.
+        # Entry 80, bid 30 -> drop 50, exactly at threshold.
         out = _engine().evaluate_stop_loss(
             self._pos(entry=80), MarketState(ticker="X", yes_bid_cents=30, yes_ask_cents=32)
         )
@@ -341,12 +503,16 @@ class TestEvaluateReentry:
             "dry_run_closed_stop",
             -100,
             _bankroll(),
+            yes_ask_levels=_levels(price=40),
         )
         assert out is not None
         assert out.is_reentry is True
         assert out.prior_trade_id == 99
         assert out.prior_trade_outcome == "dry_run_closed_stop"
         assert out.prior_trade_realized_pnl_usd_cents == -100
+        # Phase 3 audit fields propagate from the synthesized intent.
+        assert out.target_avg_fill_price_cents == 40
+        assert out.cap_binding == "cap_one"
 
     def test_fresh_match_after_resolution_proposes(self) -> None:
         out = _engine().evaluate_reentry(
@@ -356,6 +522,7 @@ class TestEvaluateReentry:
             "dry_run_closed_resolved",
             +400,
             _bankroll(),
+            yes_ask_levels=_levels(price=40),
         )
         assert out is not None
         assert out.prior_trade_outcome == "dry_run_closed_resolved"
@@ -370,7 +537,11 @@ def test_no_float_in_intent() -> None:
     """A drift bug would silently turn target_price_cents into a float
     once we multiply by a confidence score. Pin int type."""
     intent = _engine().evaluate_news_match(
-        _match(confidence=0.873), _market(yes_ask=42), None, _bankroll()
+        _match(confidence=0.873),
+        _market(yes_ask=42),
+        None,
+        _bankroll(),
+        yes_ask_levels=_levels(price=42),
     )
     assert intent is not None
     assert isinstance(intent.target_price_cents, int)

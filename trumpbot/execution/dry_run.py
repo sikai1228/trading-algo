@@ -1,20 +1,32 @@
 """DryRunExecutor — simulated order placement against the live orderbook.
 
-Phase 2's executor of record. Inserts a row into ``trades`` for every
-"filled" entry/reentry, and updates the row to a closed state on
-stop-loss exits or market resolution.
+Phase 3 Part 1 made the dry-run executor walk-aware and FOK-aware so
+its behavior matches what we'll do in Phase 4 with real Fill-or-Kill
+orders. The executor:
 
-All money math is integer cents. The ``ExecutionResult`` returned to
-the caller mirrors the row written so callers can act without an extra
-DB round trip.
+1. Re-fetches the order book at submission time (not stale from
+   decision time). The book may have moved during the user's approval
+   window.
+2. Re-walks the book for the intent's target dollar budget.
+3. **Fills** if the re-walk produces ``filled_quantity ==
+   intent.target_quantity`` at average price ≤
+   ``intent.target_avg_fill_price_cents`` — same trade, possibly
+   slightly different actual avg.
+4. **Kills** otherwise. No row is written. A ``fok_killed`` system
+   event is logged; the gate's Telegram message is updated to
+   "Order killed: book moved unfavorably".
 
-Phase 4 will add a sibling ``KalshiExecutor`` that talks to the
-exchange. The interface (``Executor.submit``) is identical.
+Backtester goes through the same code path so historical replays
+reflect realistic FOK behavior.
+
+Phase 4 will add a sibling ``KalshiExecutor`` that places real FOK
+orders. The interface (``Executor.submit``) is identical.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -23,10 +35,13 @@ from trumpbot.db.repositories import (
     TradeInsertRow,
     close_trade,
     get_open_trade_for_ticker,
+    insert_system_event,
     insert_trade,
     list_open_trades,
     update_trade_marks,
 )
+from trumpbot.execution.fees import calculate_entry_fee_cents
+from trumpbot.execution.slippage import walk_orderbook_for_buy
 from trumpbot.types.intents import (
     ExecutionResult,
     ReentryIntent,
@@ -43,9 +58,15 @@ class _Quote:
 
 
 # Type alias: the orderbook callable the executor uses to read live
-# prices. Daemon wiring passes a thin wrapper over the WS feed; tests
-# pass a static dict.
+# top-of-book prices for stop-loss / position-marking. Daemon wiring
+# passes a thin wrapper over the WS feed; tests pass a static dict.
 OrderbookFn = Callable[[str], _Quote]
+
+# Type alias: the order-book-depth callable the executor uses for the
+# FOK re-walk on entry submissions. Returns the unified yes-ask side
+# of the live book (NO bids already inverted), or ``None`` when the
+# book is unavailable.
+DepthFn = Callable[[str], Sequence[tuple[int, int]] | None]
 
 
 def _utcnow_iso() -> str:
@@ -53,15 +74,29 @@ def _utcnow_iso() -> str:
 
 
 class DryRunExecutor:
-    """Phase 2 simulated executor.
+    """Phase 3 walk-aware, FOK-aware simulated executor.
 
     Honors the type-system chokepoint: ``submit`` accepts only
     :class:`RiskApprovedOrder`, never a raw intent.
+
+    The ``depth_fn`` callable is required for entry / re-entry
+    submissions — the executor re-walks the book at submission time
+    and refuses to fill if the walk doesn't produce the target
+    quantity at an acceptable average. ``orderbook_fn`` is still used
+    for the stop-loss path (which only needs the best YES bid) and
+    for ``update_position_marks``.
     """
 
-    def __init__(self, *, db: Database, orderbook_fn: OrderbookFn) -> None:
+    def __init__(
+        self,
+        *,
+        db: Database,
+        orderbook_fn: OrderbookFn,
+        depth_fn: DepthFn | None = None,
+    ) -> None:
         self._db = db
         self._quote_fn = orderbook_fn
+        self._depth_fn = depth_fn
 
     # -- main API -----------------------------------------------------
 
@@ -103,7 +138,7 @@ class DryRunExecutor:
         row = get_open_trade_for_ticker(self._db, ticker)
         if row is None:
             return None
-        # YES contract pays out 100¢ on YES resolution, 0¢ on NO.
+        # YES contract pays out 100c on YES resolution, 0c on NO.
         payoff_cents = 100 if resolution == "settled_yes" else 0
         proceeds_cents = payoff_cents * row["quantity"]
         realized = proceeds_cents - row["cost_basis_usd_cents"]
@@ -129,6 +164,126 @@ class DryRunExecutor:
     def _submit_buy(
         self, intent: TradeIntent | ReentryIntent, approved: RiskApprovedOrder
     ) -> ExecutionResult:
+        """Phase 3 FOK semantics. Re-walk the book at submission time;
+        fill iff the re-walk produces the same target quantity at an
+        average ≤ the original ``target_avg_fill_price_cents``."""
+        # Path A: depth callable not configured. Fall back to the
+        # Phase-2 simple-ask fill — used by older tests until they
+        # migrate. Production daemon always wires depth_fn.
+        if self._depth_fn is None:
+            return self._submit_buy_legacy(intent, approved)
+
+        levels = self._depth_fn(intent.ticker)
+        if not levels:
+            self._log_killed(
+                ticker=intent.ticker,
+                kind="fok_killed_insufficient_liquidity",
+                reason="no order-book depth available at submission time",
+            )
+            return ExecutionResult(
+                trade_id=-1,
+                status="rejected",
+                notes="FOK killed: no depth at submission",
+            )
+
+        target_qty = approved.adjusted_quantity or intent.target_quantity
+        target_avg = intent.target_avg_fill_price_cents
+        target_budget = intent.target_size_usd_cents
+        # Re-walk for the same dollar budget the engine sized for.
+        rewalk = walk_orderbook_for_buy(
+            levels,
+            target_dollars_cents=target_budget,
+            max_price_cents=intent.target_price_cents,
+            fee_calculator=calculate_entry_fee_cents,
+        )
+
+        # FOK kill conditions: filled less than target, OR avg fill
+        # exceeds the original target avg. Either is "book moved
+        # unfavorably between approval and submission".
+        if rewalk.filled_quantity < target_qty:
+            self._log_killed(
+                ticker=intent.ticker,
+                kind="fok_killed_insufficient_liquidity",
+                reason=(
+                    f"re-walk filled {rewalk.filled_quantity} < target " f"{target_qty} contracts"
+                ),
+            )
+            return ExecutionResult(
+                trade_id=-1,
+                status="rejected",
+                notes=(
+                    f"FOK killed: re-walk filled {rewalk.filled_quantity} "
+                    f"of {target_qty} contracts"
+                ),
+            )
+
+        if target_avg > 0 and rewalk.average_fill_price_cents > target_avg:
+            self._log_killed(
+                ticker=intent.ticker,
+                kind="fok_killed_book_moved",
+                reason=(
+                    f"re-walk avg {rewalk.average_fill_price_cents}c > " f"target avg {target_avg}c"
+                ),
+            )
+            return ExecutionResult(
+                trade_id=-1,
+                status="rejected",
+                notes=(
+                    f"FOK killed: avg fill {rewalk.average_fill_price_cents}c "
+                    f"> target {target_avg}c"
+                ),
+            )
+
+        # Re-walk passed FOK gate. Use NEW (re-walked) numbers, not
+        # stale decision-time numbers.
+        actual_qty = rewalk.filled_quantity
+        actual_avg = rewalk.average_fill_price_cents
+        actual_cost = rewalk.total_cost_cents
+        trade_id = insert_trade(
+            self._db,
+            TradeInsertRow(
+                ticker=intent.ticker,
+                status="dry_run",
+                entry_price_cents=actual_avg,
+                quantity=actual_qty,
+                cost_basis_usd_cents=actual_cost,
+                triggering_match_id=intent.triggering_match_id,
+                triggering_intent_json=intent.model_dump_json(),
+                risk_decision_id=approved.risk_decision_id,
+                approval_id=None,
+                is_reentry=isinstance(intent, ReentryIntent),
+                prior_trade_id=getattr(intent, "prior_trade_id", None),
+                reasoning_text=intent.reasoning_text,
+                entered_at=_utcnow_iso(),
+                # Phase 3 audit columns from the re-walk.
+                cap_binding=intent.cap_binding,
+                cap_one_value_cents=intent.cap_one_value_cents,
+                cap_two_value_cents=intent.cap_two_value_cents,
+                target_avg_fill_price_cents=intent.target_avg_fill_price_cents,
+                actual_avg_fill_price_cents=actual_avg,
+                slippage_cents=rewalk.slippage_cents,
+                entry_fees_cents=rewalk.estimated_fees_cents,
+                levels_consumed_json=json.dumps(rewalk.levels_consumed),
+            ),
+        )
+        return ExecutionResult(
+            trade_id=trade_id,
+            status="filled",
+            fill_price_cents=actual_avg,
+            fill_quantity=actual_qty,
+            notes=(
+                f"FOK fill: {actual_qty} contracts at avg {actual_avg}c "
+                f"(target avg {target_avg}c, slippage {rewalk.slippage_cents}c, "
+                f"fees ${rewalk.estimated_fees_cents/100:.2f})"
+            ),
+        )
+
+    def _submit_buy_legacy(
+        self, intent: TradeIntent | ReentryIntent, approved: RiskApprovedOrder
+    ) -> ExecutionResult:
+        """Pre-Phase-3 fallback used when ``depth_fn`` isn't configured.
+        Simulated fill at top-of-book ask; no FOK gate. Kept so older
+        tests can still construct an executor without supplying depth."""
         quote = self._quote_fn(intent.ticker)
         if quote.yes_ask_cents is None:
             return ExecutionResult(
@@ -136,9 +291,6 @@ class DryRunExecutor:
                 status="rejected",
                 notes="no ask available at submission time",
             )
-        # Simulated fill at the current ask. Slippage modeling is
-        # Phase 3 — this overstates real fill quality but is consistent
-        # for backtesting (same code path runs in both).
         fill_price = min(quote.yes_ask_cents, intent.target_price_cents)
         quantity = approved.adjusted_quantity or intent.target_quantity
         cost_basis = fill_price * quantity
@@ -165,7 +317,19 @@ class DryRunExecutor:
             status="filled",
             fill_price_cents=fill_price,
             fill_quantity=quantity,
-            notes="dry-run entry simulated at current ask",
+            notes="dry-run entry (legacy top-of-book fill)",
+        )
+
+    def _log_killed(self, *, ticker: str, kind: str, reason: str) -> None:
+        """Persist a system_event row + log so the audit trail
+        captures every FOK-killed order."""
+        insert_system_event(
+            self._db,
+            event_type=kind,
+            severity="warning",
+            component="dry_run_executor",
+            message=f"FOK killed for {ticker}: {reason}",
+            detail={"ticker": ticker, "reason": reason},
         )
 
     def _submit_stop_loss(

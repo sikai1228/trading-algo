@@ -502,17 +502,28 @@ def _dollars_signed(cents: int) -> str:
     return f"{'+' if cents >= 0 else '-'}${abs(cents) / 100:.2f}"
 
 
+_ET = "America/New_York"
+
+
 def _now_et_short() -> str:
-    """HH:MM ET. Avoids zoneinfo-dependency-on-Linux issues by using
-    UTC offset literally for now -- the daemon's timezone is fine for
-    a casual heartbeat label."""
-    return datetime.now(UTC).strftime("%H:%M UTC")
+    """``HH:MM ET`` (auto-handles EST vs EDT via tz database)."""
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(UTC).astimezone(ZoneInfo(_ET)).strftime("%H:%M ET")
 
 
 def _format_et(iso: str | None) -> str:
+    """Format a stored ISO-8601-UTC timestamp as ``YYYY-MM-DD HH:MM ET``
+    for display. The DB always stores UTC; the user always sees ET."""
     if not iso:
         return "n/a"
-    return iso.replace("T", " ").replace("Z", " UTC")[:19]
+    from zoneinfo import ZoneInfo
+
+    try:
+        ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return "n/a"
+    return ts.astimezone(ZoneInfo(_ET)).strftime("%Y-%m-%d %H:%M ET")
 
 
 def _ago(iso: str | None) -> str:

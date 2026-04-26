@@ -558,6 +558,45 @@ Outputs a summary to stdout and a per-trade CSV to
 
 ---
 
+## macOS deployment — the launchd-TCC + secrets gotcha
+
+Two bugs we hit on first redeploy that aren't obvious from reading
+the code:
+
+1. **launchd doesn't source `~/.config/trumpbot/secrets.env`.** The
+   daemon's config loader does `${TELEGRAM_BOT_TOKEN}` env-var
+   substitution; without those vars set, `cfg.telegram.bot_token`
+   is empty, the Telegram bot isn't constructed, and all 4 scheduled
+   loops are skipped (`task_count: 8` instead of `12`). Symptom:
+   bot is silent in Telegram even though the daemon process is alive.
+
+2. **macOS TCC blocks launchd from reading `~/Desktop/`.** Since
+   Mojave, launchd-spawned processes need "Full Disk Access" to
+   read Desktop / Documents / Downloads. The wrapper script must
+   live OUTSIDE `~/Desktop/`. Symptom: launchd logs `exit 127` and
+   `/bin/zsh: can't open input file: ...`.
+
+**Fix shipped:** `deploy/run_trumpbot.sh` is the shell wrapper that
+sources `secrets.env` and execs the daemon. `deploy/setup_macos.sh`
+copies the wrapper to `~/Library/Application Support/trumpbot/bin/`
+(TCC-friendly), templates the plist with `$HOME`, and (re)loads the
+agent. Run it on every redeploy:
+
+```
+deploy/setup_macos.sh
+```
+
+The plist's `ProgramArguments` is `/bin/zsh` + the wrapper path —
+NOT the python entrypoint directly. That way launchd doesn't need
+to know about uv or Desktop or env vars; the wrapper handles all
+three.
+
+All user-facing timestamps go through `zoneinfo.ZoneInfo("America/
+New_York")` and render as `HH:MM ET` (auto-handles EST vs EDT).
+Database storage stays UTC ISO-8601; only the display layer is ET.
+
+---
+
 ## When picking up a new task
 
 1. Read this file end to end.

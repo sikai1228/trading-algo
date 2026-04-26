@@ -134,7 +134,12 @@ class TelegramApprovalBot:
         if app.updater is not None:
             await app.updater.start_polling(drop_pending_updates=True)
         self._app = app
-        log.info("telegram_bot_started")
+        log.info(
+            "telegram_bot_started",
+            app_running=app.running,
+            updater_running=(app.updater.running if app.updater else None),
+            handlers=len(app.handlers.get(0, [])),
+        )
 
     async def stop(self) -> None:
         if self._app is None:
@@ -225,6 +230,13 @@ class TelegramApprovalBot:
         msg = update.message
         if msg is None:
             return
+        # Log every inbound command attempt so the audit trail is
+        # complete (allowlist failures + rate limits also log below).
+        log.info(
+            "telegram_command_received",
+            chat_id=msg.chat.id,
+            text=(msg.text or "")[:120],
+        )
         if msg.chat.id != self._chat_id_int:
             log.warning("telegram_command_from_unauthorized_chat", chat_id=msg.chat.id)
             # Phase 3 Part 2 spec: write a system_events row so the

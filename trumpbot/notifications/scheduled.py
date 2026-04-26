@@ -36,7 +36,6 @@ from trumpbot.db.connection import Database
 from trumpbot.db.repositories import (
     get_source_status,
     get_system_state,
-    list_active_snoozed_markets,
     list_open_trades,
     list_source_status,
     upsert_source_status,
@@ -501,7 +500,7 @@ def _humanize_duration(td: timedelta) -> str:
 
 
 # Used to satisfy unused-import lints on infrequent paths.
-_ = (get_source_status, get_system_state, list_active_snoozed_markets)
+_ = (get_source_status, get_system_state)
 
 
 # ---------------------------------------------------------------------------

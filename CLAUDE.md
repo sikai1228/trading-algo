@@ -35,14 +35,15 @@ far:
 - **Phase 3 Part 1** — two-cap position sizing, order-book walking
   for slippage modeling, Kalshi fee modeling, FOK semantics in
   dry-run.
-- **Phase 3 Part 2 (current)** — operational features. Full Telegram
-  command surface (`/status`, `/positions`, `/halt`, `/resume`,
-  `/snooze`, `/why`, `/history`, `/heartbeat`, `/spend`, `/mode`).
-  Scheduled messages (heartbeat, daily digest, settlement
-  notifications, source-health alerts). Categorized alert system
-  (critical/warning/info). LLM-based subject-alias enrichment when new
-  markets are discovered. **Still dry-run only** until Phase 4
-  explicitly enables live order placement.
+- **Phase 3 Part 2** — operational features. Telegram command
+  surface (`/status`, `/positions`, `/halt`, `/resume`, `/why`,
+  `/history`, `/heartbeat`, `/spend`, `/mode`). Scheduled messages
+  (heartbeat, daily digest, settlement notifications, source-health
+  alerts). Categorized alert system (critical/warning/info).
+  LLM-based subject-alias enrichment when new markets are
+  discovered. (Phase 4 Part 2.9 removed the per-ticker `/snooze`
+  and `/unsnooze` commands; `/halt` + `/resume` are the sole
+  operator override.)
 
 ---
 
@@ -56,18 +57,22 @@ updating the test suite (`tests/test_decision_engine.py`,
 
 A news match becomes a buy intent **only if all** of:
 
-1. `match.confidence >= 0.85` (LLM cascade confidence threshold)
-2. `match.interaction_occurred is True` (LLM explicitly classified the
-   article as proving a qualifying interaction; keyword-only matches never
-   trigger trades)
-3. `match.is_kalshi_approved is True` (source is on the Kalshi-approved list)
-4. No open position in this ticker (one entry per cycle)
-5. The article timestamp is inside the market's open/close window
+1. `match.interaction_occurred is True` — the LLM cascade explicitly
+   classified the article as proving a qualifying interaction.
+   Keyword-only matches never trigger trades. **Phase 4 Part 2.9
+   removed the `confidence >= 0.85` threshold gate**: the trigger is
+   yes/no, no gradient. The Haiku confidence float is recorded in
+   `llm_classifications.parsed_confidence` for audit and shadow
+   analysis but does not drive any decision.
+2. `match.is_kalshi_approved is True` (source is on the Kalshi-approved
+   list — all approved sources weighted equally; one confirms)
+3. No open position in this ticker (one entry per cycle)
+4. The article timestamp is inside the market's open/close window
    (fail-closed if the article is undated)
-6. `market_state.yes_ask_cents <= 90` (max buy price ceiling — raised
+5. `market_state.yes_ask_cents <= 90` (max buy price ceiling — raised
    from 80 c to 90 c in Phase 4 Part 2.5 to capture the post-news leg
    between 80-90 c)
-7. Sized position is at least 1 contract
+6. Sized position is at least 1 contract
 
 **Sizing — Phase 3 Part 1 two-cap system:**
 
@@ -357,28 +362,24 @@ severity, and sends to Telegram with the template's audibility.
 - `/halt` — pause new trade proposals (sets
   `system_state.halt_flag = 'true'`)
 - `/resume` — resume new trade proposals
-- `/snooze <ticker> [duration]` — silence one market (e.g.
-  `/snooze X 24h`); duration accepts `24h`, `30m`, `3d`, `2h30m`
-- `/unsnooze <ticker>` — resume one market
 - `/heartbeat` — quick liveness check
 - `/help` — full command list
+
+(Phase 4 Part 2.9 removed `/snooze` and `/unsnooze`. The per-ticker
+silence didn't earn its operational complexity; `/halt` + `/resume`
+are the global override the operator uses.)
 
 Validation: messages from non-allowlisted chat IDs are silently
 dropped with a warning log. Commands rate-limit at 30/min/chat
 (defends against stolen-session abuse). Unknown commands reply with
 the `command_reply_unknown` template.
 
-### Halt + snooze plumbing
+### Halt plumbing
 
 **`/halt`** sets `system_state.halt_flag='true'`. Both the decision
 loop and the re-entry loop check `_is_halted(db)` at the start of
 every cycle and early-return if halted. Stop-losses are NOT gated —
 the user must still be able to approve emergency exits.
-
-**`/snooze <ticker>`** writes a row to `snoozed_markets`. The decision
-loop calls `is_market_snoozed(db, ticker)` per match and skips with a
-`trade_skipped_snoozed` system event. Snoozes auto-expire when
-`snoozed_until` passes; no cleanup task needed.
 
 ### Scheduled loops (in addition to the four Phase 2 decision loops)
 
@@ -415,6 +416,8 @@ doesn't repeat).
 ### DB schema additions (migration 006)
 
 - `snoozed_markets` — per-ticker `/snooze` state (FK to markets).
+  *Dropped by migration 012 in Phase 4 Part 2.9 along with the
+  /snooze command.*
 - `system_state` — generic key/value bag, seeded with `halt_flag='false'`.
 - `source_status` — per-news-source health for the source-health loop.
 - `alert_dedup` — short-window dedup of categorized-alert sends.
@@ -424,8 +427,6 @@ doesn't repeat).
 
 - `alert_critical_*` / `alert_warning_*` / `alert_info_*` — every alert
   send writes one of these (matches the template name for grep-ability).
-- `trade_skipped_snoozed` — decision loop skipped a match because the
-  ticker is snoozed.
 
 ---
 
@@ -1197,6 +1198,136 @@ two are kept in lockstep.
 4. If the contract text changes mid-month, re-run
    `scripts/snapshot_contract.py`; the daemon's hash-drift alert
    will fire automatically on the next call.
+
+---
+
+## Phase 4 Part 2.9 — targeted cleanup
+
+Removes accumulated dead code, defensive workarounds, and unused
+features after the LLM cascade landed. Pipeline behavior unchanged;
+less code, fewer config fields, fewer dead paths.
+
+### What was removed
+
+1. **Per-ticker `/snooze` and `/unsnooze`.** `/halt` + `/resume`
+   are the sole operator override now. Removed: command handlers
+   in `notifications/commands.py`, repo helpers
+   (`upsert_snoozed_market`, `delete_snoozed_market`,
+   `is_market_snoozed`, `list_active_snoozed_markets`,
+   `SnoozedMarketRow`), decision-loop checks, the
+   `snoozed_markets` table (migration 012), the
+   `command_reply_snooze` / `command_reply_unsnooze` templates,
+   the `parse_duration` helper, the `trade_skipped_snoozed`
+   system-event type, and the `snoozed_count` field on
+   `command_reply_status` / `command_reply_mode`. Stop-losses
+   were never gated by snooze and are not affected. Pinned by
+   `tests/test_halt.py::test_snooze_repo_helpers_are_gone` and
+   `test_snoozed_markets_table_is_dropped`.
+
+2. **`llm_confidence_threshold` engine gate.** The trade trigger
+   is now the LLM's `interaction_occurred` boolean alone. Yes or
+   no, no gradient. The Haiku confidence float is recorded in
+   `llm_classifications.parsed_confidence` for audit and shadow
+   analysis but does not drive any decision. Removed from
+   `DecisionConfig`, `DecisionPhaseConfig` (config field),
+   `cfg.decision.llm_confidence_threshold` wiring in `daemon.py`,
+   `backtester.replay._matches_in_window` (now filters on
+   `parsed_interaction_occurred = 1` directly), and the
+   `Confidence: {confidence}` line on `trade_proposal_entry` /
+   `trade_proposal_reentry` Telegram messages. The prompt
+   template at `trumpbot/news/prompts/cascade_classifier_v1.txt`
+   was updated to tell the LLM "confidence is logged for audit
+   but does not gate trade decisions; if the article is
+   ambiguous, return `interaction_occurred=false`, do not hedge
+   with low confidence." Pinned by
+   `tests/test_decision_engine.py::test_low_confidence_with_interaction_true_still_produces_intent`
+   and `::test_high_confidence_but_interaction_false_returns_none`.
+
+3. **`position_size_base_pct` config field.** Dead since Phase 3
+   Part 1 (the two-cap system replaced confidence-weighted
+   sizing); the field was wired through but no production code
+   read it. Removed from `DecisionConfig`,
+   `DecisionPhaseConfig`, `daemon.py`, and `config.example.yaml`.
+
+4. **Defensive workarounds in `_row_to_snapshot`.** The Phase
+   1.5 LLM cascade is now in production (PR #22, migration 011),
+   so the try/except suppressing missing `classifier_type` /
+   `parsed_interaction_occurred` columns is gone. The function
+   now reads them as required SQL columns; the
+   `_fetch_unevaluated_matches` query always JOINs
+   `llm_classifications` so they're always present.
+
+5. **Source-weight schema tightened.** `NewsSourceConfig`
+   switched from `extra="allow"` (silently ignore legacy
+   `weight: 1.0` keys) to `extra="forbid"` (loudly reject them).
+   Catches a partial revert before the daemon starts. The
+   deployed `~/.config/trumpbot/config.yaml` was migrated
+   (`weight:` keys stripped) before this change shipped. Pinned
+   by `tests/test_config.py::test_legacy_weight_field_rejected`.
+
+### What stays unchanged
+
+Tax tracking; `/halt` and `/resume`; the LLM cascade and
+classifier prompt (just the doc-string + the classifier
+soft-prompt got the "confidence is logged only" note); decision
+engine logic; risk manager; executor; Telegram approval flow
+beyond the two field removals; settlement detection;
+reconciliation; bankroll sync; backtester signature.
+
+### Operator-facing impact
+
+- `/snooze X 24h` and `/unsnooze X` are gone. Use `/halt` to
+  pause everything; trade proposals fire again on `/resume`.
+- Trade-proposal Telegram messages no longer show
+  `Confidence: 0.92`. The LLM's yes/no answer is the gate; the
+  number invited second-guessing of a value that doesn't drive
+  anything.
+- Existing `~/.config/trumpbot/config.yaml` files keep working
+  if they still contain `position_size_base_pct: 0.08` or
+  `llm_confidence_threshold: 0.85` — `DecisionPhaseConfig` was
+  switched to `extra="ignore"` so legacy fields load silently.
+  After all deployed configs are migrated, a follow-up PR can
+  flip back to `extra="forbid"`.
+- `weight: 1.0` keys on news sources DO now fail at config-load
+  time. Strip them with `sed -E 's/, weight: [0-9.]+//g' -i
+  ~/.config/trumpbot/config.yaml` before redeploying.
+
+### Migration 012
+
+Drops the `snoozed_markets` table and its index. Append-only;
+existing rows are lost (the table was operator state, not audit
+trail; nothing to preserve).
+
+### File map for Phase 4 Part 2.9
+
+- `migrations/012_phase4_part_2_9_drop_snoozed_markets.sql`
+- `tests/test_halt.py` (renamed from `test_halt_snooze.py`,
+  snooze sections removed, regression tests added)
+- `docs/deferred_cleanup.md` (new — non-blocking items spotted
+  during this PR)
+- `trumpbot/news/sources.py` — `extra="forbid"`
+- `trumpbot/notifications/commands.py` — handlers + dispatch
+  entries removed
+- `trumpbot/notifications/templates.py` — templates + status
+  fields removed
+- `trumpbot/notifications/scheduled.py` — unused import dropped
+- `trumpbot/decision/loops.py` — snooze guard removed,
+  `_row_to_snapshot` tightened
+- `trumpbot/decision/engine.py` — confidence gate + base-pct
+  field removed
+- `trumpbot/db/repositories.py` — snooze helpers removed
+- `trumpbot/config.py` — config-field removals + `extra="ignore"`
+  on `DecisionPhaseConfig`
+- `trumpbot/daemon.py` — wiring updated
+- `trumpbot/backtest/replay.py` — query updated to JOIN
+  `llm_classifications`
+- `trumpbot/news/llm_classifier.py` — docstring updated
+- `trumpbot/news/prompts/cascade_classifier_v1.txt` —
+  confidence-is-logged-only note added
+- `trumpbot/approval/message_templates.py` — confidence data
+  field removed from entry / re-entry data dicts
+- `config/config.example.yaml` — legacy fields commented out
+- `scripts/preview_templates.py` — sample data refreshed
 
 ---
 

@@ -22,6 +22,24 @@ news:
       type: "rss"
       url: "https://example.com/feed.xml"
       poll_interval_sec: 90
+      is_kalshi_approved: true
+"""
+
+# Used by test_legacy_weight_field_rejected to confirm the schema
+# loudly rejects a legacy `weight` key (Phase 4 Part 2.9 tightened
+# this to ``extra="forbid"``; pre-2.9 it silently ignored).
+SAMPLE_CONFIG_WITH_WEIGHT = """
+kalshi:
+  api_key_id: "x"
+  private_key_path: "/tmp/key.pem"
+  target_series:
+    - KXTRUMPCALL
+news:
+  sources:
+    - name: "reuters"
+      type: "rss"
+      url: "https://example.com/feed.xml"
+      poll_interval_sec: 90
       weight: 1.0
       is_kalshi_approved: true
 """
@@ -51,3 +69,17 @@ def test_invalid_config_raises(tmp_path: Path) -> None:
     p.write_text("not: valid: yaml: structure: here:")
     with pytest.raises((ValueError, yaml.YAMLError)):
         load_config(p)
+
+
+def test_legacy_weight_field_rejected(tmp_path: Path) -> None:
+    """Phase 4 Part 2.9 tightened ``NewsSourceConfig`` to
+    ``extra="forbid"`` so a legacy ``weight: 1.0`` key fails loudly
+    at config-load time. Catches a partial revert before the daemon
+    starts trading off the wrong assumption."""
+    from pydantic import ValidationError
+
+    p = tmp_path / "config.yaml"
+    p.write_text(SAMPLE_CONFIG_WITH_WEIGHT)
+    with pytest.raises(ValidationError) as exc_info:
+        load_config(p)
+    assert "weight" in str(exc_info.value)

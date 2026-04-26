@@ -1115,81 +1115,13 @@ def set_system_state(db: Database, *, key: str, value: str) -> None:
         )
 
 
-# snoozed_markets — per-ticker /snooze state
-
-
-@dataclass(frozen=True)
-class SnoozedMarketRow:
-    ticker: str
-    snoozed_until: str
-    """ISO-8601 UTC timestamp at which the snooze expires."""
-
-    snoozed_at: str
-    reason: str | None
-
-
-def upsert_snoozed_market(
-    db: Database, *, ticker: str, snoozed_until: str, reason: str | None = None
-) -> None:
-    """Snooze (or extend the snooze on) ``ticker`` until ``snoozed_until``."""
-    with db.transaction() as conn:
-        conn.execute(
-            """
-            INSERT INTO snoozed_markets (ticker, snoozed_until, snoozed_at, reason)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(ticker) DO UPDATE SET
-                snoozed_until = excluded.snoozed_until,
-                snoozed_at = excluded.snoozed_at,
-                reason = excluded.reason
-            """,
-            (ticker, snoozed_until, utcnow_iso(), reason),
-        )
-
-
-def delete_snoozed_market(db: Database, *, ticker: str) -> bool:
-    """Remove the snooze on ``ticker``. Returns True if a row was deleted."""
-    with db.transaction() as conn:
-        cur = conn.execute("DELETE FROM snoozed_markets WHERE ticker = ?", (ticker,))
-        return cur.rowcount > 0
-
-
-def is_market_snoozed(db: Database, ticker: str, *, now_iso: str | None = None) -> bool:
-    """True iff ``ticker`` has a snooze row with ``snoozed_until > now``."""
-    conn = db.connect()
-    row = conn.execute(
-        "SELECT snoozed_until FROM snoozed_markets WHERE ticker = ?",
-        (ticker,),
-    ).fetchone()
-    if row is None:
-        return False
-    now = now_iso or utcnow_iso()
-    return str(row[0]) > now
-
-
-def list_active_snoozed_markets(
-    db: Database, *, now_iso: str | None = None
-) -> list[SnoozedMarketRow]:
-    """All snoozes whose ``snoozed_until`` is in the future."""
-    conn = db.connect()
-    now = now_iso or utcnow_iso()
-    rows = conn.execute(
-        """
-        SELECT ticker, snoozed_until, snoozed_at, reason
-        FROM snoozed_markets
-        WHERE snoozed_until > ?
-        ORDER BY snoozed_until ASC
-        """,
-        (now,),
-    ).fetchall()
-    return [
-        SnoozedMarketRow(
-            ticker=r["ticker"],
-            snoozed_until=r["snoozed_until"],
-            snoozed_at=r["snoozed_at"],
-            reason=r["reason"],
-        )
-        for r in rows
-    ]
+# Phase 4 Part 2.9 — the per-ticker /snooze plumbing
+# (``snoozed_markets`` table, ``upsert_snoozed_market``,
+# ``is_market_snoozed``, ``list_active_snoozed_markets``,
+# ``delete_snoozed_market``) was REMOVED in this cleanup PR. The
+# /halt + /resume global override is sufficient and the per-ticker
+# snooze added operational surface area without earning its
+# complexity. Migration 012 drops the table.
 
 
 # source_status — per-news-source health

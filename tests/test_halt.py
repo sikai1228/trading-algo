@@ -1,19 +1,22 @@
-"""Regression tests for the halt + snooze plumbing in
+"""Regression tests for the /halt plumbing in
 ``trumpbot/decision/loops.py``.
 
 These pin the core operational invariant: when the user has issued
 ``/halt``, no new trade proposals fire from the decision or re-entry
-loops. When a specific ticker is snoozed, that ticker is skipped
-even when the rest of the system would otherwise fire.
+loops. Stop-loss exits intentionally bypass /halt — emergency exits
+must always reach the user.
 
-The tests poke the per-cycle helper directly (``_run_decision_cycle``
-+ ``_maybe_reentry``) instead of running the full asyncio loop --
-behavior is the same, faster.
+Phase 4 Part 2.9 removed the per-ticker /snooze plumbing. /halt is
+the sole global override.
+
+The tests poke the per-cycle helper directly (``_run_decision_cycle``)
+instead of running the full asyncio loop -- behavior is the same,
+faster.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -26,7 +29,6 @@ from trumpbot.db.repositories import (
     insert_news_event,
     set_system_state,
     upsert_market,
-    upsert_snoozed_market,
     upsert_subject,
 )
 from trumpbot.decision.loops import _is_halted
@@ -91,35 +93,6 @@ class TestHaltFlag:
 
 
 # ---------------------------------------------------------------------------
-# snooze
-# ---------------------------------------------------------------------------
-
-
-class TestSnooze:
-    def test_default_no_snooze(self, tmp_path: Path) -> None:
-        from trumpbot.db.repositories import is_market_snoozed
-
-        db = _db(tmp_path)
-        assert is_market_snoozed(db, "X") is False
-
-    def test_active_snooze_blocks(self, tmp_path: Path) -> None:
-        from trumpbot.db.repositories import is_market_snoozed
-
-        db = _db(tmp_path)
-        until = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
-        upsert_snoozed_market(db, ticker="X", snoozed_until=until)
-        assert is_market_snoozed(db, "X") is True
-
-    def test_expired_snooze_does_not_block(self, tmp_path: Path) -> None:
-        from trumpbot.db.repositories import is_market_snoozed
-
-        db = _db(tmp_path)
-        past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
-        upsert_snoozed_market(db, ticker="X", snoozed_until=past)
-        assert is_market_snoozed(db, "X") is False
-
-
-# ---------------------------------------------------------------------------
 # decision-cycle integration: halt early-return
 # ---------------------------------------------------------------------------
 
@@ -146,7 +119,11 @@ class _StubRisk:
         from trumpbot.types.intents import RiskRejection
 
         return RiskRejection(
-            intent=None, reason="x", detail="x", rule_fired="x", risk_decision_id=0  # type: ignore[arg-type]
+            intent=None,  # type: ignore[arg-type]
+            reason="x",
+            detail="x",
+            rule_fired="x",
+            risk_decision_id=0,
         )
 
 
@@ -204,17 +181,16 @@ async def test_decision_cycle_no_op_when_halted(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # Stop-loss bypass — Phase 3 Part 2 spec calls this out explicitly.
-# Snooze and halt block NEW entries; stop-losses on existing positions
-# must still fire so the user can approve emergency exits.
+# /halt blocks NEW entries; stop-losses on existing positions must still
+# fire so the user can approve emergency exits.
 # ---------------------------------------------------------------------------
 
 
-def test_stop_loss_loop_does_not_check_halt_or_snooze() -> None:
-    """The stop_loss_loop body must not call _is_halted or
-    is_market_snoozed -- the spec is explicit that stop-losses
-    bypass both flags. This is a structural test against the
-    decision/loops.py source so a future refactor that adds the
-    check fails loudly."""
+def test_stop_loss_loop_does_not_check_halt() -> None:
+    """The stop_loss_loop body must not call _is_halted -- the spec is
+    explicit that stop-losses bypass /halt. This is a structural test
+    against the decision/loops.py source so a future refactor that adds
+    the check fails loudly."""
     import inspect
 
     from trumpbot.decision import loops
@@ -224,8 +200,40 @@ def test_stop_loss_loop_does_not_check_halt_or_snooze() -> None:
         "stop_loss_loop must NOT gate on /halt -- emergency exits must "
         "always reach the user. Remove the _is_halted check."
     )
-    assert "is_market_snoozed" not in src, (
-        "stop_loss_loop must NOT gate on /snooze -- snoozes block new "
-        "entries, not stop-losses on existing positions. Remove the "
-        "is_market_snoozed check."
-    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Part 2.9 — snooze removal regression
+# ---------------------------------------------------------------------------
+
+
+def test_snooze_repo_helpers_are_gone() -> None:
+    """is_market_snoozed / upsert_snoozed_market / delete_snoozed_market /
+    list_active_snoozed_markets must NOT be importable. Catches a
+    revert that brings the snooze plumbing back."""
+    from trumpbot.db import repositories
+
+    for name in (
+        "is_market_snoozed",
+        "upsert_snoozed_market",
+        "delete_snoozed_market",
+        "list_active_snoozed_markets",
+        "SnoozedMarketRow",
+    ):
+        assert not hasattr(repositories, name), (
+            f"trumpbot.db.repositories.{name} was removed in Phase 4 Part 2.9 "
+            "(snooze deletion). If it's back, revert the revert."
+        )
+
+
+def test_snoozed_markets_table_is_dropped(tmp_path: Path) -> None:
+    """Migration 012 drops the snoozed_markets table. Verify a fresh
+    Database (which runs all migrations) does not contain it."""
+    db = Database(tmp_path / "fresh.db")
+    db.connect()
+    conn = db.connect()
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='snoozed_markets'"
+    ).fetchone()
+    db.close()
+    assert row is None, "snoozed_markets table must be gone after migration 012"

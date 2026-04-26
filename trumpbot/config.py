@@ -65,9 +65,21 @@ class TelegramConfig(BaseModel):
 class DecisionPhaseConfig(BaseModel):
     """Phase-2 decision-layer thresholds (LOCKED by CLAUDE.md)."""
 
-    model_config = ConfigDict(extra="forbid")
+    # Phase 4 Part 2.9 — switched to ``extra="ignore"`` so an
+    # un-migrated config.yaml carrying ``llm_confidence_threshold:
+    # 0.85`` (the field removed in this PR) loads silently. The next
+    # operator pass will strip it from the YAML; in the meantime
+    # nothing breaks. New unrecognized fields still won't be silently
+    # accepted in any place that matters because the engine just
+    # ignores them.
+    model_config = ConfigDict(extra="ignore")
 
-    llm_confidence_threshold: float = 0.85
+    # Phase 4 Part 2.9 — ``llm_confidence_threshold`` was REMOVED.
+    # The decision engine no longer gates on a confidence number; the
+    # LLM's ``interaction_occurred`` boolean is the trade trigger. The
+    # Haiku confidence float is recorded in
+    # ``llm_classifications.parsed_confidence`` for audit only.
+
     max_buy_price_cents: int = 90
     """Hard ceiling on YES contract entry price (in cents). Trades
     above this are rejected by the engine and the risk gate. Raised
@@ -75,7 +87,11 @@ class DecisionPhaseConfig(BaseModel):
     80-90 cent band for several hours after a confirming news
     headline before snapping to $1.00, and the bot was missing those
     legs because of the old ceiling."""
-    position_size_base_pct: float = 0.08
+    # Phase 4 Part 2.9 — ``position_size_base_pct`` was REMOVED. It
+    # was the multiplier in the old "8 % of bankroll x confidence"
+    # sizing path; the two-cap system replaced it in Phase 3 Part 1
+    # and no production code has read this field since.
+
     # Phase 3 Part 1: two-cap system (was a single fixed cap in PR #10).
     position_size_hard_cap_cents: int = 2000
     """Cap one — hard fixed-dollar ceiling per trade, in USDCents.

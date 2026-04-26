@@ -182,9 +182,11 @@ async def _amain(config_path: Path) -> int:
 
     decision_engine = DecisionEngine(
         DecCfg(
-            llm_confidence_threshold=cfg.decision.llm_confidence_threshold,
+            # Phase 4 Part 2.9 — llm_confidence_threshold and
+            # position_size_base_pct removed; the LLM's
+            # ``interaction_occurred`` boolean is the sole gate, and
+            # the two caps + walk drive sizing.
             max_buy_price_cents=cfg.decision.max_buy_price_cents,
-            position_size_base_pct=cfg.decision.position_size_base_pct,
             position_size_hard_cap_cents=cfg.decision.position_size_hard_cap_cents,
             position_size_orderbook_pct=cfg.decision.position_size_orderbook_pct,
             min_trade_size_contracts=cfg.decision.min_trade_size_contracts,

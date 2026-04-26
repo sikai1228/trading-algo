@@ -7,16 +7,20 @@ the article + verbatim contract rules to Claude Haiku 4.5, gets a
 strict-JSON classification back, and writes one row to
 ``llm_classifications`` per call (success or failure).
 
-The only thing the rest of the system reads off the LLM is the
-``parsed_interaction_occurred`` boolean and the ``parsed_confidence``
-float. Both feed the decision-engine guards:
+The only thing the rest of the system reads off the LLM for trade
+gating is the ``parsed_interaction_occurred`` boolean. Phase 4 Part
+2.9 removed the ``llm_confidence_threshold`` engine gate; the LLM's
+yes/no answer is the sole signal-strength filter. The
+``parsed_confidence`` float is still recorded in
+``llm_classifications.parsed_confidence`` for audit and shadow
+analysis but does not drive any decision.
 
 - ``DecisionEngine.evaluate_news_match`` requires
-  ``interaction_occurred is True`` AND
-  ``confidence >= cfg.decision.llm_confidence_threshold`` (0.85).
+  ``interaction_occurred is True``.
 - The matcher row's ``confidence`` and ``classifier_type`` are
-  overwritten in-place after a successful classification so the
-  decision engine sees a single coherent view.
+  overwritten in-place after a successful classification so
+  ``/why`` and shadow reports show the LLM's score even though the
+  engine doesn't gate on it.
 
 Failure modes are first-class:
 

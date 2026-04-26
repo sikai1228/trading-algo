@@ -165,13 +165,15 @@ _PROPOSAL_BODY = (
 _TRADE_PROPOSAL_ENTRY = MessageTemplate(
     category="trade_proposal",
     audible=False,
-    # fields: ticker, match_id, confidence, weight, plus the proposal
-    # body fields documented on _PROPOSAL_BODY.
+    # fields: ticker, match_id, plus the proposal body fields
+    # documented on _PROPOSAL_BODY. Phase 4 Part 2.9 removed the
+    # ``Confidence: {confidence}`` line — the LLM's yes/no boolean
+    # is the gate, the float number invited the user to second-guess
+    # based on a number that no longer drives anything.
     format=(
         "💰 TRADE PROPOSAL\n"
         "Ticker: {ticker}\n"
-        "Triggered by match #{match_id}\n"
-        "Confidence: {confidence}\n\n"
+        "Triggered by match #{match_id}\n\n"
         "Approve within 3:00 to execute.\n\n" + _PROPOSAL_BODY
     ),
 )
@@ -179,14 +181,15 @@ _TRADE_PROPOSAL_ENTRY = MessageTemplate(
 _TRADE_PROPOSAL_REENTRY = MessageTemplate(
     category="trade_proposal",
     audible=False,
-    # fields: ticker, match_id, confidence, prior_trade_id,
-    #         prior_trade_outcome, prior_realized_dollars, plus body fields.
+    # fields: ticker, match_id, prior_trade_id, prior_trade_outcome,
+    #         prior_realized_dollars, plus body fields. Phase 4 Part
+    #         2.9 dropped the ``(confidence {confidence})`` annotation.
     format=(
         "🔄 RE-ENTRY OPPORTUNITY\n"
         "Ticker: {ticker}\n"
         "Prior trade #{prior_trade_id} closed via {prior_trade_outcome}\n"
         "Prior realized P&L: {prior_realized_dollars}\n\n"
-        "Fresh signal: match #{match_id} (confidence {confidence})\n\n"
+        "Fresh signal: match #{match_id}\n\n"
         "No timeout -- respond when ready.\n\n" + _PROPOSAL_BODY
     ),
 )
@@ -527,7 +530,7 @@ _ALERT_INFO_BANKROLL_SYNC_RECOVERED = MessageTemplate(
 _COMMAND_REPLY_STATUS = MessageTemplate(
     category="command_reply",
     audible=False,
-    # fields: execution_mode, approval_mode, halt_status, snoozed_count,
+    # fields: execution_mode, approval_mode, halt_status,
     #         bankroll, deposit_status, open_count, unrealized_pnl,
     #         today_pnl, month_pnl, sources_active, sources_total,
     #         llm_mtd, llm_cap, llm_pct, last_heartbeat, heartbeat_age,
@@ -535,7 +538,7 @@ _COMMAND_REPLY_STATUS = MessageTemplate(
     format=(
         "🤖 Bot Status\n\n"
         "Mode: {execution_mode} | approval: {approval_mode}\n"
-        "Halt: {halt_status} | snoozed: {snoozed_count}\n\n"
+        "Halt: {halt_status}\n\n"
         "Bankroll: {bankroll} ({deposit_status})\n"
         "Open positions: {open_count} (unrealized: {unrealized_pnl})\n"
         "Today: {today_pnl} realized\n"
@@ -652,25 +655,9 @@ _COMMAND_REPLY_RESUME = MessageTemplate(
     ),
 )
 
-_COMMAND_REPLY_SNOOZE = MessageTemplate(
-    category="command_reply",
-    audible=False,
-    # fields: ticker, duration, resume_time_et
-    format=(
-        "🔕 Snoozed: {ticker}\n"
-        "Duration: {duration}\n"
-        "Resumes: {resume_time_et}\n\n"
-        "The bot will not propose new trades on this market until then.\n"
-        "Existing position remains. To unsnooze early: /unsnooze {ticker}"
-    ),
-)
-
-_COMMAND_REPLY_UNSNOOZE = MessageTemplate(
-    category="command_reply",
-    audible=False,
-    # fields: ticker
-    format=("✅ Unsnoozed: {ticker}\n" "Trading proposals resumed for this market."),
-)
+# Phase 4 Part 2.9 — _COMMAND_REPLY_SNOOZE / _COMMAND_REPLY_UNSNOOZE
+# were REMOVED with the /snooze and /unsnooze commands. /halt + /resume
+# are the global override; per-ticker snooze is gone.
 
 _COMMAND_REPLY_HEARTBEAT = MessageTemplate(
     category="command_reply",
@@ -696,13 +683,12 @@ _COMMAND_REPLY_SPEND = MessageTemplate(
 _COMMAND_REPLY_MODE = MessageTemplate(
     category="command_reply",
     audible=False,
-    # fields: execution_mode, approval_mode, halt_status, snoozed_count
+    # fields: execution_mode, approval_mode, halt_status
     format=(
         "Current mode:\n"
         "  Execution: {execution_mode}\n"
         "  Approval: {approval_mode}\n"
-        "  Halt: {halt_status}\n"
-        "  Snoozed: {snoozed_count}\n\n"
+        "  Halt: {halt_status}\n\n"
         "To change execution mode: requires config edit + restart\n"
         "(safety: not changeable from chat)"
     ),
@@ -722,8 +708,6 @@ _COMMAND_REPLY_HELP = MessageTemplate(
         "  /mode                         current execution + approval mode\n"
         "  /halt                         pause new trade proposals\n"
         "  /resume                       resume new trade proposals\n"
-        "  /snooze <ticker> [dur]        snooze one market\n"
-        "  /unsnooze <ticker>            unsnooze one market\n"
         "  /heartbeat                    quick liveness check\n"
         "  /shadow_report [Nd]           auto-approve simulation (default 7d)\n"
         "  /reconcile_resolve <trade_id> acknowledge a reconcile drift row\n"
@@ -1058,8 +1042,6 @@ TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
     "command_reply_history": _COMMAND_REPLY_HISTORY,
     "command_reply_halt": _COMMAND_REPLY_HALT,
     "command_reply_resume": _COMMAND_REPLY_RESUME,
-    "command_reply_snooze": _COMMAND_REPLY_SNOOZE,
-    "command_reply_unsnooze": _COMMAND_REPLY_UNSNOOZE,
     "command_reply_heartbeat": _COMMAND_REPLY_HEARTBEAT,
     "command_reply_spend": _COMMAND_REPLY_SPEND,
     "command_reply_mode": _COMMAND_REPLY_MODE,

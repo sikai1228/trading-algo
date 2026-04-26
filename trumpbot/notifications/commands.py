@@ -1,4 +1,4 @@
-"""Telegram command handlers (/status, /halt, /resume, /snooze, ...).
+"""Telegram command handlers (/status, /halt, /resume, /history, ...).
 
 Phase 3 Part 2.
 
@@ -37,15 +37,12 @@ from typing import Any
 
 from trumpbot.db.connection import Database
 from trumpbot.db.repositories import (
-    delete_snoozed_market,
     get_open_trade_for_ticker,
     get_system_state,
-    list_active_snoozed_markets,
     list_open_trades,
     list_source_status,
     set_system_state,
     shadow_report_summary,
-    upsert_snoozed_market,
 )
 from trumpbot.notifications.llm_cost import LLMCostGuard
 from trumpbot.notifications.templates import RenderedMessage, render_template
@@ -129,7 +126,6 @@ async def handle_resume(ctx: CommandContext) -> RenderedMessage:
 
 async def handle_status(ctx: CommandContext) -> RenderedMessage:
     halt = get_system_state(ctx.db, "halt_flag") or "false"
-    snoozed = list_active_snoozed_markets(ctx.db)
     open_trades = list_open_trades(ctx.db)
     today_realized = _today_realized_cents(ctx.db)
     month_realized = _month_realized_cents(ctx.db)
@@ -144,7 +140,6 @@ async def handle_status(ctx: CommandContext) -> RenderedMessage:
             "execution_mode": "dry_run",
             "approval_mode": "human",
             "halt_status": "ON" if halt == "true" else "off",
-            "snoozed_count": len(snoozed),
             "bankroll": _dollars(ctx.bankroll_usd_cents),
             "deposit_status": "Kalshi balance reflects this amount",
             "open_count": len(open_trades),
@@ -370,92 +365,19 @@ async def handle_spend(ctx: CommandContext) -> RenderedMessage:
 
 async def handle_mode(ctx: CommandContext) -> RenderedMessage:
     halt = get_system_state(ctx.db, "halt_flag") or "false"
-    snoozed = list_active_snoozed_markets(ctx.db)
     return render_template(
         "command_reply_mode",
         {
             "execution_mode": "dry_run",
             "approval_mode": "human",
             "halt_status": "ON" if halt == "true" else "off",
-            "snoozed_count": len(snoozed),
         },
     )
 
 
-async def handle_snooze(ctx: CommandContext) -> RenderedMessage:
-    if not ctx.args:
-        return render_template(
-            "command_reply_usage_hint",
-            {"command": "/snooze", "usage": "<ticker> [duration]"},
-        )
-    ticker = ctx.args[0]
-    duration_str = ctx.args[1] if len(ctx.args) > 1 else "24h"
-    try:
-        delta = parse_duration(duration_str)
-    except ValueError:
-        return render_template(
-            "command_reply_usage_hint",
-            {
-                "command": "/snooze",
-                "usage": "<ticker> [duration like 24h, 30m, 3d, 2h30m]",
-            },
-        )
-    until = datetime.now(UTC) + delta
-    upsert_snoozed_market(
-        ctx.db, ticker=ticker, snoozed_until=until.isoformat(), reason="user_command"
-    )
-    return render_template(
-        "command_reply_snooze",
-        {
-            "ticker": ticker,
-            "duration": duration_str,
-            "resume_time_et": _format_et(until.isoformat()),
-        },
-    )
-
-
-async def handle_unsnooze(ctx: CommandContext) -> RenderedMessage:
-    if not ctx.args:
-        return render_template(
-            "command_reply_usage_hint",
-            {"command": "/unsnooze", "usage": "<ticker>"},
-        )
-    ticker = ctx.args[0]
-    delete_snoozed_market(ctx.db, ticker=ticker)
-    return render_template("command_reply_unsnooze", {"ticker": ticker})
-
-
-# ---------------------------------------------------------------------------
-# Duration parser (24h, 30m, 3d, 2h30m, ...)
-# ---------------------------------------------------------------------------
-
-
-_DURATION_RE = re.compile(r"(\d+)([dhm])")
-
-
-def parse_duration(s: str) -> timedelta:
-    """Parse strings like ``24h``, ``30m``, ``3d``, ``2h30m``. Raises
-    :class:`ValueError` on anything else."""
-    matches = _DURATION_RE.findall(s)
-    if not matches:
-        raise ValueError(f"unrecognised duration: {s!r}")
-    # Reject if the matches don't account for every char (e.g. "24x" would
-    # match nothing useful but still match 24).
-    consumed = "".join(n + u for n, u in matches)
-    if consumed != s:
-        raise ValueError(f"unrecognised duration: {s!r}")
-    seconds = 0
-    for n, unit in matches:
-        n_int = int(n)
-        if unit == "d":
-            seconds += n_int * 86400
-        elif unit == "h":
-            seconds += n_int * 3600
-        elif unit == "m":
-            seconds += n_int * 60
-    if seconds <= 0:
-        raise ValueError(f"non-positive duration: {s!r}")
-    return timedelta(seconds=seconds)
+# Phase 4 Part 2.9 — handle_snooze / handle_unsnooze + the duration
+# parser were REMOVED. /halt + /resume cover the whole need; per-ticker
+# snooze added operational surface area without earning its complexity.
 
 
 # ---------------------------------------------------------------------------
@@ -733,8 +655,6 @@ _HANDLERS: dict[str, CommandHandler] = {
     "history": handle_history,
     "spend": handle_spend,
     "mode": handle_mode,
-    "snooze": handle_snooze,
-    "unsnooze": handle_unsnooze,
     # Phase 4 Part 1
     "shadow_report": handle_shadow_report,
     "reconcile_resolve": handle_reconcile_resolve,
@@ -884,5 +804,4 @@ __all__ = [
     "CommandRateLimiter",
     "all_command_names",
     "dispatch",
-    "parse_duration",
 ]

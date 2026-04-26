@@ -204,8 +204,6 @@ def test_command_help_lists_every_command() -> None:
         "/mode",
         "/halt",
         "/resume",
-        "/snooze",
-        "/unsnooze",
         "/heartbeat",
         "/help",
     ):

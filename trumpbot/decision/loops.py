@@ -23,7 +23,6 @@ from trumpbot.db.repositories import (
     get_open_trade_for_ticker,
     get_system_state,
     insert_system_event,
-    is_market_snoozed,
     list_open_trades,
     total_open_position_cost_cents,
     update_telegram_approval,
@@ -195,17 +194,6 @@ async def _run_decision_cycle(
         return
     for match in matches:
         ticker = match["ticker"]
-        # Phase 3 Part 2: skip per-ticker if /snooze is active.
-        if is_market_snoozed(db, ticker):
-            insert_system_event(
-                db,
-                event_type="trade_skipped_snoozed",
-                severity="info",
-                component="decision_loop",
-                message=f"skipping match for snoozed ticker {ticker}",
-                detail={"ticker": ticker, "match_id": match["id"]},
-            )
-            continue
         market_row = _get_market_row(db, ticker)
         if market_row is None:
             continue
@@ -353,9 +341,6 @@ async def reentry_loop(
             else:
                 for match in _fetch_unevaluated_matches(db):
                     ticker = match["ticker"]
-                    # Phase 3 Part 2: skip if /snooze is active.
-                    if is_market_snoozed(db, ticker):
-                        continue
                     await _maybe_reentry(
                         db=db,
                         engine=engine,
@@ -393,8 +378,8 @@ async def _maybe_reentry(  # type: ignore[no-untyped-def]
     ticker: str,
 ) -> None:
     """Refactored body of the re-entry per-match loop. Pulled out so
-    the halt + snooze guards above can early-return without an
-    awkward indentation wrap."""
+    the halt guard above can early-return without an awkward
+    indentation wrap."""
     if get_open_trade_for_ticker(db, ticker) is not None:
         return
     prior_row = get_last_closed_trade_for_ticker(db, ticker)
@@ -486,23 +471,24 @@ def _row_to_snapshot(match_row, market_row) -> MatchSnapshot:  # type: ignore[no
     ``llm_classifications``) into a :class:`MatchSnapshot` for the
     decision engine.
 
-    Phase 4 Part 2.8: ``interaction_occurred`` now reads the LLM's
-    ``parsed_interaction_occurred`` directly. For rows without an LLM
-    classification (cap-hit / disabled / pre-2.8 backlog) we fall
-    through to ``False`` — keyword-only matches must never fire trades.
-    """
-    classifier_type: str | None = None
-    parsed_interaction_raw: object = None
-    with contextlib.suppress(IndexError, KeyError):
-        classifier_type = match_row["classifier_type"]
-    with contextlib.suppress(IndexError, KeyError):
-        parsed_interaction_raw = match_row["parsed_interaction_occurred"]
+    Phase 4 Part 2.9 cleanup — the defensive try/except suppressing
+    missing ``classifier_type`` and ``parsed_interaction_occurred``
+    columns is gone. Migration 011 added both, and
+    ``_fetch_unevaluated_matches`` always JOINs ``llm_classifications``
+    so they're always present in the row.
 
-    if classifier_type == "llm_cascade" and parsed_interaction_raw is not None:
-        # SQLite stores the BOOLEAN as 0/1; treat truthy as True.
-        interaction_occurred = bool(parsed_interaction_raw)
-    else:
-        interaction_occurred = False
+    Logic:
+
+    - ``classifier_type == 'llm_cascade'``: read
+      ``parsed_interaction_occurred`` (0/1). True iff truthy.
+    - Anything else (``keyword_only`` — cap-hit, LLM disabled, or
+      pre-classification backlog): ``False``. Keyword-only matches
+      must never fire trades.
+    """
+    classifier_type = match_row["classifier_type"]
+    parsed_interaction_raw = match_row["parsed_interaction_occurred"]
+
+    interaction_occurred = classifier_type == "llm_cascade" and bool(parsed_interaction_raw)
 
     return MatchSnapshot(
         match_id=match_row["id"],

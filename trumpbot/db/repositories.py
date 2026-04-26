@@ -730,6 +730,18 @@ class TradeInsertRow:
     """JSON-encoded list of [price_cents, qty] pairs the executor's
     re-walk actually consumed."""
 
+    # Phase 4 Part 1 — live-trading idempotency columns (migration 007).
+    client_order_id: str | None = None
+    """UUIDv4 we generate locally and persist BEFORE the Kalshi API
+    call. Kalshi treats it as the idempotency key; we use it during
+    reconciliation to look up an order whose response was lost to a
+    network failure."""
+
+    kalshi_order_id: str | None = None
+    """The opaque server-side order id Kalshi returns. Populated after
+    a successful submission, or by reconciliation when we recover
+    orphaned orders. NULL for dry-run rows."""
+
 
 def insert_trade(db: Database, row: TradeInsertRow) -> int:
     sql = """
@@ -741,7 +753,8 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         reasoning_text, entered_at, created_at,
         cap_binding, cap_one_value_cents, cap_two_value_cents,
         target_avg_fill_price_cents, actual_avg_fill_price_cents,
-        slippage_cents, entry_fees_cents, levels_consumed_json
+        slippage_cents, entry_fees_cents, levels_consumed_json,
+        client_order_id, kalshi_order_id
     ) VALUES (
         :ticker, 'yes', 'buy', :status,
         :entry_price_cents, :quantity, :cost_basis_usd_cents,
@@ -750,7 +763,8 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         :reasoning_text, :entered_at, :now,
         :cap_binding, :cap_one_value_cents, :cap_two_value_cents,
         :target_avg_fill_price_cents, :actual_avg_fill_price_cents,
-        :slippage_cents, :entry_fees_cents, :levels_consumed_json
+        :slippage_cents, :entry_fees_cents, :levels_consumed_json,
+        :client_order_id, :kalshi_order_id
     )
     """
     params = {
@@ -765,17 +779,112 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         return last_id
 
 
+def update_trade_status_by_client_order_id(
+    db: Database,
+    *,
+    client_order_id: str,
+    new_status: str,
+    kalshi_order_id: str | None = None,
+    entry_price_cents: int | None = None,
+    quantity: int | None = None,
+    cost_basis_usd_cents: int | None = None,
+    actual_avg_fill_price_cents: int | None = None,
+) -> int | None:
+    """Phase 4: update an existing trade row keyed by ``client_order_id``.
+
+    Used by the live executor's two-phase write: insert with
+    ``status='pending'`` BEFORE the API call, then update with the
+    actual fill once Kalshi acks. Idempotent — the trade row is
+    uniquely keyed on the UUIDv4 we minted locally.
+
+    Returns the trade row id (or ``None`` if no matching row exists).
+    """
+    fields = ["status = :status"]
+    params: dict[str, str | int | None] = {
+        "client_order_id": client_order_id,
+        "status": new_status,
+    }
+    if kalshi_order_id is not None:
+        fields.append("kalshi_order_id = :kalshi_order_id")
+        params["kalshi_order_id"] = kalshi_order_id
+    if entry_price_cents is not None:
+        fields.append("entry_price_cents = :entry_price_cents")
+        params["entry_price_cents"] = entry_price_cents
+    if quantity is not None:
+        fields.append("quantity = :quantity")
+        params["quantity"] = quantity
+    if cost_basis_usd_cents is not None:
+        fields.append("cost_basis_usd_cents = :cost_basis_usd_cents")
+        params["cost_basis_usd_cents"] = cost_basis_usd_cents
+    if actual_avg_fill_price_cents is not None:
+        fields.append("actual_avg_fill_price_cents = :actual_avg_fill_price_cents")
+        params["actual_avg_fill_price_cents"] = actual_avg_fill_price_cents
+    sql = f"""
+    UPDATE trades
+       SET {", ".join(fields)}
+     WHERE client_order_id = :client_order_id
+    RETURNING id
+    """
+    with db.transaction() as conn:
+        cur = conn.execute(sql, params)
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return int(row[0])
+
+
+def get_trade_by_client_order_id(db: Database, client_order_id: str) -> sqlite3.Row | None:
+    """Phase 4: locate a trade row by its idempotency UUID. Used by
+    reconciliation to recover from network failures."""
+    conn = db.connect()
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT * FROM trades WHERE client_order_id = ? LIMIT 1",
+        (client_order_id,),
+    ).fetchone()
+    return row
+
+
+def get_trade_by_kalshi_order_id(db: Database, kalshi_order_id: str) -> sqlite3.Row | None:
+    """Phase 4: locate a trade row by Kalshi's server-side order id.
+    Used by reconciliation when Kalshi reports an order our DB doesn't
+    know about."""
+    conn = db.connect()
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT * FROM trades WHERE kalshi_order_id = ? LIMIT 1",
+        (kalshi_order_id,),
+    ).fetchone()
+    return row
+
+
+def list_open_live_trades(db: Database) -> list[sqlite3.Row]:
+    """Phase 4: open positions that need live-mode position marking,
+    settlement detection, and stop-loss evaluation."""
+    conn = db.connect()
+    return list(conn.execute("SELECT * FROM trades WHERE status = 'live' ORDER BY entered_at"))
+
+
+def list_pending_trades(db: Database) -> list[sqlite3.Row]:
+    """Phase 4: trades stuck in ``pending`` (sent to Kalshi but no ack
+    received). Reconciliation looks at these on startup and queries
+    Kalshi by client_order_id to learn what really happened."""
+    conn = db.connect()
+    return list(conn.execute("SELECT * FROM trades WHERE status = 'pending' ORDER BY entered_at"))
+
+
 def list_open_trades(db: Database) -> list[sqlite3.Row]:
     conn = db.connect()
     return list(
-        conn.execute("SELECT * FROM trades WHERE status IN ('dry_run', 'live') ORDER BY entered_at")
+        conn.execute(
+            "SELECT * FROM trades WHERE status IN ('dry_run', 'live', 'live_imported') "
+            "ORDER BY entered_at"
+        )
     )
 
 
 def get_open_trade_for_ticker(db: Database, ticker: str) -> sqlite3.Row | None:
     conn = db.connect()
     row: sqlite3.Row | None = conn.execute(
-        "SELECT * FROM trades WHERE ticker = ? AND status IN ('dry_run', 'live') "
+        "SELECT * FROM trades WHERE ticker = ? AND status IN ('dry_run', 'live', 'live_imported') "
         "ORDER BY entered_at DESC LIMIT 1",
         (ticker,),
     ).fetchone()
@@ -839,7 +948,7 @@ def total_open_position_cost_cents(db: Database) -> int:
     conn = db.connect()
     row = conn.execute(
         "SELECT COALESCE(SUM(cost_basis_usd_cents), 0) "
-        "FROM trades WHERE status IN ('dry_run', 'live')"
+        "FROM trades WHERE status IN ('dry_run', 'live', 'live_imported')"
     ).fetchone()
     return int(row[0])
 
@@ -1136,3 +1245,172 @@ def llm_spend_count_since(db: Database, *, since_iso: str) -> int:
         (since_iso,),
     ).fetchone()
     return int(row[0])
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Part 1 — shadow_decisions
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ShadowSnapshot:
+    """Walk result snapshot at a single point in time. Used at
+    message-send-time and at human-decision-time to compare outcomes."""
+
+    yes_ask_cents: int
+    avg_fill_cents: int
+    filled_quantity: int
+    estimated_cost_cents: int
+    orderbook_json: str
+    """JSON-encoded yes-side levels actually consumed at this snapshot."""
+
+
+def insert_shadow_decision_at_send(
+    db: Database,
+    *,
+    intent_id: str,
+    intent_type: str,
+    ticker: str,
+    sent_at_iso: str,
+    snapshot: ShadowSnapshot,
+) -> int:
+    """Phase 4: record the orderbook snapshot at TRADE PROPOSAL send
+    time. The decision-time snapshot is filled in later by
+    :func:`update_shadow_decision_at_decision`.
+
+    Returns the row id so the approval flow can update the same row
+    when the human responds (or the timeout fires)."""
+    sql = """
+    INSERT INTO shadow_decisions (
+        intent_id, intent_type, ticker,
+        message_sent_at, human_decision,
+        shadow_yes_ask_at_send_cents,
+        shadow_orderbook_at_send_json,
+        shadow_avg_fill_at_send_cents,
+        shadow_filled_quantity_at_send,
+        shadow_estimated_cost_at_send_cents
+    ) VALUES (
+        :intent_id, :intent_type, :ticker,
+        :sent_at, 'pending',
+        :yes_ask, :orderbook_json,
+        :avg_fill, :filled_qty, :est_cost
+    )
+    """
+    params = {
+        "intent_id": intent_id,
+        "intent_type": intent_type,
+        "ticker": ticker,
+        "sent_at": sent_at_iso,
+        "yes_ask": snapshot.yes_ask_cents,
+        "orderbook_json": snapshot.orderbook_json,
+        "avg_fill": snapshot.avg_fill_cents,
+        "filled_qty": snapshot.filled_quantity,
+        "est_cost": snapshot.estimated_cost_cents,
+    }
+    with db.transaction() as conn:
+        cur = conn.execute(sql, params)
+        last_id: int | None = cur.lastrowid
+        assert last_id is not None
+        return last_id
+
+
+def update_shadow_decision_at_decision(
+    db: Database,
+    *,
+    intent_id: str,
+    decision_made_at_iso: str,
+    human_decision: str,
+    snapshot: ShadowSnapshot | None,
+) -> None:
+    """Phase 4: write the decision-time half of the shadow record.
+
+    ``snapshot`` is ``None`` when the orderbook was unavailable at
+    decision time (e.g. the user took so long the WS reconnected with
+    no fresh snapshot). In that case derived diff fields stay NULL.
+    """
+    fields = [
+        "decision_made_at = :decision_made_at",
+        "human_decision = :human_decision",
+    ]
+    params: dict[str, str | int | None] = {
+        "intent_id": intent_id,
+        "decision_made_at": decision_made_at_iso,
+        "human_decision": human_decision,
+    }
+    if snapshot is not None:
+        fields.extend(
+            [
+                "actual_yes_ask_at_decision_cents = :yes_ask",
+                "actual_avg_fill_at_decision_cents = :avg_fill",
+                "actual_filled_quantity_at_decision = :filled_qty",
+                "price_movement_cents = " "  COALESCE(:yes_ask, 0) - shadow_yes_ask_at_send_cents",
+                "decision_lag_seconds = CAST(("
+                "  julianday(:decision_made_at) - julianday(message_sent_at)"
+                ") * 86400 AS INTEGER)",
+                "hypothetical_pnl_difference_cents = "
+                "  (shadow_estimated_cost_at_send_cents - COALESCE(:est_cost, 0))",
+            ]
+        )
+        params["yes_ask"] = snapshot.yes_ask_cents
+        params["avg_fill"] = snapshot.avg_fill_cents
+        params["filled_qty"] = snapshot.filled_quantity
+        params["est_cost"] = snapshot.estimated_cost_cents
+    sql = f"""
+    UPDATE shadow_decisions
+       SET {", ".join(fields)}
+     WHERE intent_id = :intent_id
+       AND human_decision = 'pending'
+    """
+    with db.transaction() as conn:
+        conn.execute(sql, params)
+
+
+def shadow_report_summary(db: Database, *, since_iso: str) -> dict[str, int | float]:
+    """Aggregate stats for the ``/shadow_report`` command.
+
+    Returns a dict with:
+    - total_proposals
+    - approved_count
+    - rejected_count
+    - expired_count
+    - avg_decision_lag_seconds
+    - avg_price_movement_cents
+    - sum_hypothetical_pnl_diff_cents
+
+    All numeric fields fall back to 0 when no rows match.
+    """
+    conn = db.connect()
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total_proposals,
+            SUM(CASE WHEN human_decision = 'approved' THEN 1 ELSE 0 END) AS approved_count,
+            SUM(CASE WHEN human_decision = 'rejected' THEN 1 ELSE 0 END) AS rejected_count,
+            SUM(CASE WHEN human_decision = 'expired'  THEN 1 ELSE 0 END) AS expired_count,
+            COALESCE(AVG(decision_lag_seconds), 0) AS avg_decision_lag_seconds,
+            COALESCE(AVG(price_movement_cents), 0) AS avg_price_movement_cents,
+            COALESCE(SUM(hypothetical_pnl_difference_cents), 0) AS sum_hypothetical_pnl_diff_cents
+          FROM shadow_decisions
+         WHERE message_sent_at >= ?
+        """,
+        (since_iso,),
+    ).fetchone()
+    if row is None:
+        return {
+            "total_proposals": 0,
+            "approved_count": 0,
+            "rejected_count": 0,
+            "expired_count": 0,
+            "avg_decision_lag_seconds": 0.0,
+            "avg_price_movement_cents": 0.0,
+            "sum_hypothetical_pnl_diff_cents": 0,
+        }
+    return {
+        "total_proposals": int(row["total_proposals"] or 0),
+        "approved_count": int(row["approved_count"] or 0),
+        "rejected_count": int(row["rejected_count"] or 0),
+        "expired_count": int(row["expired_count"] or 0),
+        "avg_decision_lag_seconds": float(row["avg_decision_lag_seconds"] or 0.0),
+        "avg_price_movement_cents": float(row["avg_price_movement_cents"] or 0.0),
+        "sum_hypothetical_pnl_diff_cents": int(row["sum_hypothetical_pnl_diff_cents"] or 0),
+    }

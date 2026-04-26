@@ -266,7 +266,6 @@ async def _amain(config_path: Path) -> int:
     approval_gate = ApprovalGate(
         db=db,
         config=ApprovalGateConfig(
-            mode=cfg.approval.mode,
             entry_timeout_sec=cfg.approval.entry_timeout_sec,
             stop_loss_timeout_sec=cfg.approval.stop_loss_timeout_sec,
             reentry_timeout_sec=cfg.approval.reentry_timeout_sec,
@@ -275,7 +274,39 @@ async def _amain(config_path: Path) -> int:
         depth_fn=_depth,
     )
 
-    dry_run_executor = DryRunExecutor(db=db, orderbook_fn=_orderbook, depth_fn=_depth)
+    # ---- Phase 4 Part 1: live executor switch + reconciliation ----
+    # Pick executor based on cfg.execution.mode. The two flavors
+    # share the async submit / update_position_marks / close_resolved
+    # surface; loops are oblivious.
+    from trumpbot.execution.live_executor import HaltCallback, KalshiExecutor
+
+    def _halt_bot(reason: str) -> None:
+        from trumpbot.db.repositories import set_system_state
+
+        set_system_state(db, key="halt_flag", value="true")
+        insert_system_event(
+            db,
+            event_type="halted_by_state_error",
+            severity="error",
+            component="kalshi_executor",
+            message=f"halted by StateError: {reason[:240]}",
+            detail={"reason": reason},
+        )
+        log.error("bot_halted_by_state_error", reason=reason)
+
+    executor: DryRunExecutor | KalshiExecutor
+    if cfg.execution.mode == "live":
+        executor = KalshiExecutor(
+            db=db,
+            kalshi_client=rest_client,
+            orderbook_fn=_orderbook,
+            depth_fn=_depth,
+            halt_callback=HaltCallback(callback=_halt_bot),
+        )
+        log.info("execution_mode_live")
+    else:
+        executor = DryRunExecutor(db=db, orderbook_fn=_orderbook, depth_fn=_depth)
+        log.info("execution_mode_dry_run")
 
     bus.subscribe("news_event_ingested", _make_news_metric_handler())
     bus.subscribe("market_discovered", _make_market_metric_handler(db))
@@ -318,7 +349,7 @@ async def _amain(config_path: Path) -> int:
                     engine=decision_engine,
                     risk=risk_manager,
                     gate=approval_gate,
-                    executor=dry_run_executor,
+                    executor=executor,
                     orderbook=_orderbook,
                     depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
@@ -336,7 +367,7 @@ async def _amain(config_path: Path) -> int:
                     engine=decision_engine,
                     risk=risk_manager,
                     gate=approval_gate,
-                    executor=dry_run_executor,
+                    executor=executor,
                     orderbook=_orderbook,
                     depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
@@ -350,7 +381,7 @@ async def _amain(config_path: Path) -> int:
         "position_marking_loop": asyncio.create_task(
             _supervised(
                 lambda: position_marking_loop(
-                    executor=dry_run_executor,
+                    executor=executor,  # Executor union: dry-run or live
                     poll_interval_sec=cfg.decision.position_marking_loop_interval_sec,
                     stop_event=stop_event,
                 ),
@@ -365,7 +396,7 @@ async def _amain(config_path: Path) -> int:
                     engine=decision_engine,
                     risk=risk_manager,
                     gate=approval_gate,
-                    executor=dry_run_executor,
+                    executor=executor,
                     orderbook=_orderbook,
                     depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
@@ -509,6 +540,132 @@ async def _amain(config_path: Path) -> int:
                     stop_event=stop_event,
                 ),
                 "source_health_loop",
+                critical=False,
+            )
+        )
+
+    # ---- Phase 4 Part 1: live-mode side tasks ------------------------
+    # Bankroll sync + settlement detector run only in live mode (they
+    # poll Kalshi REST endpoints that don't apply to a dry-run session).
+    # Startup reconciliation runs as a one-shot before the main loops
+    # are allowed to do anything.
+    if cfg.execution.mode == "live":
+        from trumpbot.account.bankroll_sync import bankroll_sync_loop
+        from trumpbot.account.reconcile import reconcile_once
+        from trumpbot.account.settlement_detector import settlement_loop
+        from trumpbot.notifications.templates import render_template
+
+        # ---- Startup reconciliation (gating) ----
+        log.info("startup_reconciliation_starting")
+        recon = await reconcile_once(db=db, kalshi=rest_client)
+        if not recon.succeeded:
+            log.error("startup_reconciliation_failed")
+            if telegram_bot is not None:
+                with contextlib.suppress(Exception):
+                    rendered = render_template(
+                        "reconciliation_failed",
+                        {"detail": "could not reach Kalshi for /orders or /positions"},
+                    )
+                    await telegram_bot.send_text(rendered.text, silent=False)
+            insert_system_event(
+                db,
+                event_type="startup_reconciliation_failed",
+                severity="error",
+                component="daemon",
+                message=("startup reconciliation failed; trading loops gated"),
+            )
+            # Re-try every 60s until reconciliation succeeds, gating
+            # the main loops until then. Cheap; Kalshi outages don't
+            # last long.
+            while not stop_event.is_set():
+                await asyncio.sleep(60)
+                recon = await reconcile_once(db=db, kalshi=rest_client)
+                if recon.succeeded:
+                    break
+        if recon.has_drift and telegram_bot is not None:
+            with contextlib.suppress(Exception):
+                summary = "\n".join(f"  • [{d.kind}] {d.ticker}: {d.detail}" for d in recon.drifts)
+                rendered = render_template("reconciliation_drift", {"drift_summary": summary})
+                await telegram_bot.send_text(rendered.text, silent=True)
+        elif telegram_bot is not None:
+            with contextlib.suppress(Exception):
+                rendered = render_template(
+                    "reconciliation_ok",
+                    {
+                        "pending_count": recon.pending_count,
+                        "live_count": recon.live_count,
+                        "kalshi_position_count": recon.kalshi_position_count,
+                    },
+                )
+                await telegram_bot.send_text(rendered.text, silent=True)
+
+        # ---- Mode-switched alert (audible critical) ----
+        if telegram_bot is not None:
+            with contextlib.suppress(Exception):
+                from datetime import datetime as _dt
+                from zoneinfo import ZoneInfo
+
+                now_et = _dt.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M ET")
+                bal = await rest_client.get_balance()
+                rendered = render_template(
+                    "mode_switched_live",
+                    {"bankroll": f"${bal.balance / 100:.2f}", "time_et": now_et},
+                )
+                await telegram_bot.send_text(rendered.text, silent=False)
+
+        # ---- Bankroll sync + settlement detector loops ----
+        async def _settlement_notifier(
+            *,
+            ticker: str,
+            result: str,
+            realized_pnl_cents: int,
+            quantity: int,
+            payoff_cents: int,
+        ) -> None:
+            if telegram_bot is None:
+                return
+            template_name = "trade_settled_yes" if result == "yes" else "trade_settled_no"
+            data = {
+                "ticker": ticker,
+                "subject_full_name": "(market)",
+                "quantity": quantity,
+                "entry_price": payoff_cents,  # best-effort
+                "pnl_dollars": f"{realized_pnl_cents / 100:.2f}",
+                "roi": "n/a",
+                "series": "n/a",
+                "remaining_in_series": "n/a",
+                "stop_status": "exit at resolution",
+                "loss_dollars": f"{abs(realized_pnl_cents) / 100:.2f}",
+                "resolution_date": "today",
+            }
+            try:
+                rendered = render_template(template_name, data)
+                await telegram_bot.send_text(rendered.text, silent=True)
+            except Exception as exc:
+                log.warning("settlement_notify_failed", error=repr(exc))
+
+        tasks["bankroll_sync_loop"] = asyncio.create_task(
+            _supervised(
+                lambda: bankroll_sync_loop(
+                    db=db,
+                    kalshi=rest_client,
+                    poll_interval_sec=300,
+                    stop_event=stop_event,
+                ),
+                "bankroll_sync_loop",
+                critical=False,
+            )
+        )
+        tasks["settlement_loop"] = asyncio.create_task(
+            _supervised(
+                lambda: settlement_loop(
+                    db=db,
+                    kalshi=rest_client,
+                    poll_interval_sec=cfg.notifications.settlement_check_interval_seconds,
+                    stop_event=stop_event,
+                    notifier=_settlement_notifier,
+                ),
+                "settlement_loop",
                 critical=False,
             )
         )

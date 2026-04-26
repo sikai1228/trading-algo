@@ -36,11 +36,18 @@ from trumpbot.decision.engine import (
     Position,
 )
 from trumpbot.execution.dry_run import DryRunExecutor, Quote
+from trumpbot.execution.live_executor import KalshiExecutor
 from trumpbot.risk.manager import RiskManager, RiskState
 from trumpbot.types.intents import RiskApprovedOrder, RiskRejection
 from trumpbot.utils.logging import get_logger
 
 log = get_logger(__name__)
+
+
+Executor = DryRunExecutor | KalshiExecutor
+"""Either flavor of executor — the daemon picks one at startup based
+on ``cfg.execution.mode``. Both expose the same ``async submit`` and
+``update_position_marks`` surface; ``close_resolved`` is also shared."""
 
 OrderbookFn = Callable[[str], Quote]
 DepthFn = Callable[[str], list[tuple[int, int]] | None]
@@ -66,7 +73,7 @@ async def decision_loop(
     engine: DecisionEngine,
     risk: RiskManager,
     gate: ApprovalGate,
-    executor: DryRunExecutor,
+    executor: Executor,
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
@@ -109,7 +116,7 @@ async def _run_decision_cycle(
     engine: DecisionEngine,
     risk: RiskManager,
     gate: ApprovalGate,
-    executor: DryRunExecutor,
+    executor: Executor,
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
@@ -181,7 +188,7 @@ async def stop_loss_loop(
     engine: DecisionEngine,
     risk: RiskManager,
     gate: ApprovalGate,
-    executor: DryRunExecutor,
+    executor: Executor,
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
@@ -227,7 +234,7 @@ async def stop_loss_loop(
 
 async def position_marking_loop(
     *,
-    executor: DryRunExecutor,
+    executor: Executor,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
 ) -> None:
@@ -256,7 +263,7 @@ async def reentry_loop(
     engine: DecisionEngine,
     risk: RiskManager,
     gate: ApprovalGate,
-    executor: DryRunExecutor,
+    executor: Executor,
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
@@ -304,7 +311,7 @@ async def _maybe_reentry(  # type: ignore[no-untyped-def]
     engine: DecisionEngine,
     risk: RiskManager,
     gate: ApprovalGate,
-    executor: DryRunExecutor,
+    executor: Executor,
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
@@ -454,7 +461,7 @@ def _open_tickers(db: Database) -> frozenset[str]:
 async def _approve_and_submit(
     decision: RiskApprovedOrder,
     gate: ApprovalGate,
-    executor: DryRunExecutor,
+    executor: Executor,
     db: Database,
 ) -> None:
     approval = await gate.request_approval(decision)
@@ -465,7 +472,7 @@ async def _approve_and_submit(
             decision=approval.decision,
         )
         return
-    result = executor.submit(decision)
+    result = await executor.submit(decision)
     if result.trade_id > 0 and approval.approval_record_id is not None:
         # Backfill the trades.approval_id link.
         with db.transaction() as conn:

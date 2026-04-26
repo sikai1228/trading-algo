@@ -25,13 +25,22 @@ from trumpbot.kalshi.exceptions import (
 from trumpbot.kalshi.rate_limit import TokenBucket, rate_limited
 from trumpbot.kalshi.schemas import (
     KalshiBalance,
+    KalshiCancelOrderResponse,
     KalshiCandlesticksResponse,
+    KalshiCreateOrderResponse,
     KalshiEventResponse,
     KalshiMarket,
     KalshiMarketListResponse,
     KalshiMarketResponse,
+    KalshiOrder,
     KalshiOrderbook,
     KalshiOrderbookResponse,
+    KalshiOrderListResponse,
+    KalshiOrderResponse,
+    KalshiPosition,
+    KalshiPositionListResponse,
+    KalshiSettlement,
+    KalshiSettlementListResponse,
 )
 from trumpbot.utils.logging import get_logger
 
@@ -179,6 +188,174 @@ class KalshiClient:
     async def get_balance(self) -> KalshiBalance:
         return await self._request("GET", "/portfolio/balance", model=KalshiBalance)
 
+    # -- Phase 4: order placement, lookups, cancellation -----------------
+
+    @rate_limited()
+    async def place_order(
+        self,
+        *,
+        ticker: str,
+        client_order_id: str,
+        action: str,
+        side: str,
+        count: int,
+        order_type: str = "limit",
+        yes_price: int | None = None,
+        no_price: int | None = None,
+        time_in_force: str = "FOK",
+    ) -> KalshiOrder:
+        """POST /portfolio/orders.
+
+        ``client_order_id`` MUST be a UUIDv4 the caller has already
+        persisted to ``trades.client_order_id``. This is the
+        idempotency key Kalshi uses; submitting the same value twice
+        is a no-op (the second call returns the original order).
+
+        ``time_in_force='FOK'`` (Fill-Or-Kill) matches the engine's
+        all-or-nothing sizing assumption: either we get the full target
+        quantity at acceptable prices or the order is killed and no
+        position is opened.
+
+        ``retry_on_transient=False`` so a network blip during submission
+        can never silently resubmit. Caller catches ``TransientError``
+        and asks ``get_order_by_client_id`` whether the original landed.
+        """
+        body: dict[str, Any] = {
+            "ticker": ticker,
+            "client_order_id": client_order_id,
+            "action": action,
+            "side": side,
+            "count": count,
+            "type": order_type,
+            "time_in_force": time_in_force,
+        }
+        if yes_price is not None:
+            body["yes_price"] = yes_price
+        if no_price is not None:
+            body["no_price"] = no_price
+        resp = await self._request(
+            "POST",
+            "/portfolio/orders",
+            json_body=body,
+            model=KalshiCreateOrderResponse,
+            retry_on_transient=False,
+        )
+        return resp.order
+
+    @rate_limited()
+    async def get_order(self, order_id: str) -> KalshiOrder:
+        """GET /portfolio/orders/{order_id}. Used by reconciliation when
+        we have a stored ``kalshi_order_id`` and want fresh status."""
+        resp = await self._request(
+            "GET",
+            f"/portfolio/orders/{order_id}",
+            model=KalshiOrderResponse,
+        )
+        return resp.order
+
+    async def get_order_by_client_id(self, client_order_id: str) -> KalshiOrder | None:
+        """Look up an order by our locally-generated client_order_id.
+
+        Kalshi exposes this through /portfolio/orders?client_order_id=...
+        Used to recover from a transient submission failure: if the
+        network died after we sent the request, the order may or may
+        not have landed -- this answers definitively.
+
+        Returns ``None`` if no order with that client_order_id exists.
+        """
+        resp = await self._request(
+            "GET",
+            "/portfolio/orders",
+            params={"client_order_id": client_order_id, "limit": 1},
+            model=KalshiOrderListResponse,
+        )
+        for order in resp.orders:
+            if order.client_order_id == client_order_id:
+                return order
+        return None
+
+    @rate_limited()
+    async def list_orders(
+        self,
+        *,
+        ticker: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> KalshiOrderListResponse:
+        """GET /portfolio/orders. Pages of recent orders."""
+        params: dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request(
+            "GET",
+            "/portfolio/orders",
+            params=params,
+            model=KalshiOrderListResponse,
+        )
+
+    @rate_limited()
+    async def cancel_order(self, order_id: str) -> KalshiOrder:
+        """DELETE /portfolio/orders/{order_id}. Used by /halt to clear
+        any resting orders. FOK orders are typically already
+        terminal, so this mostly affects future order types."""
+        resp = await self._request(
+            "DELETE",
+            f"/portfolio/orders/{order_id}",
+            model=KalshiCancelOrderResponse,
+            retry_on_transient=False,
+        )
+        return resp.order
+
+    @rate_limited()
+    async def get_positions(
+        self,
+        *,
+        ticker: str | None = None,
+        limit: int = 200,
+        cursor: str | None = None,
+    ) -> list[KalshiPosition]:
+        """GET /portfolio/positions. Returns the flattened list of
+        market positions; event-level positions are dropped (we trade
+        per-market, not per-event)."""
+        params: dict[str, Any] = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+        resp = await self._request(
+            "GET",
+            "/portfolio/positions",
+            params=params,
+            model=KalshiPositionListResponse,
+        )
+        return list(resp.market_positions)
+
+    @rate_limited()
+    async def get_settlements(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> list[KalshiSettlement]:
+        """GET /portfolio/settlements. Returns recent settlement events
+        used by the live-mode settlement detector to close out trades
+        once a market resolves."""
+        params: dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        resp = await self._request(
+            "GET",
+            "/portfolio/settlements",
+            params=params,
+            model=KalshiSettlementListResponse,
+        )
+        return list(resp.settlements)
+
     @rate_limited()
     async def get_market_candlesticks(
         self,
@@ -214,7 +391,9 @@ class KalshiClient:
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
         model: type[T],
+        retry_on_transient: bool = True,
     ) -> T:
         url = f"{self._base_url}{path}"
         # Kalshi signs the FULL path including the API_PATH_PREFIX. The
@@ -229,8 +408,16 @@ class KalshiClient:
                 method=method,
                 path=sign_path,
             ).as_dict()
+            if json_body is not None:
+                headers["Content-Type"] = "application/json"
             try:
-                response = await self._http.request(method, url, params=params, headers=headers)
+                response = await self._http.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    headers=headers,
+                )
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 raise TransientError(
                     f"network error: {exc!r}",
@@ -239,6 +426,13 @@ class KalshiClient:
                 ) from exc
             return self._parse_response(response, method=method, path=path, model=model)
 
+        # Order placement (and other non-idempotent endpoints) MUST NOT
+        # auto-retry on transient errors: a 5xx or socket timeout could
+        # indicate the order landed but the response didn't, and a blind
+        # retry would create a duplicate. Caller suppresses retries and
+        # then queries Kalshi by client_order_id to determine real state.
+        if not retry_on_transient:
+            return await attempt()
         return await self._with_retries(attempt, method=method, path=path)
 
     async def _with_retries(

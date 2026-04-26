@@ -84,6 +84,9 @@ def test_only_critical_alerts_are_audible() -> None:
         "alert_critical_daemon_crash",
         "alert_critical_contract_changed",
         "alert_critical_resolution_rules_changed_midevent",
+        # Phase 4 Part 1: live-mode critical alerts.
+        "reconciliation_failed",
+        "mode_switched_live",
     }
     assert audible_names == expected
 

@@ -25,6 +25,7 @@ core logic pure-async and makes mocking trivial.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -32,8 +33,11 @@ from datetime import UTC, datetime, timedelta
 from trumpbot.approval.message_templates import format_message
 from trumpbot.db.connection import Database
 from trumpbot.db.repositories import (
+    ShadowSnapshot,
+    insert_shadow_decision_at_send,
     insert_system_event,
     insert_telegram_approval,
+    update_shadow_decision_at_decision,
     update_telegram_approval,
 )
 from trumpbot.execution.fees import calculate_entry_fee_cents
@@ -63,12 +67,25 @@ FOK_QTY_DRIFT_TOLERANCE_PCT = 0.20
 DepthFn = Callable[[str], Sequence[tuple[int, int]] | None]
 
 
+APPROVAL_MODE: str = "human"
+"""HARDCODED v1 approval mode. Auto-approve is not reachable through
+config — it can only be enabled by editing this constant. The
+``shadow_decisions`` table (Phase 4 Part 1) collects empirical
+evidence to inform a future graduation."""
+
+
 @dataclass(frozen=True)
 class ApprovalGateConfig:
-    mode: str = "human"
     entry_timeout_sec: int = 180
     stop_loss_timeout_sec: int | None = None
     reentry_timeout_sec: int | None = None
+
+    @property
+    def mode(self) -> str:
+        """Always returns the module-level ``APPROVAL_MODE`` constant.
+        Kept as a property for backwards compatibility with any
+        snapshots / tests that read ``cfg.mode`` directly."""
+        return APPROVAL_MODE
 
 
 class ApprovalRequester:
@@ -125,6 +142,17 @@ class ApprovalGate:
             chat_id=chat_id,
             expires_at=expires_at,
         )
+
+        # ---- Phase 4 Part 1: shadow capture at send time ----
+        # Take a deterministic snapshot of the orderbook RIGHT BEFORE we
+        # send the proposal. Pairs with a decision-time snapshot below
+        # to back the /shadow_report query. Stop-loss intents are
+        # excluded — they're emergency exits, not auto-approve
+        # candidates, so the shadow comparison doesn't apply.
+        send_at_iso = datetime.now(UTC).isoformat()
+        if isinstance(intent, TradeIntent | ReentryIntent):
+            self._capture_shadow_at_send(intent, send_at_iso)
+
         try:
             telegram_message_id = await self._requester.send_request(
                 intent_id=intent.intent_id,
@@ -201,12 +229,110 @@ class ApprovalGate:
             decision_source=source,
             telegram_message_id=telegram_message_id,
         )
+
+        # ---- Phase 4 Part 1: shadow capture at decision time ----
+        if isinstance(intent, TradeIntent | ReentryIntent):
+            self._capture_shadow_at_decision(intent, decision)
+
         return ApprovalDecision(
             intent_id=intent.intent_id,
             decision=decision,  # type: ignore[arg-type]
             decided_at=datetime.now(UTC),
             decision_source=source,  # type: ignore[arg-type]
             approval_record_id=record_id,
+        )
+
+    def _capture_shadow_at_send(
+        self,
+        intent: TradeIntent | ReentryIntent,
+        sent_at_iso: str,
+    ) -> None:
+        """Persist the orderbook snapshot at message-send time. The
+        decision-time half is filled in by
+        :meth:`_capture_shadow_at_decision` once the user responds.
+        Logs and swallows errors — shadow tracking is best-effort and
+        must never block an approval flow."""
+        try:
+            snapshot = self._build_shadow_snapshot(intent)
+        except Exception as exc:
+            log.warning(
+                "shadow_snapshot_at_send_failed",
+                intent_id=intent.intent_id,
+                error=repr(exc),
+            )
+            return
+        if snapshot is None:
+            return
+        try:
+            insert_shadow_decision_at_send(
+                self._db,
+                intent_id=intent.intent_id,
+                intent_type=intent.intent_type,
+                ticker=intent.ticker,
+                sent_at_iso=sent_at_iso,
+                snapshot=snapshot,
+            )
+        except Exception as exc:
+            log.warning(
+                "shadow_insert_at_send_failed",
+                intent_id=intent.intent_id,
+                error=repr(exc),
+            )
+
+    def _capture_shadow_at_decision(
+        self,
+        intent: TradeIntent | ReentryIntent,
+        decision: str,
+    ) -> None:
+        """Update the shadow row with the decision-time snapshot +
+        derived diff fields. Best-effort; failures are logged."""
+        try:
+            snapshot = self._build_shadow_snapshot(intent)
+        except Exception as exc:
+            log.warning(
+                "shadow_snapshot_at_decision_failed",
+                intent_id=intent.intent_id,
+                error=repr(exc),
+            )
+            snapshot = None
+        try:
+            update_shadow_decision_at_decision(
+                self._db,
+                intent_id=intent.intent_id,
+                decision_made_at_iso=datetime.now(UTC).isoformat(),
+                human_decision=decision,
+                snapshot=snapshot,
+            )
+        except Exception as exc:
+            log.warning(
+                "shadow_update_at_decision_failed",
+                intent_id=intent.intent_id,
+                error=repr(exc),
+            )
+
+    def _build_shadow_snapshot(self, intent: TradeIntent | ReentryIntent) -> ShadowSnapshot | None:
+        """Run the same walk the executor would, against the live book.
+        Returns ``None`` when the depth_fn isn't configured or the book
+        is empty — the caller skips the snapshot in that case."""
+        if self._depth_fn is None:
+            return None
+        levels = self._depth_fn(intent.ticker)
+        if not levels:
+            return None
+        rewalk = walk_orderbook_for_buy(
+            levels,
+            target_dollars_cents=intent.target_size_usd_cents,
+            max_price_cents=intent.target_price_cents,
+            fee_calculator=calculate_entry_fee_cents,
+        )
+        # The current best ask = the lowest price level present.
+        best_ask = min((p for p, _q in levels), default=0)
+        return ShadowSnapshot(
+            yes_ask_cents=int(best_ask),
+            avg_fill_cents=int(rewalk.average_fill_price_cents),
+            filled_quantity=int(rewalk.filled_quantity),
+            estimated_cost_cents=int(rewalk.total_cost_cents),
+            orderbook_json=json.dumps(list(rewalk.levels_consumed)),
         )
 
     def _fok_kill_reason(self, intent: TradeIntent | ReentryIntent) -> str | None:

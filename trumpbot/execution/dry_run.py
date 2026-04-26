@@ -100,8 +100,13 @@ class DryRunExecutor:
 
     # -- main API -----------------------------------------------------
 
-    def submit(self, approved: RiskApprovedOrder) -> ExecutionResult:
-        """Simulate a fill and persist the resulting trade record."""
+    async def submit(self, approved: RiskApprovedOrder) -> ExecutionResult:
+        """Simulate a fill and persist the resulting trade record.
+
+        ``async`` so the call site can be uniform with
+        :class:`KalshiExecutor.submit` (which awaits Kalshi's REST
+        API). The dry-run path never actually awaits anything; the
+        keyword is purely for interface symmetry."""
         intent = approved.intent
         if isinstance(intent, StopLossIntent):
             return self._submit_stop_loss(intent, approved)

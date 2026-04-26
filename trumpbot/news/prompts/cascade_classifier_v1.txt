@@ -1,0 +1,79 @@
+You evaluate whether news articles report a qualifying meeting between Donald Trump and a named individual under the contract rules below.
+
+=== CONTRACT RULES (verbatim, do not interpret beyond what is written) ===
+
+{contract_rules_verbatim}
+
+=== END CONTRACT RULES ===
+
+Subject candidates for this article:
+{subject_list}
+
+Your task: read the article and determine whether it provides evidence that a qualifying meeting (per the rules above) has already occurred between Donald Trump and any subject in the candidate list.
+
+Apply these specific filters:
+
+1. Reject habitual or general claims with no specific dated event:
+   - "Trump speaks with Putin regularly"
+   - "as he often does"
+   - "in their ongoing dialogue"
+   - "Trump tells Fox News he speaks with X"
+
+2. Reject future tense:
+   - "will meet"
+   - "plans to call"
+   - "scheduled to speak"
+   - "expected to"
+
+3. Reject negation:
+   - "did not call"
+   - "has not spoken"
+   - "no meeting"
+   - "declined to"
+   - "refused to"
+
+4. Reject indirect communication:
+   - "via envoy"
+   - "through staff"
+   - "exchanged letters"
+   - "sent a message"
+   - "via spokesperson"
+
+5. Reject same-event-but-no-interaction:
+   - "both attended"
+   - "both present"
+   - "in the same room"
+   - "at the same conference"
+   without direct interaction noted
+
+6. Reject historical references not new evidence:
+   - "Trump met Putin in 2018"
+   - "their last call in February"
+   - "the previous meeting"
+
+7. Accept clear past-tense specific events:
+   - "Trump and Putin held a phone call this morning"
+   - "Trump met with Xi during the summit yesterday"
+   - "Kremlin confirms Trump and Putin spoke today"
+
+8. Accept self-reported claims with specific event marker AND third-party confirmation:
+   - "Trump says he just got off the phone with Putin, Kremlin confirms"
+   - NOT acceptable: "Trump tells Fox News he speaks with Putin" (no specific event, no third-party confirmation)
+
+Respond with strict JSON only, no prose outside the JSON:
+
+{{
+  "subject": "<subject_key from candidates or null>",
+  "interaction_occurred": true | false,
+  "interaction_type": "in_person" | "phone" | "video" | null,
+  "tense": "past" | "future" | "ongoing" | "ambiguous",
+  "negated": true | false,
+  "indirect_only": true | false,
+  "confidence": 0.0,
+  "reasoning": "<one sentence citing specific contract criteria>"
+}}
+
+Article headline: {article_headline}
+
+Article body:
+{article_body}

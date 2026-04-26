@@ -36,7 +36,7 @@ from trumpbot.db.repositories import (
 )
 from trumpbot.discovery.subjects import DEFAULT_SUBJECT_ALIASES, SubjectExtractor
 from trumpbot.events.bus import EventBus
-from trumpbot.news.matcher import NewsMatcher
+from trumpbot.news.matcher import PASSED_REASON, NewsMatcher
 
 # A throwaway extractor passed to MatcherWorker.matcher so the constructor
 # is happy. _process_batch builds its own merged extractor on each batch,
@@ -215,9 +215,12 @@ class TestEndToEndMatch:
             )
         )
         assert len(rows) == 1
-        assert rows[0]["confidence"] == 1.0  # direct verb in headline
+        # Phase 4 Part 2.8: Stage 1 always emits confidence=0.0; the
+        # LLM cascade (not active in this test) is what would set it
+        # to >= 0.85.
+        assert rows[0]["confidence"] == 0.0
         assert rows[0]["matched_subject"] == "vladimirputin"
-        assert "direct_verb" in rows[0]["match_reason"]
+        assert rows[0]["match_reason"] == PASSED_REASON
         db.close()
 
     async def test_unknown_subject_still_returns_zero(self, tmp_path: Path) -> None:
@@ -255,5 +258,8 @@ class TestEndToEndMatch:
         )
         assert len(rows) == 1
         assert rows[0]["confidence"] == 0.0
+        # Phase 4 Part 2.8: failed pre-filter reasons are namespaced
+        # under "failed_pre_filter:" with the specific cause appended.
         assert "unknown_subject" in rows[0]["match_reason"]
+        assert rows[0]["match_reason"].startswith("failed_pre_filter:")
         db.close()

@@ -209,9 +209,9 @@ class TaxTrackingConfig(BaseModel):
 
 
 class AliasEnrichmentConfig(BaseModel):
-    """LLM-enrichment knobs. ``monthly_cap_usd_cents`` doubles as the
-    cap for the future classifier -- one budget for all Anthropic
-    calls."""
+    """LLM-enrichment knobs. ``monthly_cap_usd_cents`` is the unified
+    cap for all Anthropic spend (both alias enrichment and the news
+    classifier draw from the same budget)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -220,7 +220,28 @@ class AliasEnrichmentConfig(BaseModel):
     prompt_version: str = "v1"
     model: str = "claude-haiku-4-5"
     max_tokens: int = 512
-    monthly_cap_usd_cents: int = 1000  # $10/month default
+    monthly_cap_usd_cents: int = 2000  # $20/month default (was $10 pre-2.8)
+
+
+class LLMClassifierConfig(BaseModel):
+    """Phase 4 Part 2.8 — Stage 2 LLM cascade for the news classifier.
+
+    Shares the budget pool defined by ``alias_enrichment.monthly_cap_usd_cents``
+    via :class:`LLMCostGuard`. ``enabled=False`` disables Stage 2
+    entirely; the matcher then writes only ``classifier_type='keyword_only'``
+    rows and the decision engine's ``interaction_occurred`` check
+    blocks every trade — same behavior as before Phase 4 Part 2.8."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    model: str = "claude-haiku-4-5"
+    max_input_tokens: int = 2000
+    max_output_tokens: int = 250
+    timeout_sec: int = 10
+    prompt_path: str = "trumpbot/news/prompts/cascade_classifier_v1.txt"
+    prompt_version: str = "v1"
+    contract_path: str = "data/contracts/kxtrumpmeet_rules.txt"
 
 
 class NewsConfig(BaseModel):
@@ -287,6 +308,8 @@ class TrumpbotConfig(BaseModel):
     # Phase 3 Part 2.
     notifications: NotificationsConfig = Field(default_factory=lambda: NotificationsConfig())
     alias_enrichment: AliasEnrichmentConfig = Field(default_factory=lambda: AliasEnrichmentConfig())
+    # Phase 4 Part 2.8 — Stage 2 LLM cascade for the news classifier.
+    llm_classifier: LLMClassifierConfig = Field(default_factory=lambda: LLMClassifierConfig())
     # Phase 4 Part 2.1 — tax tracking + exports.
     tax_tracking: TaxTrackingConfig = Field(default_factory=lambda: TaxTrackingConfig())
 

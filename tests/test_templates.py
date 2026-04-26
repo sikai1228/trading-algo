@@ -91,6 +91,10 @@ def test_only_critical_alerts_are_audible() -> None:
         # is operationally critical — operator must know the bot is
         # trading off stale balance.
         "alert_critical_bankroll_sync_failed",
+        # Phase 4 Part 2.8: contract rules file hash drift detected
+        # mid-run by the LLM classifier. Operator must know whether
+        # Kalshi updated the rules or the file was edited locally.
+        "alert_critical_contract_rules_changed",
     }
     assert audible_names == expected
 

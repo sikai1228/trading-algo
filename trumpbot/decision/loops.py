@@ -440,21 +440,23 @@ async def _maybe_reentry(  # type: ignore[no-untyped-def]
 def _fetch_unevaluated_matches(db: Database) -> list:  # type: ignore[type-arg]
     """Recent high-confidence LLM-cascade matches not yet evaluated.
 
-    Phase 2 reads ``classifier_type`` (added by Phase-1.5 migration 003)
-    so it only triggers on LLM-classified rows. If migration 003 hasn't
-    been applied yet the column is missing — we fall back to filtering
-    by confidence alone but the keyword-only rows have
-    interaction_occurred=False (synthesized in the daemon mapping below)
-    so they won't fire trades.
+    Phase 4 Part 2.8 — joins ``llm_classifications`` so the snapshot
+    builder sees ``parsed_interaction_occurred`` directly. The decision
+    engine still reads ``confidence`` and ``interaction_occurred`` off
+    the snapshot; that's what gates a trade.
     """
     conn = db.connect()
     try:
         return list(
             conn.execute(
                 """
-                SELECT m.*
+                SELECT m.*,
+                       c.parsed_interaction_occurred AS parsed_interaction_occurred,
+                       c.parsed_subject AS parsed_subject,
+                       c.parsed_confidence AS parsed_confidence
                 FROM news_market_matches m
                 LEFT JOIN trades t ON t.triggering_match_id = m.id
+                LEFT JOIN llm_classifications c ON c.id = m.llm_classification_id
                 WHERE m.confidence >= 0.85
                   AND t.id IS NULL
                   AND m.created_at >= datetime('now', '-1 hour')
@@ -480,18 +482,33 @@ def _get_market_row(db: Database, ticker: str):  # type: ignore[no-untyped-def]
 
 
 def _row_to_snapshot(match_row, market_row) -> MatchSnapshot:  # type: ignore[no-untyped-def]
-    classifier_type = None
+    """Project a ``news_market_matches`` row (joined with
+    ``llm_classifications``) into a :class:`MatchSnapshot` for the
+    decision engine.
+
+    Phase 4 Part 2.8: ``interaction_occurred`` now reads the LLM's
+    ``parsed_interaction_occurred`` directly. For rows without an LLM
+    classification (cap-hit / disabled / pre-2.8 backlog) we fall
+    through to ``False`` — keyword-only matches must never fire trades.
+    """
+    classifier_type: str | None = None
+    parsed_interaction_raw: object = None
     with contextlib.suppress(IndexError, KeyError):
         classifier_type = match_row["classifier_type"]
+    with contextlib.suppress(IndexError, KeyError):
+        parsed_interaction_raw = match_row["parsed_interaction_occurred"]
+
+    if classifier_type == "llm_cascade" and parsed_interaction_raw is not None:
+        # SQLite stores the BOOLEAN as 0/1; treat truthy as True.
+        interaction_occurred = bool(parsed_interaction_raw)
+    else:
+        interaction_occurred = False
+
     return MatchSnapshot(
         match_id=match_row["id"],
         ticker=match_row["ticker"],
         confidence=match_row["confidence"],
-        # Conservative default: only LLM-classified rows have
-        # interaction_occurred=True. Without Phase-1.5 LLM cascade
-        # deployed, every match fails this check (correct — we don't
-        # want to fire trades on keyword-only signal).
-        interaction_occurred=classifier_type in {"llm_haiku", "llm_haiku_cached"},
+        interaction_occurred=interaction_occurred,
         source_name="unknown",
         is_kalshi_approved=True,  # filter happens at ingestion
         market_open_ts=market_row["open_ts"],

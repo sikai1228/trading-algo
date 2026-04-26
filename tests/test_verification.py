@@ -26,7 +26,7 @@ from trumpbot.market_data.kalshi_ws import (
     _IncomingMessage,
     _MarketBook,
 )
-from trumpbot.news.matcher import MarketContext, NewsMatcher
+from trumpbot.news.matcher import PASSED_REASON, MarketContext, NewsMatcher
 
 # ---------------------------------------------------------------------------
 # S4: rate limiter cap under burst
@@ -149,27 +149,27 @@ def matcher() -> NewsMatcher:
 
 
 class TestMatcherEdgeCases:
+    """Phase 4 Part 2.8: matcher is the Stage-1 pre-filter (Trump +
+    subject + interaction term). All confidence scoring moved to the
+    LLM cascade. These tests pin pre-filter pass/fail behavior."""
+
     def test_present_tense_calls_in_headline(self, matcher: NewsMatcher) -> None:
-        # Headline-style present tense ("Trump calls Putin") should match.
         [r] = matcher.match(
             headline="Trump calls Putin to discuss ceasefire",
             body=None,
             markets=[MarketContext(ticker="T", subject="putin")],
         )
-        assert r.confidence == 1.0
+        assert r.match_reason == PASSED_REASON
 
     def test_subject_possessive_pre_apostrophe(self, matcher: NewsMatcher) -> None:
-        # "Putin's spokesman said Trump called" — Trump did the calling
-        # and the subject 'putin' is mentioned (regex \b matches before
-        # the apostrophe). This SHOULD register as a high-confidence
-        # match per the brief: the article is about Trump talking to
-        # the Putin orbit.
+        # "Putin's spokesman said Trump called" — pre-filter sees
+        # Trump + Putin + 'called', passes to Stage 2.
         [r] = matcher.match(
             headline="Putin's spokesman said Trump called",
             body=None,
             markets=[MarketContext(ticker="T", subject="putin")],
         )
-        assert r.confidence == 1.0
+        assert r.match_reason == PASSED_REASON
 
     def test_quoted_self_claim_in_headline(self, matcher: NewsMatcher) -> None:
         [r] = matcher.match(
@@ -177,17 +177,17 @@ class TestMatcherEdgeCases:
             body=None,
             markets=[MarketContext(ticker="T", subject="putin")],
         )
-        assert r.confidence == 1.0
+        assert r.match_reason == PASSED_REASON
 
     def test_subject_speech_alone_does_not_match(self, matcher: NewsMatcher) -> None:
-        # "Putin gave a speech" — no Trump, should be confidence 0.
+        # "Putin gave a speech" — no Trump, fails pre-filter.
         [r] = matcher.match(
             headline="Putin gave a speech to Russian parliament",
             body=None,
             markets=[MarketContext(ticker="T", subject="putin")],
         )
         assert r.confidence == 0.0
-        assert r.match_reason == "no_trump_mention"
+        assert "no_trump" in r.match_reason
 
     def test_multiple_subjects_per_article(self, matcher: NewsMatcher) -> None:
         markets = [
@@ -201,21 +201,20 @@ class TestMatcherEdgeCases:
             markets=markets,
         )
         by_t = {r.ticker: r for r in results}
-        assert by_t["A"].confidence == 1.0
-        assert by_t["B"].confidence == 1.0
-        assert by_t["C"].confidence == 0.0
+        assert by_t["A"].match_reason == PASSED_REASON
+        assert by_t["B"].match_reason == PASSED_REASON
+        assert "no_subject" in by_t["C"].match_reason
 
     def test_indirect_communication_letter_to_subject(self, matcher: NewsMatcher) -> None:
-        # CLAUDE.md: "Trump sent letter to Xi" — does NOT qualify as
-        # direct conversation. Must produce confidence <= 0.5 with an
-        # indirect_communication reason.
+        # Stage 1 NO LONGER gates indirect communication — that's the
+        # LLM's job. Pre-filter sees Trump + Xi + 'letter' (interaction
+        # term) and passes.
         [r] = matcher.match(
             headline="Trump sent a letter to Xi yesterday",
             body=None,
             markets=[MarketContext(ticker="T", subject="xi")],
         )
-        assert r.confidence == 0.5
-        assert "indirect_communication" in r.match_reason
+        assert r.match_reason == PASSED_REASON
 
 
 class TestMatcherPerformance:

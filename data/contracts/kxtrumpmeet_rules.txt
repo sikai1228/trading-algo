@@ -1,0 +1,22 @@
+If Donald Trump and [input name] meet (including phone calls) before May 1, 2026, then the market resolves to Yes. Sources from The Washington Post, official social media accounts verified by the platform, official press release distribution services, Fox News, MSNBC, The Wall Street Journal, Semafor, The Information, ABC, the Associated Press, NBC, photographic or video evidence from accredited media organizations, Axios, official government websites, The New York Times, Politico, CNN, official readouts from relevant governments or organizations, Reuters, CBS, and Bloomberg News.
+A meeting is defined as any of the following:
+
+* An in-person encounter where both parties are physically present in the same location
+* A virtual meeting via video conference where both parties can see and hear each other in real-time
+* A phone call where both parties speak directly to each other
+* Any combination of the above where the parties interact directly in real-time
+
+The following qualify as meetings (though this list is not exhaustive):
+* Formal bilateral meetings, summits, or conferences
+* Informal encounters at multilateral events if documented by Source Agencies
+* Working dinners, lunches, or other meal meetings
+* Pull-aside meetings or corridor conversations if documented
+* Home visits or meetings at non-official locations
+
+The following do NOT qualify as meetings:
+* Being present at the same event without direct interaction
+* Exchanging written correspondence
+* Communication through intermediaries without direct contact
+* Pre-recorded messages or asynchronous communication
+* Meetings cancelled after being scheduled
+* Near-misses where parties were scheduled to meet but did not

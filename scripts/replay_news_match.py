@@ -72,13 +72,17 @@ def main() -> None:
         markets=contexts,
         article_published_ts=event["raw_published_ts"],
     )
-    interesting = [r for r in results if r.confidence > 0]
-    print(f"Matched against {len(contexts)} active markets ({len(interesting)} non-zero):\n")
-    for r in sorted(results, key=lambda x: x.confidence, reverse=True):
-        if r.confidence == 0:
-            continue
+    # Phase 4 Part 2.8: matcher writes confidence=0.0 for everything;
+    # interesting rows are the ones whose match_reason is
+    # "passed_pre_filter" (the LLM cascade picks them up).
+    passed = [r for r in results if r.match_reason == "passed_pre_filter"]
+    print(
+        f"Matched against {len(contexts)} markets — {len(passed)} passed Stage 1 "
+        "(pre-filter); remaining failed_pre_filter rows omitted from this view.\n"
+    )
+    for r in passed:
         print(
-            f"  conf={r.confidence:.2f}  {r.ticker} (subject={r.matched_subject})\n"
+            f"  PASSED  {r.ticker} (subject={r.matched_subject})\n"
             f"    keywords={r.matched_keywords}\n"
             f"    reason={r.match_reason}\n"
         )

@@ -411,6 +411,39 @@ def insert_news_matches(db: Database, rows: Iterable[NewsMatchRow]) -> None:
         conn.executemany(sql, payload)
 
 
+def insert_news_match_returning_id(db: Database, row: NewsMatchRow) -> int:
+    """Insert one match row and return its id.
+
+    Used by the Phase 4 Part 2.8 LLM cascade pipeline so the worker
+    can patch the row after the LLM classifies it. Slightly more
+    expensive than the bulk path; reserved for the per-row
+    classifier loop."""
+    sql = """
+    INSERT INTO news_market_matches (
+        news_event_id, ticker, confidence, matched_subject,
+        matched_keywords, match_reason
+    ) VALUES (
+        :news_event_id, :ticker, :confidence, :matched_subject,
+        :matched_keywords, :match_reason
+    )
+    """
+    with db.transaction() as conn:
+        cur = conn.execute(
+            sql,
+            {
+                "news_event_id": row.news_event_id,
+                "ticker": row.ticker,
+                "confidence": row.confidence,
+                "matched_subject": row.matched_subject,
+                "matched_keywords": (
+                    json.dumps(row.matched_keywords) if row.matched_keywords else None
+                ),
+                "match_reason": row.match_reason,
+            },
+        )
+        return int(cur.lastrowid or 0)
+
+
 def recent_high_confidence_matches(
     db: Database, *, min_confidence: float = 0.5, limit: int = 50
 ) -> list[sqlite3.Row]:
@@ -1512,3 +1545,256 @@ def shadow_report_summary(db: Database, *, since_iso: str) -> dict[str, int | fl
         "avg_price_movement_cents": float(row["avg_price_movement_cents"] or 0.0),
         "sum_hypothetical_pnl_diff_cents": int(row["sum_hypothetical_pnl_diff_cents"] or 0),
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Part 2.8 — LLM cascade tables
+# ---------------------------------------------------------------------------
+
+
+def insert_llm_classification(
+    *,
+    db: Database,
+    news_event_id: int,
+    prompt_version: str,
+    contract_hash: str,
+    model: str,
+    request_payload: str,
+    response_text: str | None,
+    parsed: Any,  # ClassificationResult | None — typed Any to avoid module cycle
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cost_micro_usd: int | None,
+    error: str | None,
+) -> int:
+    """Insert one ``llm_classifications`` row. Returns the new id.
+
+    ``parsed`` is the ClassificationResult Pydantic instance from
+    :mod:`trumpbot.news.llm_classifier`, or ``None`` on failure. We
+    take it as ``Any`` so this module doesn't import the classifier
+    (the dependency arrow points the other way).
+    """
+    if parsed is None:
+        parsed_subject = None
+        parsed_response = None
+        parsed_interaction = None
+        parsed_type = None
+        parsed_tense = None
+        parsed_negated = None
+        parsed_indirect = None
+        parsed_confidence = None
+        parsed_reasoning = None
+    else:
+        parsed_subject = getattr(parsed, "subject", None)
+        parsed_response = json.dumps(parsed.model_dump())
+        parsed_interaction = 1 if parsed.interaction_occurred else 0
+        parsed_type = parsed.interaction_type
+        parsed_tense = parsed.tense
+        parsed_negated = 1 if parsed.negated else 0
+        parsed_indirect = 1 if parsed.indirect_only else 0
+        parsed_confidence = float(parsed.confidence)
+        parsed_reasoning = parsed.reasoning
+
+    with db.transaction() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO llm_classifications (
+                news_event_id, prompt_version, contract_hash, model,
+                request_payload, response_text, parsed_response,
+                parsed_subject, parsed_interaction_occurred,
+                parsed_interaction_type, parsed_tense, parsed_negated,
+                parsed_indirect_only, parsed_confidence, parsed_reasoning,
+                input_tokens, output_tokens, cost_micro_usd, error,
+                classified_at
+            ) VALUES (
+                ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                news_event_id,
+                prompt_version,
+                contract_hash,
+                model,
+                request_payload,
+                response_text,
+                parsed_response,
+                parsed_subject,
+                parsed_interaction,
+                parsed_type,
+                parsed_tense,
+                parsed_negated,
+                parsed_indirect,
+                parsed_confidence,
+                parsed_reasoning,
+                input_tokens,
+                output_tokens,
+                cost_micro_usd,
+                error,
+                utcnow_iso(),
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def fetch_llm_classification(db: Database, classification_id: int) -> sqlite3.Row | None:
+    conn = db.connect()
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT * FROM llm_classifications WHERE id = ?", (classification_id,)
+    ).fetchone()
+    return row
+
+
+def fetch_llm_classification_for_event(db: Database, news_event_id: int) -> sqlite3.Row | None:
+    """The most recent classification for a given news event (if any)."""
+    conn = db.connect()
+    row: sqlite3.Row | None = conn.execute(
+        """
+        SELECT * FROM llm_classifications
+         WHERE news_event_id = ?
+         ORDER BY classified_at DESC
+         LIMIT 1
+        """,
+        (news_event_id,),
+    ).fetchone()
+    return row
+
+
+@dataclass(frozen=True)
+class LLMMatchUpdate:
+    """The fields :func:`update_match_with_classification` overwrites."""
+
+    classifier_type: str  # 'llm_cascade' or 'keyword_only'
+    confidence: float
+    matched_subject: str | None
+    match_reason: str
+    llm_classification_id: int | None
+
+
+def update_match_with_classification(
+    db: Database,
+    *,
+    match_id: int,
+    update: LLMMatchUpdate,
+) -> None:
+    """Patch an existing ``news_market_matches`` row in place.
+
+    Called by the matcher worker after the LLM classifies a Stage-1
+    pre-filter pass: the keyword row is upgraded to a Stage-2 row
+    (or stays keyword-only on cap-hit / failure)."""
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            UPDATE news_market_matches
+               SET classifier_type = ?,
+                   confidence = ?,
+                   matched_subject = ?,
+                   match_reason = ?,
+                   llm_classification_id = ?
+             WHERE id = ?
+            """,
+            (
+                update.classifier_type,
+                update.confidence,
+                update.matched_subject,
+                update.match_reason,
+                update.llm_classification_id,
+                match_id,
+            ),
+        )
+
+
+def fetch_match_with_classification(db: Database, *, match_id: int) -> sqlite3.Row | None:
+    """Read a match row joined with its (optional) LLM classification.
+
+    Used by ``decision/loops.py:_row_to_snapshot`` so the decision
+    engine sees ``parsed_interaction_occurred`` instead of inferring
+    it from a missing column."""
+    conn = db.connect()
+    row: sqlite3.Row | None = conn.execute(
+        """
+        SELECT m.id AS id,
+               m.news_event_id AS news_event_id,
+               m.ticker AS ticker,
+               m.confidence AS confidence,
+               m.matched_subject AS matched_subject,
+               m.matched_keywords AS matched_keywords,
+               m.match_reason AS match_reason,
+               m.classifier_type AS classifier_type,
+               m.llm_classification_id AS llm_classification_id,
+               c.parsed_interaction_occurred AS parsed_interaction_occurred,
+               c.parsed_subject AS parsed_subject,
+               c.parsed_confidence AS parsed_confidence
+          FROM news_market_matches m
+          LEFT JOIN llm_classifications c ON c.id = m.llm_classification_id
+         WHERE m.id = ?
+        """,
+        (match_id,),
+    ).fetchone()
+    return row
+
+
+# ---- llm_spend_daily upsert ------------------------------------------------
+
+
+def upsert_llm_spend_daily(
+    db: Database,
+    *,
+    day_iso: str,  # 'YYYY-MM-DD'
+    cost_micro_usd: int,
+    input_tokens: int,
+    output_tokens: int,
+    cache_hit: bool = False,
+) -> None:
+    """Add one call's cost+tokens to the day's rollup row.
+
+    Idempotent only at the call-grain — calling it twice for the
+    same call double-counts. The cost guard wraps a single
+    ``record_spend`` per call so this stays consistent with
+    ``llm_spend_log``."""
+    with db.transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO llm_spend_daily (
+                date, total_calls, cache_hits,
+                total_input_tokens, total_output_tokens,
+                total_cost_micro_usd, updated_at
+            ) VALUES (?, 1, ?, ?, ?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+                total_calls = total_calls + 1,
+                cache_hits = cache_hits + excluded.cache_hits,
+                total_input_tokens = total_input_tokens + excluded.total_input_tokens,
+                total_output_tokens = total_output_tokens + excluded.total_output_tokens,
+                total_cost_micro_usd = total_cost_micro_usd + excluded.total_cost_micro_usd,
+                updated_at = excluded.updated_at
+            """,
+            (
+                day_iso,
+                1 if cache_hit else 0,
+                input_tokens,
+                output_tokens,
+                cost_micro_usd,
+                utcnow_iso(),
+            ),
+        )
+
+
+def llm_spend_daily_total_cents_since(db: Database, *, day_iso: str) -> int:
+    """Sum of ``total_cost_micro_usd`` (converted back to USDCents) since
+    ``day_iso`` (inclusive). Used by the cap-status query."""
+    conn = db.connect()
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(total_cost_micro_usd), 0) AS micro
+          FROM llm_spend_daily
+         WHERE date >= ?
+        """,
+        (day_iso,),
+    ).fetchone()
+    micro = int(row["micro"] or 0)
+    # micro USD -> cents: 1 cent = 10_000 micro USD
+    return micro // 10_000

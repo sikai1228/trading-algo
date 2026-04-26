@@ -343,6 +343,25 @@ _ALERT_CRITICAL_CONTRACT_CHANGED = MessageTemplate(
     ),
 )
 
+_ALERT_CRITICAL_CONTRACT_RULES_CHANGED = MessageTemplate(
+    category="alert_critical",
+    audible=True,
+    # fields: old_hash, new_hash
+    # Phase 4 Part 2.8 — emitted by the LLM classifier when the
+    # ``data/contracts/kxtrumpmeet_rules.txt`` SHA-256 hash drifts
+    # mid-process. Stripped-down version of
+    # ``alert_critical_contract_changed`` since the classifier path
+    # doesn't have a diff or prompt-version bump to surface.
+    format=(
+        "🚨 CRITICAL: contract rules file changed mid-run.\n\n"
+        "Old hash: {old_hash}...\n"
+        "New hash: {new_hash}...\n\n"
+        "The classifier loaded the new content; future articles use\n"
+        "the new rules. Re-run scripts/snapshot_contract.py if Kalshi\n"
+        "updated the contract; otherwise investigate the file edit."
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # Warning alerts (silent)
 # ---------------------------------------------------------------------------
@@ -1014,6 +1033,7 @@ TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
     "alert_critical_anthropic_auth": _ALERT_CRITICAL_ANTHROPIC_AUTH,
     "alert_critical_daemon_crash": _ALERT_CRITICAL_DAEMON_CRASH,
     "alert_critical_contract_changed": _ALERT_CRITICAL_CONTRACT_CHANGED,
+    "alert_critical_contract_rules_changed": _ALERT_CRITICAL_CONTRACT_RULES_CHANGED,
     # Warning alerts (silent)
     "alert_warning_source_down": _ALERT_WARNING_SOURCE_DOWN,
     "alert_warning_db_slow": _ALERT_WARNING_DB_SLOW,

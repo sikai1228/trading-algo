@@ -94,7 +94,7 @@ def reprocess(*, db_path: Path, hours: int, dry_run: bool) -> dict[str, int]:
 
     # 4. Run matcher across every event x context.
     new_rows: list[NewsMatchRow] = []
-    nonzero = 0
+    passed = 0  # Phase 4 Part 2.8: count pre-filter passes (LLM-eligible)
     for evt in events:
         results = matcher.match(
             headline=evt["headline"],
@@ -113,15 +113,15 @@ def reprocess(*, db_path: Path, hours: int, dry_run: bool) -> dict[str, int]:
                     match_reason=r.match_reason,
                 )
             )
-            if r.confidence > 0:
-                nonzero += 1
+            if r.match_reason == "passed_pre_filter":
+                passed += 1
 
     if dry_run:
         return {
             "events": len(events),
             "matches_deleted": existing_count,
             "matches_written": len(new_rows),
-            "nonzero_matches": nonzero,
+            "passed_pre_filter": passed,
             "dry_run": 1,
         }
 
@@ -138,7 +138,7 @@ def reprocess(*, db_path: Path, hours: int, dry_run: bool) -> dict[str, int]:
         "events": len(events),
         "matches_deleted": existing_count,
         "matches_written": len(new_rows),
-        "nonzero_matches": nonzero,
+        "passed_pre_filter": passed,
     }
 
 

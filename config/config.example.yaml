@@ -195,8 +195,10 @@ bankroll:
 # ----- Phase 3 Part 2: operational features -----------------------------
 
 notifications:
-  # Send a one-line ✓ heartbeat to Telegram every N minutes.
-  heartbeat_interval_minutes: 15
+  # Send a one-line ✓ heartbeat to Telegram every N minutes, ALIGNED
+  # to the wall-clock hour boundary. Default 60 → fires at HH:00 of
+  # every hour. If set to 15 it would fire at :00 / :15 / :30 / :45.
+  heartbeat_interval_minutes: 60
   # Daily-digest fires once at this UTC hour (12 UTC ≈ 8 AM ET in
   # standard time; 13 UTC ≈ 9 AM ET in daylight time).
   digest_hour_utc: 12

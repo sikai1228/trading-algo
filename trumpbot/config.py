@@ -148,7 +148,7 @@ class NotificationsConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    heartbeat_interval_minutes: int = 15
+    heartbeat_interval_minutes: int = 60
     digest_hour_utc: int = 12  # 12 UTC ~ 8 AM ET in standard time
     settlement_check_interval_seconds: int = 300  # 5 min
     source_health_check_interval_seconds: int = 300

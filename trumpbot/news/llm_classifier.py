@@ -90,6 +90,14 @@ class ClassificationResult(BaseModel):
     indirect_only: bool
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str
+    key_quote: str = ""
+    """Verbatim quote from the article supporting the LLM's decision.
+    Phase 4 Part 2.11 added this so trade-approval Telegram messages
+    can render the operator-facing reasoning with the article's own
+    words. The model's instructions ask for max 200 chars; a longer
+    quote is truncated at the template-render boundary rather than
+    rejected by the parser. Defaulted to empty string for back-compat
+    with the v1 prompt during the prompt-version transition."""
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +112,11 @@ class LLMClassifierConfig:
     max_input_tokens: int = 2000
     max_output_tokens: int = 250
     timeout_sec: int = 10
-    prompt_path: str = "trumpbot/news/prompts/cascade_classifier_v1.txt"
-    prompt_version: str = "v1"
+    # Phase 4 Part 2.11 — bumped to v2 to extract a verbatim
+    # ``key_quote`` from the article. The v1 file is retained for
+    # archive only; production loads v2.
+    prompt_path: str = "trumpbot/news/prompts/cascade_classifier_v2.txt"
+    prompt_version: str = "v2"
     contract_path: str = "data/contracts/kxtrumpmeet_rules.txt"
 
 

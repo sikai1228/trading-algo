@@ -483,23 +483,45 @@ Kalshi (re-walk, kill if avg drift / qty drift), then:
      promote to `live` optimistically (the original submission
      landed; we lost only the response)
 
-### Hardcoded human-in-the-loop
+### Approval mode
 
-Auto-approval is **NOT** reachable through any config knob in v1.
-The constant `APPROVAL_MODE = "human"` in
-`trumpbot/approval/gate.py` is the only switch. The Phase 2
-`cfg.approval.mode` field was deliberately removed in Phase 4 — adding
-it back is forbidden, regression-tested by
-`test_approval_mode_hardcoded_human` in
-`tests/test_kalshi_executor.py`.
+Phase 4 Part 2.11 re-introduced `cfg.approval.mode` after the
+`shadow_decisions` audit demonstrated stable signals. The default
+in `main` MUST stay `"human"` — committing `mode: "auto"` in the
+example config or the daemon-default config is a release blocker.
 
-The `shadow_decisions` table (Phase 4 Part 1, migration 007) records
-the orderbook snapshot at message-send-time AND at human-decision-time
-for every `TRADE PROPOSAL`. The `/shadow_report` command aggregates
-these into a "what would have happened if auto-approved?" summary.
-This is data-only: the bot still always asks the human. The table
-is the empirical foundation for the eventual auto-approve graduation
-decision.
+- `"human"` (default): every entry intent sends a Telegram message
+  and waits for the user's `[APPROVE]` / `[REJECT]` response.
+- `"auto"`: entry intents bypass Telegram and synthesize an
+  approved decision in-memory. The gate writes a `telegram_approvals`
+  audit row with `decision_source='auto_approval'` so the table is
+  queryable for every approval, regardless of channel. After the
+  executor finishes, the daemon sends `trade_filled_auto` (success)
+  or `trade_killed_auto` (FOK / error) to the operator.
+
+Stop-loss and re-entry intents ALWAYS require human approval
+regardless of the mode setting. That invariant is enforced inside
+`ApprovalGate.request_approval`, not by config — pinned by
+`tests/test_approval_gate.py::TestAutoApprovalMode::test_stop_loss_in_auto_mode_still_human`
+and `::test_reentry_in_auto_mode_still_human`.
+
+Switching to auto requires:
+
+1. Edit `~/.config/trumpbot/config.yaml`: `approval.mode: "auto"`.
+2. Restart the daemon (`deploy/setup_macos.sh`).
+3. The daemon emits `log.warning("AUTO-APPROVAL ENABLED ...")` in
+   stdout AND fires `alert_critical_auto_approval_enabled` (audible
+   Telegram) so accidental enable is highly visible.
+4. The pre-live checklist (`scripts/pre_live_checklist.py`) returns
+   `passed=False` when the mode is non-human; the operator must
+   acknowledge before going live.
+
+The `shadow_decisions` table (Phase 4 Part 1, migration 007)
+recorded the orderbook snapshot at message-send-time AND at
+human-decision-time for every `TRADE PROPOSAL`. The `/shadow_report`
+command aggregates these into a "what would have happened if
+auto-approved?" summary. The shadow audit was the empirical
+foundation for re-introducing the config knob in 2.11.
 
 ### Bankroll syncing — `trumpbot/account/bankroll_sync.py`
 
@@ -1456,6 +1478,213 @@ heartbeat layers were removed in this PR:
   from `DaemonConfig`, both switched to `extra="ignore"`
 - `config/config.example.yaml` — heartbeat fields commented out
 - `scripts/preview_templates.py` — sample data refreshed
+
+---
+
+## Phase 4 Part 2.11 — auto-approval mode + standardized trade notifications
+
+Two related changes that share infrastructure:
+
+1. **`cfg.approval.mode`** is reachable as a config knob again. See
+   "Approval mode" above for the contract; `"human"` (default) sends
+   every entry intent to Telegram, `"auto"` skips the prompt and
+   informs the user after the executor finishes. Stop-loss and
+   re-entry are always human-in-the-loop.
+
+2. **All trade-related Telegram messages share the same six
+   information categories**: timestamp ET, market (ticker / subject /
+   title), entry contracts + price, potential P&L (settlement +
+   stop), reasoning (key quote from the article), and article link.
+
+### Schema additions (migration 013)
+
+- `llm_classifications.parsed_key_quote` — verbatim sentence the LLM
+  extracts from the article supporting its decision. Rendered into
+  the trade-proposal Telegram messages.
+- `trades.triggering_article_url`, `trades.triggering_source`,
+  `trades.triggering_headline`, `trades.triggering_key_quote`,
+  `trades.triggering_published_ts` — article-context audit captured
+  on every trade-row insert from the joined news_event +
+  llm_classification.
+- `telegram_approvals.decision_source` CHECK widened to admit
+  `'auto_approval'`. Existing values (`telegram_button`,
+  `telegram_command`, `timeout`) unchanged. SQLite couldn't ALTER
+  the constraint so the table was rebuilt; existing rows preserved.
+
+### Prompt v2
+
+`trumpbot/news/prompts/cascade_classifier_v2.txt` adds the
+`key_quote` field to the JSON schema and updates the LLM
+instructions to extract a verbatim 200-char-max quote supporting
+its decision. The classifier defaults switched to
+`prompt_path=cascade_classifier_v2.txt`, `prompt_version="v2"`,
+and `max_output_tokens=320` (was 250) to fit the new field.
+`ClassificationResult.key_quote` was added with default `""` so
+back-compat rows from the v1 prompt still parse.
+
+### TradeIntent + ReentryIntent article context
+
+Five new fields on each: `triggering_article_url`,
+`triggering_source`, `triggering_headline`, `triggering_key_quote`,
+`triggering_published_ts`. Defaulted to empty strings for
+back-compat with synthetic test fixtures. Threaded through the
+DecisionEngine (which reads them off `MatchSnapshot`, populated by
+`_row_to_snapshot` joining news_events + llm_classifications) and
+persisted to the new trade-row columns by both executors.
+
+### ApprovalGate
+
+The hardcoded `APPROVAL_MODE = "human"` constant in
+`trumpbot/approval/gate.py` was REMOVED. `ApprovalGateConfig` gains
+a `mode: str = "human"` field. `request_approval` checks the mode
+for entry intents; for `mode="auto"` it calls `_auto_approve`,
+which writes the audit row and returns immediately. Stop-loss and
+re-entry intents bypass the auto branch unconditionally.
+
+### Daemon startup
+
+`_amain` logs `APPROVAL MODE: HUMAN` (or `AUTO`) at boot, writes a
+`human_approval_enabled` / `auto_approval_enabled` system_event,
+and fires `alert_critical_auto_approval_enabled` (audible Telegram)
+when mode is `"auto"`. The alert is dispatched after `AlertDispatcher`
+is built so it actually reaches the operator.
+
+### Standardized templates
+
+- `_TRADE_PROPOSAL_ENTRY` / `_TRADE_PROPOSAL_REENTRY` /
+  `_TRADE_PROPOSAL_STOP_LOSS` were rebuilt to share the six-category
+  layout. The shared body block (`_PROPOSAL_BODY_V2`) carries every
+  field the entry + re-entry templates need.
+- `_TRADE_FILLED_AUTO` — fires after a successful auto-approved
+  fill. Shows actual fill price, total spent, settlement P&L, key
+  quote, article link.
+- `_TRADE_KILLED_AUTO` — fires after an auto-approved order is
+  killed (FOK book-moved, no-fill, or executor error). Shows the
+  kill reason + kind so the operator can investigate.
+- `_ALERT_CRITICAL_AUTO_APPROVAL_ENABLED` — startup banner.
+
+### Render helpers
+
+`trumpbot/notifications/trade_render.py` is a new module of pure
+helpers consumed by the message adapter and the auto-confirmation
+path:
+
+- `now_et_long` / `now_et_short` / `format_et_long` / `format_et_short`
+  / `humanize_age_since` — ET timestamp formatting via
+  `zoneinfo.ZoneInfo("America/New_York")`.
+- `article_link_markdown` — Telegram-Markdown link with paywall
+  annotation for known sources (NYT, WSJ, Bloomberg, FT, WaPo,
+  Atlantic, New Yorker) and `@handle` extraction for X / Twitter.
+- `render_key_quote` — strips whitespace, truncates at word
+  boundary if > 200 chars.
+- `compute_settlement_pnl` — integer-cents math for "if resolves
+  YES at $1.00" (settlement, exit fees, net profit, ROI in basis
+  points).
+- `compute_potential_loss_cents` — walks the bid-side orderbook to
+  estimate "approx loss if stops out at 50c drop"; falls back to a
+  uniform `entry - stop_drop_cents` floor when the live book isn't
+  available.
+- `dollars` / `dollars_signed` / `percent_from_bps` — display
+  formatters using `decimal.Decimal` (no float drift).
+
+All functions are pure; no I/O, no DB. Tests in
+`tests/test_trade_render.py` pin the math + formatting.
+
+### `_approve_and_submit` post-execute hook
+
+`decision/loops.py:_approve_and_submit` accepts an optional
+`auto_notify: AutoNotifyFn` callable. When the approval source was
+`auto_approval`, the loop calls `_send_auto_confirmation(...)`
+which renders `trade_filled_auto` (on success) or
+`trade_killed_auto` (on rejection) and dispatches via the notifier.
+Best-effort: failures are swallowed so a missed auto-message never
+blocks the next cycle.
+
+### Pre-live checklist
+
+`_check_approval_mode_hardcoded()` (renamed conceptually but not
+function-name-wise) now reads `cfg.approval.mode` and returns
+`passed=False` if it isn't `"human"`. Going live with auto requires
+explicit acknowledgement.
+
+### Test coverage (669 tests passing)
+
+- `test_approval_gate.py::TestAutoApprovalMode` — pins the four
+  branches (entry/auto, entry/human, stop-loss/auto, reentry/auto)
+  and the audit-row + system_event writes.
+- `test_kalshi_executor.py::test_approval_mode_defaults_to_human`
+  + `::test_approval_mode_field_present_and_validated` +
+  `::test_approval_mode_constant_not_re_added` — pins the default,
+  the `Literal["human", "auto"]` validation, and the removal of the
+  hardcoded module-level constant.
+- `test_trade_render.py` — 25+ tests for the new helpers
+  (timestamps, paywall annotation, key-quote truncation, P&L math,
+  formatters).
+- `test_templates.py::test_only_critical_alerts_are_audible` —
+  added `alert_critical_auto_approval_enabled` to the audible-
+  template allowlist.
+- The existing `test_entry_message_contains_required_fields` was
+  updated to assert the six new info categories
+  (⏱ / 📍 / 💵 / 📈 / 📉 / 📰) instead of the old "BUY YES" body.
+
+### File map for Phase 4 Part 2.11
+
+- `migrations/013_phase4_part_2_11_auto_approval_and_article_context.sql`
+- `trumpbot/news/prompts/cascade_classifier_v2.txt` (new)
+- `trumpbot/news/llm_classifier.py` —
+  `ClassificationResult.key_quote`; default prompt path bumped to v2
+- `trumpbot/db/repositories.py` —
+  `insert_llm_classification` writes `parsed_key_quote`;
+  `TradeInsertRow` + `insert_trade` carry the 5 article-context
+  columns; widened `decision_source` rebuild
+- `trumpbot/types/intents.py` — five new fields on `TradeIntent` +
+  `ReentryIntent`; `ApprovalDecision.decision_source` Literal
+  widened to include `auto_approval`
+- `trumpbot/decision/engine.py` — `MatchSnapshot` gains article
+  fields; `evaluate_news_match` + `evaluate_reentry` thread them
+  into the intent
+- `trumpbot/decision/loops.py` — `_fetch_unevaluated_matches` joins
+  `news_events`; `_row_to_snapshot` populates the article fields;
+  new `AutoNotifyFn` type alias; `_approve_and_submit` post-execute
+  hook; `_send_auto_confirmation` helper
+- `trumpbot/execution/dry_run.py` + `live_executor.py` — persist
+  the article-context columns on trade insert
+- `trumpbot/approval/gate.py` — `APPROVAL_MODE` constant gone;
+  `ApprovalGateConfig.mode`; `_auto_approve` method; auto branch in
+  `request_approval`
+- `trumpbot/approval/message_templates.py` — rewritten data
+  adapters; consume `trade_render` helpers
+- `trumpbot/notifications/trade_render.py` (new) — render helpers
+- `trumpbot/notifications/templates.py` — overhauled
+  `_TRADE_PROPOSAL_ENTRY` / `_REENTRY` / `_STOP_LOSS`; new
+  `_TRADE_FILLED_AUTO` / `_TRADE_KILLED_AUTO` /
+  `_ALERT_CRITICAL_AUTO_APPROVAL_ENABLED`
+- `trumpbot/config.py` — `ApprovalPhaseConfig.mode`; bumped
+  classifier defaults to v2
+- `trumpbot/daemon.py` — wires `cfg.approval.mode` into the gate;
+  startup logging + audible alert; `auto_notify` callable plumbed
+  into `decision_loop`
+- `config/config.example.yaml` — `approval.mode` documented;
+  classifier defaults bumped
+- `scripts/pre_live_checklist.py` — checks `cfg.approval.mode == "human"`
+- `tests/test_approval_gate.py`, `tests/test_kalshi_executor.py`,
+  `tests/test_templates.py`, `tests/test_trade_render.py` (new)
+
+### Deferred (deferred_cleanup.md)
+
+- `prior_closed_age` in re-entry template renders as `"unknown"`
+  pending threading the prior-trade close timestamp onto
+  `ReentryIntent`.
+- `news_context` in stop-loss template renders as
+  `"(no recent matches indexed)"` pending wiring the "last 6 hours
+  of news_market_matches for this ticker" query into the message
+  adapter (would require DB access from the adapter, which is
+  currently pure).
+- The end-to-end "spawn the daemon, insert a synthetic match, watch
+  trade_filled_auto land within 10 s" test is deferred to a future
+  integration suite — the unit tests pin the gate behavior, the
+  template renders, and the helpers' math; the integration glue is
+  validated manually post-deploy.
 
 ---
 

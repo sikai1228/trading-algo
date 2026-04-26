@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from trumpbot.approval.gate import ApprovalGate
@@ -52,6 +52,12 @@ OrderbookFn = Callable[[str], Quote]
 DepthFn = Callable[[str], list[tuple[int, int]] | None]
 """Phase 3 Part 1: full YES-ask depth for the engine's walker. The
 daemon wires this to a thin wrapper over the WS feed."""
+
+# Phase 4 Part 2.11 — auto-approval Telegram confirmation hook. The
+# decision_loop calls this AFTER the executor finishes for any entry
+# whose approval was sourced='auto_approval'. Daemon wires it to
+# ``send_text``; tests pass None to skip notifications.
+AutoNotifyFn = Callable[[str, dict[str, object]], Awaitable[None]]
 
 
 def _bankroll_state(
@@ -138,6 +144,7 @@ async def decision_loop(
     execution_mode: str,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
+    auto_notify: AutoNotifyFn | None = None,
 ) -> None:
     component = "decision_loop"
     log.info(f"{component}_started")
@@ -153,6 +160,7 @@ async def decision_loop(
                 depth=depth,
                 starting_amount_usd=starting_amount_usd,
                 execution_mode=execution_mode,
+                auto_notify=auto_notify,
             )
         except asyncio.CancelledError:
             raise
@@ -181,6 +189,7 @@ async def _run_decision_cycle(
     depth: DepthFn,
     starting_amount_usd: float,
     execution_mode: str = "dry_run",
+    auto_notify: AutoNotifyFn | None = None,
 ) -> None:
     # Phase 3 Part 2: respect /halt as the first thing every cycle.
     # When the user has issued /halt the entire cycle is a no-op until
@@ -222,7 +231,7 @@ async def _run_decision_cycle(
         if isinstance(decision, RiskRejection):
             log.info("decision_loop_risk_rejected", reason=decision.reason)
             continue
-        await _approve_and_submit(decision, gate, executor, db)
+        await _approve_and_submit(decision, gate, executor, db, auto_notify=auto_notify)
 
 
 def _is_halted(db: Database) -> bool:
@@ -438,10 +447,17 @@ def _fetch_unevaluated_matches(db: Database) -> list:  # type: ignore[type-arg]
                 SELECT m.*,
                        c.parsed_interaction_occurred AS parsed_interaction_occurred,
                        c.parsed_subject AS parsed_subject,
-                       c.parsed_confidence AS parsed_confidence
+                       c.parsed_confidence AS parsed_confidence,
+                       c.parsed_key_quote AS parsed_key_quote,
+                       n.source AS news_source,
+                       n.headline AS news_headline,
+                       n.url_canonical AS news_url_canonical,
+                       n.url AS news_url,
+                       n.raw_published_ts AS news_published_ts
                 FROM news_market_matches m
                 LEFT JOIN trades t ON t.triggering_match_id = m.id
                 LEFT JOIN llm_classifications c ON c.id = m.llm_classification_id
+                LEFT JOIN news_events n ON n.id = m.news_event_id
                 WHERE m.confidence >= 0.85
                   AND t.id IS NULL
                   AND m.created_at >= datetime('now', '-1 hour')
@@ -490,18 +506,41 @@ def _row_to_snapshot(match_row, market_row) -> MatchSnapshot:  # type: ignore[no
 
     interaction_occurred = classifier_type == "llm_cascade" and bool(parsed_interaction_raw)
 
+    # Phase 4 Part 2.11 — pull article-context fields off the joined
+    # news_events + llm_classifications rows. Defensive ``or ""`` so
+    # NULL columns (legacy backlog rows) don't blow up Pydantic's
+    # required-string validators downstream.
+    article_url = (
+        _safe_row_get(match_row, "news_url_canonical") or _safe_row_get(match_row, "news_url") or ""
+    )
+    article_headline = _safe_row_get(match_row, "news_headline") or ""
+    article_key_quote = _safe_row_get(match_row, "parsed_key_quote") or ""
+    article_published_ts = _safe_row_get(match_row, "news_published_ts")
+    source_name = _safe_row_get(match_row, "news_source") or "unknown"
+
     return MatchSnapshot(
         match_id=match_row["id"],
         ticker=match_row["ticker"],
         confidence=match_row["confidence"],
         interaction_occurred=interaction_occurred,
-        source_name="unknown",
+        source_name=source_name,
         is_kalshi_approved=True,  # filter happens at ingestion
         market_open_ts=market_row["open_ts"],
         market_close_ts=market_row["close_ts"],
-        article_published_ts=None,
+        article_published_ts=article_published_ts,
         classified_at_ts=datetime.now(UTC).isoformat(),
+        article_url=article_url,
+        article_headline=article_headline,
+        article_key_quote=article_key_quote,
     )
+
+
+def _safe_row_get(row, key: str):  # type: ignore[no-untyped-def]
+    """Return ``row[key]`` if present, else ``None``. Tolerates legacy
+    backlog rows that pre-date the Phase 4 Part 2.11 query columns."""
+    with contextlib.suppress(IndexError, KeyError):
+        return row[key]
+    return None
 
 
 def _row_to_position(row) -> Position | None:  # type: ignore[no-untyped-def]
@@ -543,6 +582,7 @@ async def _approve_and_submit(
     gate: ApprovalGate,
     executor: Executor,
     db: Database,
+    auto_notify: AutoNotifyFn | None = None,
 ) -> None:
     approval = await gate.request_approval(decision)
     if approval.decision != "approved":
@@ -572,6 +612,117 @@ async def _approve_and_submit(
         intent_id=decision.intent.intent_id,
         trade_id=result.trade_id,
         status=result.status,
+    )
+
+    # Phase 4 Part 2.11 — auto-approval confirmation. Only fire for
+    # entry intents whose approval source was 'auto_approval'. The
+    # human path already shows the operator everything via the
+    # original approval message.
+    if auto_notify is None or approval.decision_source != "auto_approval":
+        return
+    with contextlib.suppress(Exception):
+        await _send_auto_confirmation(decision, result, auto_notify)
+
+
+async def _send_auto_confirmation(  # type: ignore[no-untyped-def]
+    decision: RiskApprovedOrder,
+    result,
+    auto_notify: AutoNotifyFn,
+) -> None:
+    """Render the appropriate ``trade_filled_auto`` /
+    ``trade_killed_auto`` template and dispatch via the notifier.
+    Best-effort; failures are swallowed (an auto-approval message
+    being lost should never block the next cycle)."""
+    from trumpbot.notifications.trade_render import (
+        article_link_markdown,
+        compute_potential_loss_cents,
+        compute_settlement_pnl,
+        dollars,
+        dollars_signed,
+        format_et_short,
+        humanize_age_since,
+        now_et_long,
+        percent_from_bps,
+        render_key_quote,
+    )
+
+    intent = decision.intent
+    ticker = getattr(intent, "ticker", "?")
+    if result.status == "filled" and result.trade_id > 0:
+        qty = int(result.fill_quantity or 0)
+        avg = int(result.fill_price_cents or 0)
+        cost_cents = qty * avg
+        entry_fees = int(getattr(intent, "estimated_fees_cents", 0) or 0)
+        slippage = int(getattr(intent, "slippage_cents", 0) or 0)
+        best_ask = max(0, avg - slippage)
+        settlement, _exit_fees, profit, roi_bps = compute_settlement_pnl(
+            quantity=qty, cost_basis_cents=cost_cents, entry_fees_cents=entry_fees
+        )
+        loss = compute_potential_loss_cents(
+            quantity=qty,
+            cost_basis_cents=cost_cents,
+            entry_fees_cents=entry_fees,
+            entry_price_cents=avg,
+            yes_bid_levels=None,
+        )
+        published_ts = getattr(intent, "triggering_published_ts", "") or ""
+        age = humanize_age_since(published_ts) if published_ts else "unknown"
+        article_age_note = (
+            f" (published {age} ago)" if published_ts and age not in {"unknown", "just now"} else ""
+        )
+        await auto_notify(
+            "trade_filled_auto",
+            {
+                "trade_id": result.trade_id,
+                "timestamp_et": now_et_long(),
+                "signal_to_trade_age": age if published_ts else "unknown",
+                "market_title": getattr(intent, "triggering_headline", "") or f"(market {ticker})",
+                "ticker": ticker,
+                "subject_full_name": getattr(intent, "triggering_source", "") or "—",
+                "actual_fill_price": avg,
+                "filled_quantity": qty,
+                "actual_cost": dollars(cost_cents),
+                "actual_fees": dollars(entry_fees),
+                "actual_slippage": slippage,
+                "best_ask_at_send": best_ask,
+                "total_spent": dollars(cost_cents + entry_fees),
+                "settlement_value": dollars(settlement),
+                "potential_profit": dollars_signed(profit),
+                "potential_roi": percent_from_bps(roi_bps),
+                "potential_loss": dollars(loss),
+                "source": getattr(intent, "triggering_source", "") or "(unknown)",
+                "published_time_et": (format_et_short(published_ts) if published_ts else "unknown"),
+                "article_age_note": article_age_note,
+                "headline": getattr(intent, "triggering_headline", "") or "(no headline)",
+                "key_quote": render_key_quote(getattr(intent, "triggering_key_quote", "")),
+                "article_url": article_link_markdown(getattr(intent, "triggering_article_url", "")),
+            },
+        )
+        return
+
+    # Anything else = killed. ExecutionResult.notes carries the kind.
+    kind = "killed"
+    notes = result.notes or ""
+    if "FOK killed" in notes:
+        kind = "killed_book_moved"
+    elif "no ask available" in notes or "no_fill" in notes:
+        kind = "killed_no_fill"
+    elif result.status == "rejected":
+        kind = result.notes.split(":")[0] if ":" in (result.notes or "") else "rejected"
+    await auto_notify(
+        "trade_killed_auto",
+        {
+            "intent_id_short": intent.intent_id.split("-")[0],
+            "timestamp_et": now_et_long(),
+            "market_title": getattr(intent, "triggering_headline", "") or f"(market {ticker})",
+            "ticker": ticker,
+            "kill_reason": notes or "no reason recorded",
+            "kill_kind": kind,
+            "target_quantity": getattr(intent, "target_quantity", "?"),
+            "target_avg_fill": getattr(intent, "target_avg_fill_price_cents", 0),
+            "source": getattr(intent, "triggering_source", "") or "(unknown)",
+            "article_url": article_link_markdown(getattr(intent, "triggering_article_url", "")),
+        },
     )
 
 

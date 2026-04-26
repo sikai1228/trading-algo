@@ -132,80 +132,175 @@ _DAILY_DIGEST = MessageTemplate(
 )
 
 # ---------------------------------------------------------------------------
-# Trade proposal (sent when ApprovalGate asks the user to approve)
+# Trade proposals (Phase 4 Part 2.11 — standardized info categories)
 # ---------------------------------------------------------------------------
+#
+# Per the Deliverable 7 spec, both human approval requests and
+# auto-approval confirmations show the same six categories:
+#
+#   1. When (timestamp ET)
+#   2. Market (ticker, subject, full title)
+#   3. Entry contract count and price
+#   4. Potential P&L (settlement, profit, loss)
+#   5. Reasoning (key quote from the article)
+#   6. Article link
+#
+# Human-side templates show "potential" numbers and ask for approval.
+# Auto-approval templates show "actual" numbers and inform after
+# execution.
 
-# Shared body for buy proposals — entry and re-entry differ only in the
-# header and the optional prior-trade context.
-_PROPOSAL_BODY = (
-    "Position sizing:\n"
-    "  Cap one (hard): {cap_one_dollars}\n"
-    "  Cap two (20% of available contracts under 90c): {cap_two_dollars}\n"
-    "    ({cap_two_contracts} of {available_contracts} contracts)\n"
-    "  Binding: {cap_binding}\n\n"
-    "Order book walk for {effective_cap_dollars}:\n"
-    "  Filled: {quantity} contracts at avg {avg_fill}c\n"
-    "  Slippage: {slippage}c from best ask\n"
-    "  Fee estimate: {fees_dollars}\n"
-    "  Total cost: {total_cost_dollars}\n\n"
-    "Action: BUY YES @ avg ~{avg_fill}c (FOK, target {quantity} contracts)\n\n"
-    "Reasoning:\n{reasoning_text}\n\n"
+# Shared body block (entry + re-entry).
+# Required fields: timestamp_et, market_title, ticker, subject_full_name,
+#                  avg_fill_price, target_quantity, total_cost,
+#                  total_fees, slippage, best_ask, total_commitment,
+#                  settlement_value, potential_profit, potential_roi,
+#                  potential_loss, source, published_time_et,
+#                  article_age_note, headline, key_quote, article_url,
+#                  reasoning_text.
+_PROPOSAL_BODY_V2 = (
+    "⏱ {timestamp_et}\n"
+    "📍 {market_title}\n"
+    "     Ticker: {ticker}\n"
+    "     Subject: {subject_full_name}\n\n"
+    "💵 If approved:\n"
+    "     Buy YES @ ~{avg_fill_price}c (FOK)\n"
+    "     {target_quantity} contracts x ~{avg_fill_price}c = {total_cost}\n"
+    "     Plus fees: {total_fees}\n"
+    "     Plus slippage: {slippage}c from best ask ({best_ask}c)\n"
+    "     Total commitment: {total_commitment}\n\n"
+    "📈 If resolves YES:\n"
+    "     Settlement: {settlement_value}\n"
+    "     Profit: {potential_profit} ({potential_roi})\n\n"
+    "📉 If stops out:\n"
+    "     Approx loss: -{potential_loss}\n\n"
+    "📰 Reasoning:\n"
+    "     Source: {source} at {published_time_et}{article_age_note}\n"
+    '     Headline: "{headline}"\n'
+    '     Key quote: "{key_quote}"\n'
+    "     Article: {article_url}\n\n"
+    "Cap analysis: cap_one={cap_one_dollars}, "
+    "cap_two={cap_two_dollars} "
+    "({cap_two_contracts} of {available_contracts} contracts), "
+    "binding={cap_binding}.\n\n"
+    "Engine reasoning:\n{reasoning_text}\n\n"
     "If book moves unfavorably between approval and execution,\n"
     "order will be killed (no trade).\n"
-    "[APPROVE] [REJECT]"
 )
 
 _TRADE_PROPOSAL_ENTRY = MessageTemplate(
     category="trade_proposal",
     audible=False,
-    # fields: ticker, match_id, plus the proposal body fields
-    # documented on _PROPOSAL_BODY. Phase 4 Part 2.9 removed the
-    # ``Confidence: {confidence}`` line — the LLM's yes/no boolean
-    # is the gate, the float number invited the user to second-guess
-    # based on a number that no longer drives anything.
+    # fields: intent_id_short + every field on _PROPOSAL_BODY_V2.
     format=(
-        "💰 TRADE PROPOSAL\n"
-        "Ticker: {ticker}\n"
-        "Triggered by match #{match_id}\n\n"
-        "Approve within 3:00 to execute.\n\n" + _PROPOSAL_BODY
+        "💰 TRADE PROPOSAL [#{intent_id_short}]\n\n"
+        + _PROPOSAL_BODY_V2
+        + "\n⏰ Approve within 3:00 to execute.\n"
+        + "[APPROVE] [REJECT] [DETAILS]"
     ),
 )
 
 _TRADE_PROPOSAL_REENTRY = MessageTemplate(
     category="trade_proposal",
     audible=False,
-    # fields: ticker, match_id, prior_trade_id, prior_trade_outcome,
-    #         prior_realized_dollars, plus body fields. Phase 4 Part
-    #         2.9 dropped the ``(confidence {confidence})`` annotation.
+    # fields: intent_id_short, prior_trade_id, prior_trade_outcome,
+    #         prior_realized_dollars, prior_closed_age, plus every
+    #         field on _PROPOSAL_BODY_V2.
     format=(
-        "🔄 RE-ENTRY OPPORTUNITY\n"
-        "Ticker: {ticker}\n"
+        "🔄 RE-ENTRY OPPORTUNITY [#{intent_id_short}]\n\n"
         "Prior trade #{prior_trade_id} closed via {prior_trade_outcome}\n"
-        "Prior realized P&L: {prior_realized_dollars}\n\n"
-        "Fresh signal: match #{match_id}\n\n"
-        "No timeout -- respond when ready.\n\n" + _PROPOSAL_BODY
+        "({prior_closed_age} ago).\n"
+        "Prior realized P&L: {prior_realized_dollars}\n\n" + _PROPOSAL_BODY_V2 + "\n"
+        "[APPROVE] [REJECT]"
     ),
 )
 
+# Stop-loss now also follows the standardized layout. Required fields:
+# ticker, trade_id, market_title, subject_full_name, timestamp_et,
+# entry_price, quantity, cost_basis_dollars, current_bid, drop,
+# current_value_dollars, unrealized_dollars, time_held, news_context,
+# reasoning_text.
 _TRADE_PROPOSAL_STOP_LOSS = MessageTemplate(
     category="trade_proposal",
     audible=False,
-    # fields: ticker, trade_id, entry_price, current_bid, drop, quantity,
-    #         cost_basis_dollars, current_value_dollars, unrealized_dollars,
-    #         reasoning_text
     format=(
-        "⚠️ STOP-LOSS TRIGGER\n"
-        "Ticker: {ticker}\n"
-        "Trade #{trade_id}\n"
-        "Entry: {entry_price}c   Current bid: {current_bid}c   "
-        "Drop: {drop}c\n\n"
-        "Position: {quantity} contracts\n"
-        "Cost basis: {cost_basis_dollars}\n"
-        "Current value: {current_value_dollars}\n"
-        "Unrealized P&L: {unrealized_dollars}\n\n"
-        "Reasoning:\n{reasoning_text}\n\n"
+        "⚠️ STOP-LOSS TRIGGER [trade #{trade_id}]\n\n"
+        "⏱ {timestamp_et}\n"
+        "📍 {market_title}\n"
+        "     Ticker: {ticker}\n"
+        "     Subject: {subject_full_name}\n\n"
+        "💵 Original entry:\n"
+        "     {quantity} contracts @ {entry_price}c\n"
+        "     Cost basis: {cost_basis_dollars}\n"
+        "     Held for: {time_held}\n\n"
+        "📉 Current state:\n"
+        "     YES bid: {current_bid}c (drop: {drop}c from entry)\n"
+        "     Hold value: {current_value_dollars}\n"
+        "     Unrealized P&L: {unrealized_dollars}\n\n"
+        "📰 Recent news for {ticker}:\n{news_context}\n\n"
+        "Engine reasoning:\n{reasoning_text}\n\n"
         "No timeout -- respond when ready.\n"
-        "[APPROVE -- exit at market] [REJECT -- hold]"
+        "[EXIT NOW -- market exit] [HOLD -- ride it out]"
+    ),
+)
+
+
+# ---------------------------------------------------------------------------
+# Auto-approval confirmations (Phase 4 Part 2.11)
+# ---------------------------------------------------------------------------
+
+_TRADE_FILLED_AUTO = MessageTemplate(
+    category="trade_outcome",
+    audible=False,
+    # fields: trade_id, timestamp_et, market_title, ticker,
+    # subject_full_name, actual_fill_price, filled_quantity,
+    # actual_cost, actual_fees, actual_slippage, best_ask_at_send,
+    # total_spent, settlement_value, potential_profit, potential_roi,
+    # potential_loss, source, published_time_et, article_age_note,
+    # signal_to_trade_age, headline, key_quote, article_url.
+    format=(
+        "✅ AUTO-APPROVED TRADE EXECUTED [trade #{trade_id}]\n\n"
+        "⏱ {timestamp_et}  (placed {signal_to_trade_age} after signal)\n"
+        "📍 {market_title}\n"
+        "     Ticker: {ticker}\n"
+        "     Subject: {subject_full_name}\n\n"
+        "💵 Filled:\n"
+        "     Bought YES @ {actual_fill_price}c avg\n"
+        "     {filled_quantity} contracts x {actual_fill_price}c = {actual_cost}\n"
+        "     Fees: {actual_fees}\n"
+        "     Slippage: {actual_slippage}c from best ask "
+        "({best_ask_at_send}c)\n"
+        "     Total spent: {total_spent}\n\n"
+        "📈 If resolves YES:\n"
+        "     Settlement: {settlement_value}\n"
+        "     Profit: {potential_profit} ({potential_roi})\n\n"
+        "📉 If stops out:\n"
+        "     Approx loss: -{potential_loss}\n\n"
+        "📰 Reasoning:\n"
+        "     Source: {source} at {published_time_et}{article_age_note}\n"
+        '     Headline: "{headline}"\n'
+        '     Key quote: "{key_quote}"\n'
+        "     Article: {article_url}\n\n"
+        "⚠️ This trade was placed automatically (auto-approval mode)."
+    ),
+)
+
+_TRADE_KILLED_AUTO = MessageTemplate(
+    category="trade_outcome",
+    audible=False,
+    # fields: intent_id_short, timestamp_et, market_title, ticker,
+    # kill_reason, kill_kind, target_quantity, target_avg_fill,
+    # source, article_url.
+    format=(
+        "⚠️ AUTO-APPROVED TRADE KILLED [#{intent_id_short}]\n\n"
+        "⏱ {timestamp_et}\n"
+        "📍 {market_title} ({ticker})\n\n"
+        "Reason: {kill_reason}\n"
+        "(kind: {kill_kind})\n\n"
+        "Original target: {target_quantity} contracts at "
+        "~{target_avg_fill}c\n"
+        "No trade was placed.\n\n"
+        "Source: {source}\n"
+        "Article: {article_url}"
     ),
 )
 
@@ -302,6 +397,23 @@ _ALERT_CRITICAL_ANTHROPIC_AUTH = MessageTemplate(
         "Required action: regenerate ANTHROPIC_API_KEY in console, update\n"
         "secrets.env, restart daemon. Until fixed, matcher quality is\n"
         "significantly degraded."
+    ),
+)
+
+_ALERT_CRITICAL_AUTO_APPROVAL_ENABLED = MessageTemplate(
+    category="alert_critical",
+    audible=True,
+    # fields: time_et
+    # Phase 4 Part 2.11 — fired once on daemon startup whenever
+    # ``cfg.approval.mode == "auto"``. Makes accidental auto-mode
+    # highly visible.
+    format=(
+        "🚨 AUTO-APPROVAL MODE ACTIVE\n\n"
+        "Daemon started with approval.mode=auto.\n\n"
+        "Entry trades will fire WITHOUT manual approval.\n"
+        "Stop-loss and re-entry approvals are still required.\n\n"
+        "Started at: {time_et}\n\n"
+        "To disable: set approval.mode=human in config.yaml and restart."
     ),
 )
 
@@ -996,14 +1108,17 @@ TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
     "trade_proposal_entry": _TRADE_PROPOSAL_ENTRY,
     "trade_proposal_reentry": _TRADE_PROPOSAL_REENTRY,
     "trade_proposal_stop_loss": _TRADE_PROPOSAL_STOP_LOSS,
-    # Trade outcomes (post-settlement / post-stop)
+    # Trade outcomes (post-settlement / post-stop / auto-approval)
     "trade_settled_yes": _TRADE_SETTLED_YES,
     "trade_settled_no": _TRADE_SETTLED_NO,
     "trade_stopped_out": _TRADE_STOPPED_OUT,
+    "trade_filled_auto": _TRADE_FILLED_AUTO,
+    "trade_killed_auto": _TRADE_KILLED_AUTO,
     # Critical alerts (audible)
     "alert_critical_llm_cap": _ALERT_CRITICAL_LLM_CAP,
     "alert_critical_kalshi_disconnect": _ALERT_CRITICAL_KALSHI_DISCONNECT,
     "alert_critical_anthropic_auth": _ALERT_CRITICAL_ANTHROPIC_AUTH,
+    "alert_critical_auto_approval_enabled": _ALERT_CRITICAL_AUTO_APPROVAL_ENABLED,
     "alert_critical_daemon_crash": _ALERT_CRITICAL_DAEMON_CRASH,
     "alert_critical_contract_changed": _ALERT_CRITICAL_CONTRACT_CHANGED,
     "alert_critical_contract_rules_changed": _ALERT_CRITICAL_CONTRACT_RULES_CHANGED,

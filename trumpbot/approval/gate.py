@@ -1,21 +1,35 @@
 """ApprovalGate — sits between RiskManager and Executor.
 
-Phase 2 always runs in human-approval mode (auto-mode is wired in the
-architecture but not enabled). Asks the user via Telegram to approve
-each entry / re-entry / stop-loss intent, awaits the response within a
-per-intent-type timeout, returns the decision.
+Phase 4 Part 2.11 re-introduced the configurable approval mode after
+the ``shadow_decisions`` audit demonstrated stable signals. The gate
+checks ``cfg.approval.mode``:
 
-Entry timeout: 180 s (configurable). Stop-loss / re-entry: no timeout
-per the locked strategy rules.
+- ``"human"`` (default): every entry intent is sent to Telegram and
+  waits for the user's approve/reject decision.
+- ``"auto"``: entry intents bypass Telegram and synthesize an
+  ``approved`` decision in-memory. The gate writes a
+  ``telegram_approvals`` audit row with
+  ``decision_source='auto_approval'`` so the table is queryable for
+  every approval, regardless of channel.
 
-Phase 3 Part 1 added an FOK pre-check: when the user approves, the
-gate re-walks the live order book and **kills** the trade if the
-rewalk shows materially-different numbers (>5 c avg-fill drift, OR
->20 % qty drift). On kill the gate marks the approval row
-``decision='rejected'`` with ``decision_source='timeout'`` and
-records a ``fok_killed_book_moved`` system event so the audit trail
-captures the reason. The user effectively approves "trade this signal
-under current rules", not "trade these specific contracts".
+Stop-loss and re-entry intents ALWAYS require human approval
+regardless of the mode setting — the gate enforces that, not the
+config. Stop-losses are emergency exits; re-entries are fresh
+signals against a market the operator has just been burned by, both
+of which warrant a human in the loop.
+
+Entry timeout: 180 s (configurable). Stop-loss / re-entry: no
+timeout per the locked strategy rules.
+
+Phase 3 Part 1 added an FOK pre-check: when the user approves (or
+the auto path fires), the gate re-walks the live order book and
+**kills** the trade if the rewalk shows materially-different
+numbers (>5 c avg-fill drift, OR >20 % qty drift). On kill the gate
+marks the approval row ``decision='rejected'`` with
+``decision_source='timeout'`` and records a
+``fok_killed_book_moved`` system event so the audit trail captures
+the reason. The user effectively approves "trade this signal under
+current rules", not "trade these specific contracts".
 
 The gate does not talk to Telegram directly — it delegates to a
 :class:`TelegramApprovalBot` (or a test double). This keeps the gate's
@@ -67,25 +81,26 @@ FOK_QTY_DRIFT_TOLERANCE_PCT = 0.20
 DepthFn = Callable[[str], Sequence[tuple[int, int]] | None]
 
 
-APPROVAL_MODE: str = "human"
-"""HARDCODED v1 approval mode. Auto-approve is not reachable through
-config — it can only be enabled by editing this constant. The
-``shadow_decisions`` table (Phase 4 Part 1) collects empirical
-evidence to inform a future graduation."""
+# Phase 4 Part 2.11 — auto-approval is now reachable through
+# config.approval.mode. The previous ``APPROVAL_MODE = "human"``
+# module-level constant was REMOVED; ``ApprovalGateConfig.mode`` is
+# the single source of truth.
 
 
 @dataclass(frozen=True)
 class ApprovalGateConfig:
+    """Approval-flow timeouts and mode.
+
+    ``mode``: ``"human"`` (default) sends every entry intent through
+    Telegram. ``"auto"`` skips the prompt and goes straight to the
+    executor. Stop-loss and re-entry are always human-in-the-loop
+    regardless of this setting.
+    """
+
+    mode: str = "human"
     entry_timeout_sec: int = 180
     stop_loss_timeout_sec: int | None = None
     reentry_timeout_sec: int | None = None
-
-    @property
-    def mode(self) -> str:
-        """Always returns the module-level ``APPROVAL_MODE`` constant.
-        Kept as a property for backwards compatibility with any
-        snapshots / tests that read ``cfg.mode`` directly."""
-        return APPROVAL_MODE
 
 
 class ApprovalRequester:
@@ -126,6 +141,17 @@ class ApprovalGate:
 
     async def request_approval(self, approved: RiskApprovedOrder) -> ApprovalDecision:
         intent = approved.intent
+
+        # Phase 4 Part 2.11 — auto-approval branch for entry intents
+        # only. Stop-loss and re-entry ALWAYS go through Telegram
+        # regardless of mode (the gate's invariant; not config).
+        if (
+            self._cfg.mode == "auto"
+            and isinstance(intent, TradeIntent)
+            and intent.intent_type == "entry"
+        ):
+            return self._auto_approve(approved)
+
         timeout_sec = self._timeout_for(approved)
         message_text = format_message(approved)
         expires_at = (
@@ -239,6 +265,67 @@ class ApprovalGate:
             decision=decision,  # type: ignore[arg-type]
             decided_at=datetime.now(UTC),
             decision_source=source,  # type: ignore[arg-type]
+            approval_record_id=record_id,
+        )
+
+    def _auto_approve(self, approved: RiskApprovedOrder) -> ApprovalDecision:
+        """Phase 4 Part 2.11 — entry-only auto-approval path.
+
+        Skips the Telegram round-trip entirely. Writes a
+        ``telegram_approvals`` audit row with
+        ``decision_source='auto_approval'`` so the table is
+        queryable for every approval, regardless of channel. Logs an
+        ``auto_approved`` system_event so the audit trail also
+        captures the decision in the system_events stream.
+
+        The auto-approved order then flows through the rest of the
+        decision_loop: the executor submits, the trade row is
+        written, and the executor fires
+        ``trade_filled_auto`` / ``trade_killed_auto`` to inform the
+        user after the fact.
+        """
+        intent = approved.intent
+        record_id = insert_telegram_approval(
+            self._db,
+            intent_type=intent.intent_type,
+            intent_json=intent.model_dump_json(),
+            message_text="(auto-approval, no Telegram message sent)",
+            chat_id=getattr(self._requester, "chat_id", None),
+            expires_at=None,
+        )
+        update_telegram_approval(
+            self._db,
+            approval_id=record_id,
+            decision="approved",
+            decision_source="auto_approval",
+            telegram_message_id=None,
+        )
+        insert_system_event(
+            self._db,
+            event_type="auto_approved",
+            severity="info",
+            component="approval_gate",
+            message=f"Auto-approval fired for {intent.ticker}",
+            detail={
+                "intent_id": intent.intent_id,
+                "ticker": intent.ticker,
+                "target_quantity": getattr(intent, "target_quantity", None),
+                "target_price_cents": getattr(intent, "target_price_cents", None),
+                "approval_record_id": record_id,
+            },
+        )
+        log.info(
+            "auto_approved",
+            intent_id=intent.intent_id,
+            ticker=intent.ticker,
+            approval_record_id=record_id,
+        )
+        return ApprovalDecision(
+            intent_id=intent.intent_id,
+            decision="approved",
+            decided_at=datetime.now(UTC),
+            decision_source="auto_approval",
+            rejected_reason=None,
             approval_record_id=record_id,
         )
 

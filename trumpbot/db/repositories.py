@@ -785,6 +785,16 @@ class TradeInsertRow:
     a successful submission, or by reconciliation when we recover
     orphaned orders. NULL for dry-run rows."""
 
+    # Phase 4 Part 2.11 — article-context audit columns (migration 013).
+    # Captured from the news_event + llm_classification rows when the
+    # trade row is inserted so the full "what fired this trade?"
+    # audit trail lives on the trade row itself.
+    triggering_article_url: str | None = None
+    triggering_source: str | None = None
+    triggering_headline: str | None = None
+    triggering_key_quote: str | None = None
+    triggering_published_ts: str | None = None
+
 
 def insert_trade(db: Database, row: TradeInsertRow) -> int:
     """Insert a fresh trade row.
@@ -806,7 +816,10 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         target_avg_fill_price_cents, actual_avg_fill_price_cents,
         slippage_cents, entry_fees_cents, levels_consumed_json,
         client_order_id, kalshi_order_id,
-        acquired_date, acquisition_cost_cents
+        acquired_date, acquisition_cost_cents,
+        triggering_article_url, triggering_source,
+        triggering_headline, triggering_key_quote,
+        triggering_published_ts
     ) VALUES (
         :ticker, 'yes', 'buy', :status,
         :entry_price_cents, :quantity, :cost_basis_usd_cents,
@@ -818,7 +831,10 @@ def insert_trade(db: Database, row: TradeInsertRow) -> int:
         :target_avg_fill_price_cents, :actual_avg_fill_price_cents,
         :slippage_cents, :entry_fees_cents, :levels_consumed_json,
         :client_order_id, :kalshi_order_id,
-        :acquired_date, :acquisition_cost_cents
+        :acquired_date, :acquisition_cost_cents,
+        :triggering_article_url, :triggering_source,
+        :triggering_headline, :triggering_key_quote,
+        :triggering_published_ts
     )
     """
     # acquisition_cost_cents = price * qty + entry fees. cost_basis_usd_cents
@@ -1516,6 +1532,7 @@ def insert_llm_classification(
         parsed_indirect = None
         parsed_confidence = None
         parsed_reasoning = None
+        parsed_key_quote = None
     else:
         parsed_subject = getattr(parsed, "subject", None)
         parsed_response = json.dumps(parsed.model_dump())
@@ -1526,6 +1543,7 @@ def insert_llm_classification(
         parsed_indirect = 1 if parsed.indirect_only else 0
         parsed_confidence = float(parsed.confidence)
         parsed_reasoning = parsed.reasoning
+        parsed_key_quote = getattr(parsed, "key_quote", "") or ""
 
     with db.transaction() as conn:
         cur = conn.execute(
@@ -1536,6 +1554,7 @@ def insert_llm_classification(
                 parsed_subject, parsed_interaction_occurred,
                 parsed_interaction_type, parsed_tense, parsed_negated,
                 parsed_indirect_only, parsed_confidence, parsed_reasoning,
+                parsed_key_quote,
                 input_tokens, output_tokens, cost_micro_usd, error,
                 classified_at
             ) VALUES (
@@ -1544,6 +1563,7 @@ def insert_llm_classification(
                 ?, ?,
                 ?, ?, ?,
                 ?, ?, ?,
+                ?,
                 ?, ?, ?, ?, ?
             )
             """,
@@ -1563,6 +1583,7 @@ def insert_llm_classification(
                 parsed_indirect,
                 parsed_confidence,
                 parsed_reasoning,
+                parsed_key_quote,
                 input_tokens,
                 output_tokens,
                 cost_micro_usd,

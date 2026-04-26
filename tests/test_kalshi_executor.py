@@ -625,22 +625,52 @@ class TestErrorCategorizer:
 
 
 # ---------------------------------------------------------------------------
-# Approval mode invariant
+# Approval mode default invariant
 # ---------------------------------------------------------------------------
 
 
-def test_approval_mode_hardcoded_human() -> None:
-    """The single most important Phase 4 invariant: auto-approve is
-    NOT reachable through config. A test failure here means somebody
-    re-introduced a config knob; revert before merging."""
-    from trumpbot.approval.gate import APPROVAL_MODE
+def test_approval_mode_defaults_to_human() -> None:
+    """Phase 4 Part 2.11 — auto-approval is now config-reachable, but
+    the default in main MUST stay 'human'. A test failure here means
+    somebody flipped the default; revert before merging.
+
+    The hardcoded ``APPROVAL_MODE = 'human'`` constant in
+    ``trumpbot/approval/gate.py`` was removed in 2.11 (the gate now
+    reads ``cfg.mode``); a regression that adds the constant back as
+    a hardcoded override would also fail the
+    ``test_approval_mode_field_present_and_validated`` check below."""
     from trumpbot.config import ApprovalPhaseConfig
 
-    assert APPROVAL_MODE == "human"
-    # The config dataclass must NOT carry a `mode` field anymore.
     cfg = ApprovalPhaseConfig()
-    with pytest.raises(AttributeError):
-        _ = cfg.mode  # type: ignore[attr-defined]
+    assert cfg.mode == "human"
+
+
+def test_approval_mode_field_present_and_validated() -> None:
+    """The ``mode`` field must exist on ``ApprovalPhaseConfig`` and
+    accept only ``"human"`` or ``"auto"``."""
+    import pydantic
+
+    from trumpbot.config import ApprovalPhaseConfig
+
+    # Both legal values load.
+    assert ApprovalPhaseConfig(mode="human").mode == "human"
+    assert ApprovalPhaseConfig(mode="auto").mode == "auto"
+    # Anything else is rejected.
+    with pytest.raises(pydantic.ValidationError):
+        ApprovalPhaseConfig(mode="yolo")  # type: ignore[arg-type]
+
+
+def test_approval_mode_constant_not_re_added() -> None:
+    """The hardcoded ``APPROVAL_MODE`` module-level constant in
+    ``trumpbot/approval/gate.py`` was REMOVED in Phase 4 Part 2.11.
+    Catches a revert that puts the global override back."""
+    from trumpbot.approval import gate
+
+    assert not hasattr(gate, "APPROVAL_MODE"), (
+        "trumpbot.approval.gate.APPROVAL_MODE was removed in Phase 4 "
+        "Part 2.11 (the gate now reads cfg.mode). If it's back, "
+        "revert the revert."
+    )
 
 
 __all__: list[str] = []

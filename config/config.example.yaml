@@ -200,7 +200,17 @@ risk:
   halted: false  # set true to halt all new orders (Phase-3 /halt stub)
 
 approval:
-  mode: "human"  # always 'human' in Phase 2
+  # Phase 4 Part 2.11: re-introduced as a config knob after the
+  # shadow_decisions audit. "human" (default) sends every entry
+  # intent to Telegram; "auto" skips the prompt and goes straight
+  # to the executor. Stop-loss and re-entry intents ALWAYS require
+  # human approval regardless of this setting.
+  #
+  # The default in main MUST stay "human". Switching to "auto" is
+  # operator-explicit: the daemon logs a warning and fires
+  # alert_critical_auto_approval_enabled on startup so accidental
+  # enable is highly visible.
+  mode: "human"  # "human" or "auto"
   entry_timeout_sec: 180
   stop_loss_timeout_sec: null   # unlimited per locked rules
   reentry_timeout_sec: null     # unlimited per locked rules
@@ -266,10 +276,13 @@ llm_classifier:
   enabled: true
   model: "claude-haiku-4-5"
   max_input_tokens: 2000
-  max_output_tokens: 250
+  # Phase 4 Part 2.11 raised max_output_tokens from 250 -> 320 to
+  # accommodate the new key_quote field (up to 200 chars + JSON
+  # encoding overhead).
+  max_output_tokens: 320
   timeout_sec: 10
-  prompt_path: "trumpbot/news/prompts/cascade_classifier_v1.txt"
-  prompt_version: "v1"
+  prompt_path: "trumpbot/news/prompts/cascade_classifier_v2.txt"
+  prompt_version: "v2"
   contract_path: "data/contracts/kxtrumpmeet_rules.txt"
 
 # Phase 4 Part 2.1 — tax tracking + exports.

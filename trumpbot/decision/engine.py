@@ -132,6 +132,15 @@ class MatchSnapshot:
     classified_at_ts: str
     """When the matcher / LLM classified this row."""
 
+    # Phase 4 Part 2.11 — article-context audit fields, threaded
+    # straight into the TradeIntent so the executor can persist them
+    # on the trade row and Telegram templates can render them.
+    # Defaulted to empty strings for back-compat with existing
+    # synthetic test fixtures.
+    article_url: str = ""
+    article_headline: str = ""
+    article_key_quote: str = ""
+
 
 @dataclass(frozen=True)
 class MarketState:
@@ -384,6 +393,15 @@ class DecisionEngine:
             slippage_cents=walk.slippage_cents,
             levels_consumed=list(walk.levels_consumed),
             reasoning_text=reasoning,
+            # Phase 4 Part 2.11 — article context for trade-proposal
+            # Telegram messages and the trades.triggering_* audit
+            # columns. Empty string is the back-compat default for
+            # synthetic test fixtures that don't supply context.
+            triggering_article_url=match.article_url,
+            triggering_source=match.source_name,
+            triggering_headline=match.article_headline,
+            triggering_key_quote=match.article_key_quote,
+            triggering_published_ts=match.article_published_ts or "",
         )
 
     # -- stop-loss ----------------------------------------------------
@@ -505,6 +523,14 @@ class DecisionEngine:
             prior_trade_id=prior_trade.trade_id,
             prior_trade_outcome=prior_trade_outcome,  # type: ignore[arg-type]
             prior_trade_realized_pnl_usd_cents=int(prior_trade_realized_pnl_cents or 0),
+            # Phase 4 Part 2.11 — article context for the re-entry
+            # Telegram template. Forwarded from the inner TradeIntent
+            # the re-entry path synthesizes.
+            triggering_article_url=synthetic_intent.triggering_article_url,
+            triggering_source=synthetic_intent.triggering_source,
+            triggering_headline=synthetic_intent.triggering_headline,
+            triggering_key_quote=synthetic_intent.triggering_key_quote,
+            triggering_published_ts=synthetic_intent.triggering_published_ts,
         )
 
 

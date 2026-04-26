@@ -253,9 +253,19 @@ class TestMessageContents:
         gate, db = gate_factory(req)
         await gate.request_approval(_entry_approved())
         message = req.sent[0][2]
+        # Phase 4 Part 2.11 — standardized info categories. The body
+        # was overhauled; pin the headers + key sections.
         assert "💰 TRADE PROPOSAL" in message
         assert "Ticker: X" in message
-        assert "BUY YES" in message
+        assert "Buy YES @" in message
+        # The six standardized info categories.
+        assert "⏱" in message  # When (timestamp)
+        assert "📍" in message  # Market
+        assert "💵" in message  # Entry contract count + price
+        assert "📈" in message  # Potential P&L (YES)
+        assert "📉" in message  # Potential loss (stop)
+        assert "📰" in message  # Reasoning + article
+        assert "[APPROVE]" in message and "[REJECT]" in message
 
     async def test_stop_loss_message_uses_warning_header(self, gate_factory) -> None:  # type: ignore[no-untyped-def]
         req = _StubRequester(response=("approved", "telegram_button"))
@@ -411,3 +421,94 @@ class TestFokRewalkOnApproval:
         decision = await gate.request_approval(_stop_approved())
         assert decision.decision == "approved"
         assert called == []  # depth_fn never invoked for stop-loss
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Part 2.11 — auto-approval mode
+# ---------------------------------------------------------------------------
+
+
+class _NoCallRequester(ApprovalRequester):
+    """Requester that fails the test if either method is called.
+    Auto-approval must never touch Telegram."""
+
+    chat_id = "fake-chat"
+
+    async def send_request(self, *, intent_id: str, intent_type: str, message_text: str) -> int:
+        raise AssertionError(
+            f"send_request called for intent {intent_id} of type "
+            f"{intent_type} -- auto-approval should bypass Telegram"
+        )
+
+    async def await_response(self, *, intent_id: str, timeout_sec: int | None) -> tuple[str, str]:
+        raise AssertionError(
+            f"await_response called for intent {intent_id} -- "
+            "auto-approval should not block on a Telegram answer"
+        )
+
+
+class TestAutoApprovalMode:
+    """The Phase 4 Part 2.11 auto-approval branch. Entry intents in
+    ``mode="auto"`` skip Telegram and synthesize an approved
+    decision; stop-loss and re-entry STILL require human approval
+    regardless of the mode."""
+
+    async def test_entry_in_auto_mode_skips_telegram(self, gate_factory) -> None:  # type: ignore[no-untyped-def]
+        req = _NoCallRequester()
+        gate, db = gate_factory(req, mode="auto")
+        decision = await gate.request_approval(_entry_approved())
+
+        assert decision.decision == "approved"
+        assert decision.decision_source == "auto_approval"
+        # Audit row was written with the new source value.
+        row = (
+            db.connect()
+            .execute(
+                "SELECT decision, decision_source, telegram_message_id " "FROM telegram_approvals"
+            )
+            .fetchone()
+        )
+        assert row is not None
+        assert row["decision"] == "approved"
+        assert row["decision_source"] == "auto_approval"
+        assert row["telegram_message_id"] is None
+        # And a system_event row landed.
+        ev_rows = list(
+            db.connect().execute(
+                "SELECT event_type, severity FROM system_events "
+                "WHERE event_type = 'auto_approved'"
+            )
+        )
+        assert len(ev_rows) == 1
+        assert ev_rows[0]["severity"] == "info"
+
+    async def test_stop_loss_in_auto_mode_still_human(self, gate_factory) -> None:  # type: ignore[no-untyped-def]
+        """Stop-loss must STILL go through Telegram even when
+        ``mode='auto'``. Spec invariant."""
+        req = _StubRequester(response=("approved", "telegram_button"))
+        gate, _ = gate_factory(req, mode="auto")
+        decision = await gate.request_approval(_stop_approved())
+        assert decision.decision == "approved"
+        assert decision.decision_source == "telegram_button"
+        # Telegram was hit (the stub recorded a send).
+        assert len(req.sent) == 1
+
+    async def test_reentry_in_auto_mode_still_human(self, gate_factory) -> None:  # type: ignore[no-untyped-def]
+        """Re-entry must STILL go through Telegram even when
+        ``mode='auto'``. Spec invariant."""
+        req = _StubRequester(response=("approved", "telegram_button"))
+        gate, _ = gate_factory(req, mode="auto")
+        decision = await gate.request_approval(_reentry_approved())
+        assert decision.decision == "approved"
+        assert decision.decision_source == "telegram_button"
+        assert len(req.sent) == 1
+
+    async def test_human_mode_default_unchanged(self, gate_factory) -> None:  # type: ignore[no-untyped-def]
+        """Sanity: with no ``mode`` kwarg the default is still
+        ``"human"`` and entry intents go through Telegram."""
+        req = _StubRequester(response=("approved", "telegram_button"))
+        gate, _ = gate_factory(req)  # no mode kwarg -> default
+        decision = await gate.request_approval(_entry_approved())
+        assert decision.decision == "approved"
+        assert decision.decision_source == "telegram_button"
+        assert len(req.sent) == 1

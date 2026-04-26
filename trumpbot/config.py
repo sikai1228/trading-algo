@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -138,18 +138,29 @@ class RiskPhaseConfig(BaseModel):
 
 
 class ApprovalPhaseConfig(BaseModel):
-    """Approval-flow timeouts.
+    """Approval-flow timeouts and mode.
 
-    NOTE: ``mode`` is HARDCODED to ``"human"`` in v1 (see CLAUDE.md
-    "Hardcoded human-in-the-loop"). It used to live here as a
-    configurable field but was deliberately removed in Phase 4 — auto-
-    approve must NOT be reachable through any config knob, only by
-    deleting the constant in the code itself. The shadow_decisions
-    table (Phase 4 Part 1) collects evidence for whether auto-approve
-    would be safe in the future.
+    Phase 4 Part 2.11 re-introduced the configurable ``mode`` field
+    after the ``shadow_decisions`` audit demonstrated stable signals.
+    ``"human"`` (default) sends every entry intent to Telegram and
+    waits for the user; ``"auto"`` skips the prompt and goes straight
+    to the executor. Stop-loss and re-entry intents ALWAYS require
+    human approval regardless of this setting; that's enforced inside
+    :class:`trumpbot.approval.gate.ApprovalGate`, not by config.
+
+    The default in main MUST stay ``"human"``. Switching to ``"auto"``
+    is operator-explicit: the daemon logs a warning and fires
+    ``alert_critical_auto_approval_enabled`` on startup so accidental
+    enable is highly visible.
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["human", "auto"] = "human"
+    """``"human"`` (default): every entry intent requires Telegram
+    approval. ``"auto"``: entry intents bypass Telegram and go
+    straight to the executor. Stop-loss and re-entry are always
+    human-in-the-loop regardless."""
 
     entry_timeout_sec: int = 180
     stop_loss_timeout_sec: int | None = None
@@ -263,10 +274,16 @@ class LLMClassifierConfig(BaseModel):
     enabled: bool = True
     model: str = "claude-haiku-4-5"
     max_input_tokens: int = 2000
-    max_output_tokens: int = 250
+    # Phase 4 Part 2.11 raised max_output_tokens from 250 -> 320 to
+    # accommodate the new ``key_quote`` field (up to 200 chars +
+    # JSON encoding overhead).
+    max_output_tokens: int = 320
     timeout_sec: int = 10
-    prompt_path: str = "trumpbot/news/prompts/cascade_classifier_v1.txt"
-    prompt_version: str = "v1"
+    # Phase 4 Part 2.11 — bumped to v2 to extract a verbatim
+    # ``key_quote`` from the article (rendered into trade-approval
+    # Telegram messages).
+    prompt_path: str = "trumpbot/news/prompts/cascade_classifier_v2.txt"
+    prompt_version: str = "v2"
     contract_path: str = "data/contracts/kxtrumpmeet_rules.txt"
 
 

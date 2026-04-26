@@ -82,9 +82,18 @@ class DecisionPhaseConfig(BaseModel):
     Default $20.00. Configurable via the YAML field
     ``decision.position_size_hard_cap_usd``."""
 
-    position_size_volume_pct: float = 0.05
-    """Cap two — fraction of the market's total traded volume the
-    bot is willing to take in a single trade. Default 5 %."""
+    position_size_orderbook_pct: float = 0.20
+    """Cap two — fraction of YES contracts available at prices ≤
+    ``max_buy_price_cents`` the bot is willing to take in a single
+    trade. Default 20 %.
+
+    Phase 4 Part 2.6 (rename + redefine): replaces the prior
+    ``position_size_volume_pct`` (5 % of historical traded volume).
+    Total volume is a poor proxy for current liquidity; the new
+    semantics measure live orderbook depth so cap_two automatically
+    tightens when the book is thin and expands when it's deep. See
+    :class:`trumpbot.decision.engine.DecisionConfig` for the full
+    formula."""
 
     min_trade_size_contracts: int = 5
     """Skip the trade entirely if the walk fills fewer than this."""

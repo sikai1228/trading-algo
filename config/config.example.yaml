@@ -161,11 +161,14 @@ decision:
   # $20.00 = 2000c. Easy to raise (e.g. to 50000 = $500) once the
   # strategy proves itself.
   position_size_hard_cap_cents: 2000
-  # Cap two — fraction of the market's total traded volume the bot
-  # will take in a single trade. Default 5 %. Cap two evaluates against
-  # ``markets.volume`` × $1/contract, so a brand-new market with no
-  # volume yet effectively disables itself.
-  position_size_volume_pct: 0.05
+  # Cap two — fraction of YES contracts AVAILABLE at prices ≤
+  # max_buy_price_cents the bot will take in a single trade.
+  # Default 20 %. Phase 4 Part 2.6 swap: was "5 % of historical
+  # traded volume" (position_size_volume_pct); now measures live
+  # orderbook depth so cap_two automatically tightens when the
+  # book is thin and expands when it's deep. A market with no
+  # acceptable depth in the live book → engine skips the trade.
+  position_size_orderbook_pct: 0.20
   # Skip the trade entirely if the order-book walk fills fewer
   # contracts than this, OR fewer dollars than min_trade_value_cents.
   min_trade_size_contracts: 5

@@ -71,18 +71,37 @@ slippage, and fees.
   (`decision.position_size_hard_cap_cents = 2000`). Designed to be
   raised to $500–1000 once the strategy proves itself. Single
   config edit.
-- **Cap two — 5 % of market volume.** Default 5 %
-  (`decision.position_size_volume_pct = 0.05`). `markets.volume` is
-  Kalshi's contract-count field; we treat one contract as $1 of
-  notional, so `cap_two_cents = volume x 100 x 0.05 = volume x 5`.
-  Brand-new market with no recorded volume -> cap_two evaluates to
-  $0 -> trading on that ticker is effectively disabled until volume
-  develops.
+- **Cap two — 20 % of acceptable orderbook depth.** Default 20 %
+  (`decision.position_size_orderbook_pct = 0.20`). The bot looks at
+  the live YES-ask side, filters to levels at prices ≤
+  `max_buy_price_cents` (90 c), sums the available contracts, and
+  takes 20 % of that count. The dollar value is the contracts x
+  volume-weighted-average-price across the same filtered levels, so
+  `cap_two_cents` is comparable to `cap_one`:
+
+  ```
+  acceptable = [(p, q) for p, q in yes_ask_levels if p <= 90]
+  available = sum(q for _, q in acceptable)
+  cap_two_contracts = floor(available x 0.20)
+  avg_price = sum(p x q for p, q in acceptable) // available
+  cap_two_cents = cap_two_contracts x avg_price
+  ```
+
+  An empty book (or every level above the price ceiling) → engine
+  skips the trade. **Phase 4 Part 2.6** rationale: total volume is a
+  poor proxy for current liquidity. The orderbook-depth cap directly
+  targets slippage by limiting position size to what the current
+  book can absorb without moving prices materially.
+
 - **Effective cap** = `min(cap_one, cap_two)`. Engine records which
-  bound on the intent (`cap_binding ∈ cap_one / cap_two / tie`).
+  bound on the intent (`cap_binding ∈ cap_one / cap_two / tie`) AND
+  the contract-count representation (`cap_two_contracts`).
 - **Minimum trade guards.** Skip if walk fills fewer than
   `min_trade_size_contracts` (default 5) OR walk total cost is below
-  `min_trade_value_cents` (default $2.00).
+  `min_trade_value_cents` (default $2.00). Cap_two contributes its
+  own pre-walk skip: if `cap_two_contracts < min_trade_size_contracts`
+  (the 20 % calculation rounds to fewer than the floor), the engine
+  returns None before the walker runs.
 
 Bankroll governs the per-trade sufficiency check (proposed cost
 must fit available cash) and is referenced in reasoning text. The
@@ -224,8 +243,9 @@ confidence {c}, with interaction_occurred=true.
 
 Current YES ask is {ask}c (max-buy ceiling 90c).
 
-Cap analysis: cap_one=$X, cap_two=$Y (5 % of {volume} contracts of
-market volume). Binding: {cap_one|cap_two|tie}, sizing target $Z.
+Cap analysis: cap_one=$X, cap_two=$Y (20 % of {available} contracts
+available under 90c ceiling: {cap_two_contracts} contracts ≈ $Y at
+avg {avg_price}c). Binding: {cap_one|cap_two|tie}, sizing target $Z.
 
 Order-book walk for $Z: N contracts filled across L levels [N1 @ P1,
 N2 @ P2, ...] at avg P_avg c (best ask: {best}, slippage: {slip}c).
@@ -834,8 +854,9 @@ For a single-account operator the aggregate exposure is already
 bounded by what's actually in the Kalshi account. The
 bankroll-sufficiency check (`target_size_usd_cents >
 available_usd_cents`) refuses any trade that wouldn't fit; the two
-per-trade caps (`cap_one` hard $ + `cap_two` 5 % of market volume)
-keep individual trades small. The aggregate "30 % of bankroll"
+per-trade caps (`cap_one` hard $ + `cap_two` 20 % of acceptable
+orderbook depth — see Phase 4 Part 2.6) keep individual trades
+small. The aggregate "30 % of bankroll"
 percentage was duplicating the protection the deposit amount
 already provides — and was actively interfering with running a
 basket of small parallel positions, which is the natural way the
@@ -881,11 +902,88 @@ Per-trade limits are unchanged:
 
 - Cap one — hard fixed-dollar ceiling
   (`position_size_hard_cap_cents`, default $20.00)
-- Cap two — 5 % of market volume
+- Cap two — 20 % of YES contracts available at prices ≤
+  `max_buy_price_cents` (Phase 4 Part 2.6 — was 5 % of historical
+  volume)
 - Bankroll sufficiency — refuses trades that won't fit the
   available cash
 - Price ceiling — refuses trades above 90 ¢ (Phase 4 Part 2.5)
 - Halt + snooze + all other risk gates
+
+---
+
+## Phase 4 Part 2.6 — cap_two redefined as orderbook depth
+
+Cap two used to be **5 % of historical traded volume** on the
+market (`markets.volume x $1/contract x 0.05`). It's now **20 %
+of YES contracts available at prices ≤ `max_buy_price_cents`**
+in the LIVE orderbook.
+
+### Why
+
+Total volume reflects historical activity, not current liquidity.
+A market with thick history but a thin live book would let the bot
+place a trade that destroys the book on entry. The new semantics
+directly target slippage:
+
+- **Thin book** → cap_two tightens automatically
+- **Deep book** → cap_two expands
+- **Empty / above-ceiling-only book** → engine skips the trade (no
+  `cap_two_zero` workaround needed)
+
+### Computation
+
+```python
+acceptable = [(p, q) for p, q in yes_ask_levels if p <= 90 and q > 0]
+available = sum(q for _, q in acceptable)
+cap_two_contracts = floor(available * 0.20)
+avg_price = sum(p * q for p, q in acceptable) // available
+cap_two_cents = cap_two_contracts * avg_price
+```
+
+`cap_two_cents` uses the volume-weighted average of the acceptable
+levels so it stays comparable to `cap_one`. The dollar number is
+what the engine compares; the contract count is what the operator
+sees in the trade row.
+
+### Code changes
+
+- `DecisionConfig.position_size_volume_pct` (0.05) →
+  `position_size_orderbook_pct` (0.20).
+- New helper `_compute_cap_two_pure(yes_ask_levels, max_price_cents,
+  orderbook_pct)` returns `(cap_two_contracts, cap_two_value_cents)`.
+  Pure function, easy to unit-test.
+- `TradeIntent` and `ReentryIntent` gain `cap_two_contracts: int = 0`
+  so the audit trail records both representations.
+- New skip case: if `cap_two_contracts < min_trade_size_contracts`
+  the engine returns None before walking the book (the spec
+  scenario "20 % rounds to fewer than min_trade_size_contracts").
+
+### Migration
+
+Migration 009 adds `trades.cap_two_contracts INTEGER`. Pre-2.6 rows
+leave it NULL — they were sized under the old volume semantics and
+there's no way to reconstruct the live orderbook snapshot.
+
+### Templates + commands
+
+- Trade-proposal Telegram body now reads "Cap two (20% of available
+  contracts under 90c)" with `({cap_two_contracts} of
+  {available_contracts} contracts)`.
+- `/why <trade_id>` reports `cap_two_pct = "20%"` and shows the
+  contract count from `trades.cap_two_contracts` (falls back to
+  `n/a (pre-2.6)` for rows missing it).
+
+### Tests
+
+- 4 old `cap_two` tests in `test_decision_engine.py` rewritten for
+  the new semantics; 5 new edge-case tests added (`empty book`,
+  `book above ceiling`, `book too thin to meet min`,
+  `volume-weighted avg`, `orderbook_pct read from config`).
+- New `TestComputeCapTwoPure` class with 7 unit tests pinning the
+  helper's math directly: empty levels → zero, all-above-ceiling
+  → zero, single-level, multi-level volume-weighted, filter, zero-
+  quantity skipped, tiny-book floors-to-zero.
 
 ---
 

@@ -256,8 +256,18 @@ async def handle_why(ctx: CommandContext) -> RenderedMessage:
             "llm_reasoning": (row["reasoning_text"] or "")[:200],
             "cap_one_amount": _dollars(int(row["cap_one_value_cents"] or 0)),
             "cap_one_status": ("binds" if row["cap_binding"] == "cap_one" else "not binding"),
-            "cap_two_pct": "5%",
-            "market_volume": int(row["volume"] or 0),
+            # Phase 4 Part 2.6: cap_two reference now reflects live
+            # orderbook depth at decision time, not historical volume.
+            "cap_two_pct": "20%",
+            # `market_volume` was the divisor under the old semantics;
+            # under Phase 4 Part 2.6 the meaningful number is the
+            # contract count cap_two would have allowed at decision
+            # time, persisted in trades.cap_two_contracts.
+            "market_volume": (
+                f"{int(row['cap_two_contracts'])} contracts"
+                if row["cap_two_contracts"] is not None
+                else "n/a (pre-2.6)"
+            ),
             "cap_two_amount": _dollars(int(row["cap_two_value_cents"] or 0)),
             "binding_cap": row["cap_binding"] or "unknown",
             "slippage": int(row["slippage_cents"] or 0),

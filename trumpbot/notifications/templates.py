@@ -147,7 +147,8 @@ _DAILY_DIGEST = MessageTemplate(
 _PROPOSAL_BODY = (
     "Position sizing:\n"
     "  Cap one (hard): {cap_one_dollars}\n"
-    "  Cap two (5% of volume): {cap_two_dollars}\n"
+    "  Cap two (20% of available contracts under 90c): {cap_two_dollars}\n"
+    "    ({cap_two_contracts} of {available_contracts} contracts)\n"
     "  Binding: {cap_binding}\n\n"
     "Order book walk for {effective_cap_dollars}:\n"
     "  Filled: {quantity} contracts at avg {avg_fill}c\n"

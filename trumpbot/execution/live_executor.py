@@ -358,15 +358,31 @@ class KalshiExecutor:
         requested_qty: int,
     ) -> ExecutionResult:
         """Promote a pending row to ``live`` (full fill) or
-        ``killed_no_fill`` (FOK rejected by Kalshi)."""
+        ``killed_no_fill`` (FOK rejected by Kalshi).
+
+        Pre-live fix #11 (Phase 4 Part 2.2): the trade row's
+        ``entry_price_cents`` / ``quantity`` / ``cost_basis_usd_cents``
+        prefer the values Kalshi REPORTED in its ack (the canonical
+        fill record). Only fall back to the local re-walk numbers
+        when Kalshi omits a field. Logs ``using_rewalk_fallback``
+        as a system_event whenever any field falls back so it's
+        visible in audit.
+        """
         # Kalshi's order shape: count is requested, remaining_count
         # tells us how much is still resting. For FOK this is either
         # 0 (fully filled) or count (entirely killed).
-        filled = (
-            (order.filled_count or 0)
-            if order.filled_count is not None
-            else ((order.count or 0) - (order.remaining_count or 0))
-        )
+        kalshi_filled: int | None = order.filled_count
+        if kalshi_filled is None and order.count is not None:
+            kalshi_filled = (order.count or 0) - (order.remaining_count or 0)
+        # Prefer Kalshi-reported filled count; fall back to re-walk's
+        # count when Kalshi gave us nothing usable.
+        if kalshi_filled is None or kalshi_filled <= 0:
+            filled = walk.filled_quantity
+            filled_source = "rewalk"
+        else:
+            filled = kalshi_filled
+            filled_source = "kalshi"
+
         if filled <= 0 or order.status not in {"executed", "filled"}:
             update_trade_status_by_client_order_id(
                 self._db,
@@ -388,10 +404,44 @@ class KalshiExecutor:
                 notes=f"Kalshi FOK kill: status={order.status}",
             )
 
-        # Promote to live. Use Kalshi-reported avg if present;
-        # fall back to walk avg.
-        actual_avg = order.avg_fill_price or walk.average_fill_price_cents
+        # Prefer Kalshi-reported avg fill price; fall back to re-walk
+        # only when Kalshi omits it.
+        if order.avg_fill_price is not None and order.avg_fill_price > 0:
+            actual_avg = order.avg_fill_price
+            avg_source = "kalshi"
+        else:
+            actual_avg = walk.average_fill_price_cents
+            avg_source = "rewalk"
         actual_cost = actual_avg * filled
+
+        # Surface the source of each field in a system_event when ANY
+        # falls back to the re-walk. Per Open Issue #11 — gives the
+        # operator visibility into divergence between Kalshi truth and
+        # our reproduction.
+        if filled_source == "rewalk" or avg_source == "rewalk":
+            insert_system_event(
+                self._db,
+                event_type="using_rewalk_fallback",
+                severity="info",
+                component="kalshi_executor",
+                message=(
+                    "Kalshi omitted fill details; using re-walk values "
+                    f"for trade {trade_id} (filled_source={filled_source}, "
+                    f"avg_source={avg_source})"
+                ),
+                detail={
+                    "trade_id": trade_id,
+                    "client_order_id": client_order_id,
+                    "kalshi_order_id": order.order_id,
+                    "filled_source": filled_source,
+                    "avg_source": avg_source,
+                    "kalshi_filled_count": order.filled_count,
+                    "kalshi_avg_fill_price": order.avg_fill_price,
+                    "rewalk_filled_quantity": walk.filled_quantity,
+                    "rewalk_avg_fill_cents": walk.average_fill_price_cents,
+                },
+            )
+
         update_trade_status_by_client_order_id(
             self._db,
             client_order_id=client_order_id,
@@ -408,7 +458,9 @@ class KalshiExecutor:
             client_order_id=client_order_id,
             kalshi_order_id=order.order_id,
             filled_quantity=filled,
+            filled_source=filled_source,
             actual_avg_fill_cents=actual_avg,
+            avg_source=avg_source,
         )
         return ExecutionResult(
             trade_id=trade_id,
@@ -418,7 +470,8 @@ class KalshiExecutor:
             notes=(
                 f"live fill: {filled} contracts at avg {actual_avg}c "
                 f"(target avg {walk.average_fill_price_cents}c, "
-                f"slippage {walk.slippage_cents}c)"
+                f"slippage {walk.slippage_cents}c, "
+                f"qty_source={filled_source}, avg_source={avg_source})"
             ),
         )
 
@@ -562,11 +615,19 @@ class KalshiExecutor:
                 notes=f"stop-loss {category.name}: {category.detail[:200]}",
             )
 
-        filled = (
-            (order.filled_count or 0)
-            if order.filled_count is not None
-            else ((order.count or 0) - (order.remaining_count or 0))
-        )
+        # Pre-live fix #11: prefer Kalshi-reported filled count + avg
+        # fill price; fall back to derived/bid only when Kalshi omits
+        # them. Log a system_event when any field falls back.
+        kalshi_filled: int | None = order.filled_count
+        if kalshi_filled is None and order.count is not None:
+            kalshi_filled = (order.count or 0) - (order.remaining_count or 0)
+        if kalshi_filled is None or kalshi_filled <= 0:
+            filled = intent.position_quantity
+            filled_source = "intent"
+        else:
+            filled = kalshi_filled
+            filled_source = "kalshi"
+
         if filled <= 0:
             self._log_killed(
                 ticker=intent.ticker,
@@ -581,7 +642,38 @@ class KalshiExecutor:
 
         from trumpbot.execution.fees import calculate_exit_fee_cents
 
-        actual_exit_price = order.avg_fill_price or bid
+        if order.avg_fill_price is not None and order.avg_fill_price > 0:
+            actual_exit_price = order.avg_fill_price
+            exit_price_source = "kalshi"
+        else:
+            actual_exit_price = bid
+            exit_price_source = "bid_fallback"
+
+        if filled_source != "kalshi" or exit_price_source != "kalshi":
+            insert_system_event(
+                self._db,
+                event_type="using_rewalk_fallback",
+                severity="info",
+                component="kalshi_executor",
+                message=(
+                    "Kalshi omitted stop-loss fill details; using fallback "
+                    f"values for trade {intent.trade_id} "
+                    f"(filled_source={filled_source}, "
+                    f"exit_price_source={exit_price_source})"
+                ),
+                detail={
+                    "trade_id": intent.trade_id,
+                    "client_order_id": client_order_id,
+                    "kalshi_order_id": order.order_id,
+                    "filled_source": filled_source,
+                    "exit_price_source": exit_price_source,
+                    "kalshi_filled_count": order.filled_count,
+                    "kalshi_avg_fill_price": order.avg_fill_price,
+                    "intent_quantity": intent.position_quantity,
+                    "best_bid": bid,
+                },
+            )
+
         # Phase 4 Part 2.1: track exit fee on the close so the
         # disposal_proceeds_cents reflects net proceeds.
         exit_fees = calculate_exit_fee_cents(actual_exit_price, filled)

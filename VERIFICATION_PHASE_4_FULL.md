@@ -447,8 +447,10 @@ task at startup (verified by reading `trumpbot/daemon.py:559-571`).
   engine. **DEFER**: full plumbing of the live bankroll cache into
   `BankrollState` is Phase 4 Part 2.2. The bankroll-sync loop runs
   and updates `system_state` regardless; `/status` already reads it.
-- ✅ RiskManager enforces all 7 checks unchanged from Phase 2 (price
-  ceiling, bankroll, exposure cap, etc.).
+- ✅ RiskManager enforces all per-trade checks unchanged from Phase 2
+  (price ceiling, bankroll sufficiency, per-trade size cap). The
+  aggregate "30 % of bankroll" exposure cap was later removed in
+  Phase 4 Part 2.3 — see CLAUDE.md.
 - ✅ ApprovalGate works for all three intent types (entry, reentry,
   stop-loss) with the documented timeouts.
 - ✅ Backtester continues working with `DryRunExecutor` (verified by
@@ -585,9 +587,11 @@ Manual steps before flipping `cfg.execution.mode = "live"`:
    ```
    All six checks must pass.
 
-2. **Deposit at least $100 on Kalshi.** The pre-live checklist enforces
-   ≥ $50; recommend $100 to leave headroom for the first few trades
-   plus the 30 % exposure cap.
+2. **Deposit at least $100 on Kalshi.** The pre-live checklist
+   enforces ≥ $50; recommend $100 to leave headroom for the first
+   few trades. (Phase 4 Part 2.3 removed the 30 % aggregate-exposure
+   cap; aggregate exposure is now bounded by the deposit amount
+   itself, so deposit conservatively.)
 
 3. **Verify production Kalshi API keys** in
    `~/.config/trumpbot/secrets.env`:

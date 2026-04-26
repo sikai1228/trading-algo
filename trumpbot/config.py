@@ -86,7 +86,12 @@ class DecisionPhaseConfig(BaseModel):
     min_trade_value_cents: int = 200
     """Skip if the walk's total cost is below this. Default $2.00."""
 
-    total_exposure_cap_pct: float = 0.30
+    # Phase 4 Part 2.3: the aggregate "total_exposure_cap_pct" field
+    # was REMOVED. Aggregate exposure is now bounded by the operator's
+    # actual Kalshi deposit (the bankroll-sufficiency check refuses
+    # any trade that wouldn't fit) plus the two per-trade caps. See
+    # CLAUDE.md "Phase 4 Part 2.3 — exposure cap removal".
+
     stop_loss_drop_cents: int = 50
     decision_loop_interval_sec: int = 10
     stop_loss_loop_interval_sec: int = 60

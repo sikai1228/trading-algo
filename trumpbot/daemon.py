@@ -179,7 +179,6 @@ async def _amain(config_path: Path) -> int:
             position_size_volume_pct=cfg.decision.position_size_volume_pct,
             min_trade_size_contracts=cfg.decision.min_trade_size_contracts,
             min_trade_value_cents=cfg.decision.min_trade_value_cents,
-            total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
             stop_loss_drop_cents=cfg.decision.stop_loss_drop_cents,
         )
     )
@@ -188,7 +187,6 @@ async def _amain(config_path: Path) -> int:
         config=RskCfg(
             enabled=cfg.risk.enabled,
             max_buy_price_cents=cfg.decision.max_buy_price_cents,
-            total_exposure_cap_pct=cfg.decision.total_exposure_cap_pct,
             position_size_hard_cap_cents=cfg.decision.position_size_hard_cap_cents,
             halted=cfg.risk.halted,
         ),

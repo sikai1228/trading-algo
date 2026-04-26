@@ -14,9 +14,12 @@ class RiskManager(ABC):
     There is no path from the decision engine to the executor that bypasses
     risk checks. This is non-negotiable.
 
-    Implementations enforce position-size cap, total-exposure cap,
-    per-market frequency limit, bankroll sufficiency, price ceiling,
-    stop-loss check, and post-loss cool-down.
+    Implementations enforce per-trade position-size cap, per-market
+    frequency limit, bankroll sufficiency, price ceiling, stop-loss
+    check, and post-loss cool-down. The aggregate "total-exposure cap"
+    that was originally in this list was removed in Phase 4 Part 2.3 —
+    aggregate exposure is now managed by the operator via Kalshi
+    deposit amount.
     """
 
     @abstractmethod

@@ -148,7 +148,6 @@ class Backtester:
         self._risk_cfg = risk_config or RiskConfig(
             enabled=True,
             max_buy_price_cents=self._cfg.max_buy_price_cents,
-            total_exposure_cap_pct=self._cfg.total_exposure_cap_pct,
             position_size_hard_cap_cents=self._cfg.position_size_hard_cap_cents,
             halted=False,
         )

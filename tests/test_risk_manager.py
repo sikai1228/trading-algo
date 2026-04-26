@@ -157,9 +157,14 @@ class TestRejections:
         assert isinstance(out, RiskRejection)
         assert out.reason == "insufficient_bankroll"
 
-    def test_exposure_cap_exceeded(self, tmp_path: Path) -> None:
+    def test_aggregate_exposure_no_longer_capped(self, tmp_path: Path) -> None:
+        """Phase 4 Part 2.3: the aggregate "30 % of bankroll" cap was
+        REMOVED. A trade that would have busted the old cap is now
+        approved as long as it fits within available bankroll and the
+        per-trade caps. Pin so a future revert is immediately visible."""
         rm = RiskManager(db=_db(tmp_path), config=RiskConfig())
-        # Bankroll $500; 30% cap = $150. Already $140 deployed, new $20 -> busts.
+        # Bankroll $500; old 30 % cap was $150. $140 already deployed,
+        # new $20 -> total $160 > old cap. Should now APPROVE.
         out = rm.evaluate(
             _intent(target_price_cents=50, target_quantity=40),  # $20
             _state(
@@ -169,9 +174,31 @@ class TestRejections:
                 ),
             ),
         )
-        # 30% of $500 = $150. $140 + $20 = $160 > $150.
-        assert isinstance(out, RiskRejection)
-        assert out.reason == "exposure_cap_exceeded"
+        assert isinstance(out, RiskApprovedOrder)
+
+    def test_multiple_positions_open_until_bankroll_exhausted(self, tmp_path: Path) -> None:
+        """Multiple concurrent positions are allowed up to the
+        bankroll-sufficiency check; the only aggregate ceiling left
+        is the operator's actual deposit. Verifies that 5 successive
+        $20 intents against a $500 bankroll all approve, even though
+        cumulative deployed cost reaches $100 (well past the old 30 %
+        of $500 = $150 cap, but still under bankroll)."""
+        rm = RiskManager(db=_db(tmp_path), config=RiskConfig())
+        deployed = 0
+        for i in range(5):
+            out = rm.evaluate(
+                _intent(target_price_cents=50, target_quantity=40),  # $20
+                _state(
+                    bankroll=_bankroll(
+                        bankroll_usd_cents=50000,
+                        open_position_cost_usd_cents=deployed,
+                    ),
+                ),
+            )
+            assert isinstance(
+                out, RiskApprovedOrder
+            ), f"position {i} ({deployed/100:.2f} already deployed) was rejected"
+            deployed += 2000  # add $20 to the running total
 
     def test_size_cap_engages_with_quantity_adjustment(self, tmp_path: Path) -> None:
         """Fixed $20 cap binds — risk APPROVES with adjusted_quantity.

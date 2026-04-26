@@ -82,9 +82,11 @@ slippage, and fees.
   `min_trade_size_contracts` (default 5) OR walk total cost is below
   `min_trade_value_cents` (default $2.00).
 
-Bankroll still governs the **30 % total-exposure cap** across all
-open positions and is referenced in reasoning text. It no longer
-dictates per-trade sizing.
+Bankroll governs the per-trade sufficiency check (proposed cost
+must fit available cash) and is referenced in reasoning text. The
+old aggregate "30 % of bankroll" exposure cap was removed in
+**Phase 4 Part 2.3**; aggregate exposure is now bounded by the
+operator's actual Kalshi deposit.
 
 ### Stop-loss rules — `DecisionEngine.evaluate_stop_loss`
 
@@ -105,7 +107,7 @@ market only if:
 - All entry rules pass for the new signal
 - Re-entry approvals also have **no timeout**
 
-### Risk-manager checks — `RiskManager.check_intent`
+### Risk-manager checks — `RiskManager.evaluate`
 
 The risk gate is the only path that can produce a `RiskApprovedOrder`. For
 buy intents (entry/reentry), it runs in this order:
@@ -113,12 +115,16 @@ buy intents (entry/reentry), it runs in this order:
 1. `enabled` — if False, reject everything
 2. `halted` — if True, reject everything
 3. **Price ceiling** — `yes_ask_cents <= max_buy_price_cents`
-4. **Bankroll** — proposed cost <= `available_bankroll_usd_cents`
-5. **Total exposure cap** — proposed cost + open exposure <= `30%` of bankroll
-6. **Per-trade size cap** — proposed cost <= `position_size_cap_usd_cents`
+4. **Bankroll** — proposed cost <= `available_usd_cents`
+5. **Per-trade size cap** — proposed cost <= `position_size_hard_cap_cents`
    (fixed dollar, default $20.00); the manager may **adjust the
    quantity downward** to fit, then re-check. Rejects only if the cap is
    so tight even one contract doesn't fit (`size_cap_below_one_contract`).
+
+The aggregate "30 % of bankroll" exposure cap that used to live
+between bankroll and per-trade was removed in **Phase 4 Part 2.3**.
+Aggregate exposure is now bounded by the operator's Kalshi deposit
+amount; the gate only enforces per-trade limits.
 
 For stop-loss intents, the gate confirms the position is still open and
 emits a `RiskApprovedOrder` for the close.
@@ -811,6 +817,73 @@ The fix:
   present, falls back to re-walk + logs system_event when Kalshi
   omits, derives from `count - remaining` when `filled_count` is
   None.
+
+---
+
+## Phase 4 Part 2.3 — total exposure cap removed
+
+The risk gate previously rejected trades that would push
+`open_position_cost + new_trade > 30 % of bankroll`. That check was
+removed.
+
+### Why
+
+For a single-account operator the aggregate exposure is already
+bounded by what's actually in the Kalshi account. The
+bankroll-sufficiency check (`target_size_usd_cents >
+available_usd_cents`) refuses any trade that wouldn't fit; the two
+per-trade caps (`cap_one` hard $ + `cap_two` 5 % of market volume)
+keep individual trades small. The aggregate "30 % of bankroll"
+percentage was duplicating the protection the deposit amount
+already provides — and was actively interfering with running a
+basket of small parallel positions, which is the natural way the
+strategy expresses itself.
+
+The operator now manages aggregate exposure by controlling the
+deposit amount on Kalshi: deposit $200 if you want at most $200 at
+risk; the bot can never trade beyond that.
+
+### What changed (vs. earlier phases)
+
+- `RiskConfig.total_exposure_cap_pct` field removed.
+- `DecisionConfig.total_exposure_cap_pct` field removed.
+- `cfg.decision.total_exposure_cap_pct` removed from `config.yaml`
+  + `config.example.yaml`.
+- `RiskManager._evaluate_buy` no longer runs the exposure check.
+  The `exposure_cap_exceeded` rejection reason is gone.
+- Daemon + backtester wiring updated; both stopped passing the
+  field through.
+- The `risk/base.py` abstract interface docstring updated to drop
+  "total-exposure cap" from the enforced-cap list.
+- `scripts/preview_templates.py` sample data swapped a removed
+  rejection reason for a still-valid one.
+
+### Tests
+
+The old `test_exposure_cap_exceeded` was replaced with two
+regressions in `tests/test_risk_manager.py`:
+
+- `test_aggregate_exposure_no_longer_capped` — the same scenario
+  that used to reject (busts the old 30 % cap) now APPROVES.
+- `test_multiple_positions_open_until_bankroll_exhausted` — five
+  successive $20 intents against a $500 bankroll all approve, even
+  though cumulative deployed cost reaches $100 (well past the old
+  $150 cap).
+
+If a future change re-introduces the aggregate cap, both
+regressions fire immediately.
+
+### What stays
+
+Per-trade limits are unchanged:
+
+- Cap one — hard fixed-dollar ceiling
+  (`position_size_hard_cap_cents`, default $20.00)
+- Cap two — 5 % of market volume
+- Bankroll sufficiency — refuses trades that won't fit the
+  available cash
+- Price ceiling — refuses trades above 80 ¢
+- Halt + snooze + all other risk gates
 
 ---
 

@@ -215,13 +215,13 @@ class TestPollOnce:
         )
         await service.poll_once()
         # Exactly one "new month" notification with the event ticker.
-        new_month = [m for m in telegram.messages if "New month detected" in m]
+        new_month = [m for m in telegram.messages if "New month" in m]
         assert len(new_month) == 1
         assert "KXTRUMPMEET-26APR" in new_month[0]
 
         # Second poll should NOT re-notify.
         await service.poll_once()
-        assert sum("New month detected" in m for m in telegram.messages) == 1
+        assert sum("New month" in m for m in telegram.messages) == 1
 
     async def test_subject_extraction_failure_recorded(self, db: Database, tmp_path: Path) -> None:
         # Manually craft an event with one bad title and one good one.

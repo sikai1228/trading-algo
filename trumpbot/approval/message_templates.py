@@ -1,12 +1,20 @@
-"""Telegram message templates for entry / re-entry / stop-loss approvals.
+"""Approval-flow message formatter.
 
-Pure formatting — no I/O. The same string the user sees in Telegram is
-also persisted to ``telegram_approvals.message_text`` so the audit
-trail matches what was actually shown.
+Phase 3 Part 2 made this a thin facade over
+:mod:`trumpbot.notifications.templates` so the single-source-of-truth
+invariant holds: the actual message text lives in ``templates.py`` and
+this module is just the adapter that turns a :class:`RiskApprovedOrder`
+into the data dict its template expects.
+
+The grep-test in CI checks that no Telegram-message text exists
+outside ``notifications/templates.py``; this module passes the test
+because every f-string here builds a *data value*, never the message
+itself (the rendered text comes from :func:`render_template`).
 """
 
 from __future__ import annotations
 
+from trumpbot.notifications.templates import render_template
 from trumpbot.types.intents import (
     ReentryIntent,
     RiskApprovedOrder,
@@ -16,135 +24,85 @@ from trumpbot.types.intents import (
 
 
 def format_message(approved: RiskApprovedOrder) -> str:
+    """Render the approval-prompt text for a single risk-approved
+    order. Routes by intent type to the right template, builds the
+    appropriate data dict, returns the rendered string."""
     intent = approved.intent
     if isinstance(intent, StopLossIntent):
-        return _format_stop_loss(intent)
+        return render_template(
+            "trade_proposal_stop_loss",
+            _stop_loss_data(intent),
+        ).text
     if isinstance(intent, ReentryIntent):
-        return _format_reentry(intent, approved)
-    return _format_entry(intent, approved)
+        return render_template(
+            "trade_proposal_reentry",
+            _reentry_data(intent, approved),
+        ).text
+    return render_template(
+        "trade_proposal_entry",
+        _entry_data(intent, approved),
+    ).text
 
 
 # ---------------------------------------------------------------------------
-# Entry
+# Data adapters: TradeIntent -> template data dict
 # ---------------------------------------------------------------------------
 
 
-def _format_entry(intent: TradeIntent, approved: RiskApprovedOrder) -> str:
-    """Phase 3 Part 1 — message includes the cap analysis, walk audit,
-    fee estimate, and FOK warning."""
+def _entry_data(intent: TradeIntent, approved: RiskApprovedOrder) -> dict[str, object]:
     qty = approved.adjusted_quantity or intent.target_quantity
-    avg_fill = intent.target_avg_fill_price_cents
-    body = [
-        f"Triggered by match #{intent.triggering_match_id}",
-        f"Confidence: {intent.confidence_score:.2f}  "
-        f"Confirmation weight: {intent.confirmation_weight:.2f}",
-        "",
-        "Position sizing:",
-        f"  Cap one (hard): ${intent.cap_one_value_cents / 100:.2f}",
-        f"  Cap two (5% of volume): ${intent.cap_two_value_cents / 100:.2f}",
-        f"  Binding: {intent.cap_binding}",
-        "",
-        f"Order book walk for ${intent.target_size_usd_cents / 100:.2f}:",
-        f"  Filled: {qty} contracts at avg {avg_fill}c",
-        f"  Slippage: {intent.slippage_cents}c from best ask",
-        f"  Fee estimate: ${intent.estimated_fees_cents / 100:.2f}",
-        f"  Total cost: ${intent.estimated_total_cost_cents / 100:.2f}",
-        "",
-        f"Action: BUY YES @ avg ~{avg_fill}c (FOK, target {qty} contracts)",
-        "",
-        "Reasoning:",
-        intent.reasoning_text,
-        "",
-        "Approve within 3:00 to execute.",
-        "If book moves unfavorably between approval and execution,",
-        "order will be killed (no trade).",
-        "[APPROVE] [REJECT] [DETAILS]",
-    ]
-    return _wrap(
-        header="💰 TRADE PROPOSAL",
-        ticker=intent.ticker,
-        body=body,
-    )
+    return {
+        "ticker": intent.ticker,
+        "match_id": intent.triggering_match_id,
+        "confidence": f"{intent.confidence_score:.2f}",
+        "weight": f"{intent.confirmation_weight:.2f}",
+        **_proposal_body_data(intent, qty),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Re-entry
-# ---------------------------------------------------------------------------
-
-
-def _format_reentry(intent: ReentryIntent, approved: RiskApprovedOrder) -> str:
-    """Phase 3 Part 1 — same walk + cap fields as entry, plus the
-    prior-trade audit context."""
+def _reentry_data(intent: ReentryIntent, approved: RiskApprovedOrder) -> dict[str, object]:
     qty = approved.adjusted_quantity or intent.target_quantity
-    avg_fill = intent.target_avg_fill_price_cents
     realized = intent.prior_trade_realized_pnl_usd_cents / 100
-    body = [
-        f"Prior trade #{intent.prior_trade_id} closed via " f"{intent.prior_trade_outcome}",
-        f"Prior realized P&L: ${realized:+.2f}",
-        "",
-        f"Fresh signal: match #{intent.triggering_match_id} "
-        f"(confidence {intent.confidence_score:.2f})",
-        "",
-        "Position sizing:",
-        f"  Cap one (hard): ${intent.cap_one_value_cents / 100:.2f}",
-        f"  Cap two (5% of volume): ${intent.cap_two_value_cents / 100:.2f}",
-        f"  Binding: {intent.cap_binding}",
-        "",
-        f"Order book walk for ${intent.target_size_usd_cents / 100:.2f}:",
-        f"  Filled: {qty} contracts at avg {avg_fill}c",
-        f"  Slippage: {intent.slippage_cents}c from best ask",
-        f"  Fee estimate: ${intent.estimated_fees_cents / 100:.2f}",
-        f"  Total cost: ${intent.estimated_total_cost_cents / 100:.2f}",
-        "",
-        f"Action: BUY YES @ avg ~{avg_fill}c (FOK, target {qty} contracts)",
-        "",
-        "Reasoning:",
-        intent.reasoning_text,
-        "",
-        "No timeout — respond when ready.",
-        "If book moves unfavorably between approval and execution,",
-        "order will be killed (no trade).",
-        "[APPROVE] [REJECT] [DETAILS]",
-    ]
-    return _wrap(
-        header="🔄 RE-ENTRY OPPORTUNITY",
-        ticker=intent.ticker,
-        body=body,
-    )
+    return {
+        "ticker": intent.ticker,
+        "match_id": intent.triggering_match_id,
+        "confidence": f"{intent.confidence_score:.2f}",
+        "prior_trade_id": intent.prior_trade_id,
+        "prior_trade_outcome": intent.prior_trade_outcome,
+        "prior_realized_dollars": f"${realized:+.2f}",
+        **_proposal_body_data(intent, qty),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Stop-loss
-# ---------------------------------------------------------------------------
+def _stop_loss_data(intent: StopLossIntent) -> dict[str, object]:
+    return {
+        "ticker": intent.ticker,
+        "trade_id": intent.trade_id,
+        "entry_price": intent.entry_price_cents,
+        "current_bid": intent.current_bid_cents,
+        "drop": intent.drop_cents,
+        "quantity": intent.position_quantity,
+        "cost_basis_dollars": f"${intent.cost_basis_usd_cents / 100:.2f}",
+        "current_value_dollars": f"${intent.current_value_usd_cents / 100:.2f}",
+        "unrealized_dollars": f"${intent.unrealized_pnl_usd_cents / 100:+.2f}",
+        "reasoning_text": intent.reasoning_text,
+    }
 
 
-def _format_stop_loss(intent: StopLossIntent) -> str:
-    return _wrap(
-        header="⚠️ STOP-LOSS TRIGGER",
-        ticker=intent.ticker,
-        body=[
-            f"Trade #{intent.trade_id}",
-            f"Entry: {intent.entry_price_cents}c   "
-            f"Current bid: {intent.current_bid_cents}c   "
-            f"Drop: {intent.drop_cents}c",
-            "",
-            f"Position: {intent.position_quantity} contracts",
-            f"Cost basis: ${intent.cost_basis_usd_cents / 100:.2f}",
-            f"Current value: ${intent.current_value_usd_cents / 100:.2f}",
-            f"Unrealized P&L: ${intent.unrealized_pnl_usd_cents / 100:+.2f}",
-            "",
-            "Reasoning:",
-            intent.reasoning_text,
-            "",
-            "No timeout — respond when ready.",
-            "[APPROVE — exit at market] [REJECT — hold]",
-        ],
-    )
-
-
-def _wrap(*, header: str, ticker: str, body: list[str]) -> str:
-    lines = [header, "", f"Ticker: {ticker}", *body]
-    return "\n".join(lines)
+def _proposal_body_data(intent: TradeIntent | ReentryIntent, qty: int) -> dict[str, object]:
+    """Shared sub-template data for entry / re-entry templates."""
+    return {
+        "cap_one_dollars": f"${intent.cap_one_value_cents / 100:.2f}",
+        "cap_two_dollars": f"${intent.cap_two_value_cents / 100:.2f}",
+        "cap_binding": intent.cap_binding,
+        "effective_cap_dollars": (f"${intent.target_size_usd_cents / 100:.2f}"),
+        "quantity": qty,
+        "avg_fill": intent.target_avg_fill_price_cents,
+        "slippage": intent.slippage_cents,
+        "fees_dollars": f"${intent.estimated_fees_cents / 100:.2f}",
+        "total_cost_dollars": (f"${intent.estimated_total_cost_cents / 100:.2f}"),
+        "reasoning_text": intent.reasoning_text,
+    }
 
 
 __all__ = ["format_message"]

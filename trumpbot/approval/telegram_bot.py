@@ -1,17 +1,24 @@
-"""Polling-based Telegram bot for the Phase-2 approval flow.
+"""Polling-based Telegram bot for the Phase-2 approval flow + Phase
+3 Part 2 command surface.
 
 Built on :mod:`python-telegram-bot` (already pinned in pyproject.toml).
-Just enough surface to:
+Surface:
 
-- Send a message with an inline ``[APPROVE] [REJECT]`` keyboard
-- Parse the user's button press
-- Resolve a Future the :class:`ApprovalGate` is awaiting
-- Honor the per-intent-type timeout (or no-timeout)
-- Validate ``chat_id`` against the allowlist (single chat in v1)
+- Approval flow (Phase 2): inline ``[APPROVE] [REJECT]`` keyboard for
+  every trade intent, awaits the user's button press, resolves the
+  future the :class:`ApprovalGate` is waiting on.
+- Command surface (Phase 3 Part 2): registers a ``CommandHandler`` for
+  every command in :mod:`trumpbot.notifications.commands`. Each command
+  is dispatched through that module's handler registry; replies render
+  via :mod:`trumpbot.notifications.templates`. Messages from
+  non-allowlisted chats are silently dropped.
+- Outbound silent / audible messages: :meth:`send_text` accepts a
+  ``silent`` flag wired to Telegram's ``disable_notification``. Used by
+  :class:`AlertDispatcher`, the heartbeat loop, and the daily digest.
 
-Out of scope (Phase 3): ``/halt``, ``/resume``, ``/status``,
-``/positions``, heartbeat messages, error alerts, command parsing
-beyond approve/reject.
+The bot validates ``chat_id`` against the allowlist (single chat in
+v1) on every inbound update; mismatches log a warning and return
+silently.
 """
 
 from __future__ import annotations
@@ -20,6 +27,19 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 
+from trumpbot.db.connection import Database
+from trumpbot.notifications.commands import (
+    CommandContext,
+    CommandRateLimiter,
+    all_command_names,
+    dispatch,
+)
+from trumpbot.notifications.llm_cost import LLMCostGuard
+from trumpbot.notifications.templates import (
+    BUTTON_APPROVE_LABEL,
+    BUTTON_REJECT_LABEL,
+    render_template,
+)
 from trumpbot.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -45,7 +65,17 @@ class TelegramApprovalBot:
 
     chat_id: str | None  # advertised so ApprovalGate can record it
 
-    def __init__(self, *, bot_token: str, chat_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        bot_token: str,
+        chat_id: str,
+        db: Database | None = None,
+        cost_guard: LLMCostGuard | None = None,
+        bankroll_usd_cents: int = 50000,
+        sources_total: int = 0,
+        rate_limit_per_minute: int = 30,
+    ) -> None:
         self._token = bot_token
         self.chat_id = chat_id
         self._chat_id_int = int(chat_id)
@@ -55,17 +85,50 @@ class TelegramApprovalBot:
         self._pending: dict[str, _PendingApproval] = {}
         self._lock = asyncio.Lock()
 
+        # ---- Phase 3 Part 2: command surface dependencies ----
+        # Optional. When None, command handlers are not registered (the
+        # bot reverts to Phase-2-only inline approval). Production
+        # daemon always supplies them; tests for the approval flow can
+        # leave them off.
+        self._db = db
+        self._cost_guard = cost_guard
+        self._bankroll_usd_cents = bankroll_usd_cents
+        self._sources_total = sources_total
+        self._sources_active = sources_total
+        self._rate_limiter = CommandRateLimiter(max_per_minute=rate_limit_per_minute)
+        from datetime import UTC, datetime
+
+        self._daemon_started_at = datetime.now(UTC)
+
+    def update_source_count(self, *, active: int, total: int) -> None:
+        """Called by the source_health_loop so /status reports accurate
+        counts. Both numbers are pure metadata; no behavior changes."""
+        self._sources_active = active
+        self._sources_total = total
+
     # -- lifecycle ----------------------------------------------------
 
     async def start(self) -> None:
         from telegram.ext import (
             ApplicationBuilder,
             CallbackQueryHandler,
+            CommandHandler,
         )
 
         builder = ApplicationBuilder().token(self._token)
         app = builder.build()
         app.add_handler(CallbackQueryHandler(self._on_button))
+        # Phase 3 Part 2: register every /command from
+        # notifications.commands.all_command_names. Each one routes to
+        # _on_command which dispatches to the handler registry.
+        if self._db is not None:
+            for name in all_command_names():
+                app.add_handler(CommandHandler(name.lstrip("/"), self._on_command))
+            # An "unknown command" catch-all so /foo gets a hint instead
+            # of silence. python-telegram-bot uses MessageHandler for this.
+            from telegram.ext import MessageHandler, filters
+
+            app.add_handler(MessageHandler(filters.COMMAND, self._on_unknown_command))
         await app.initialize()
         await app.start()
         if app.updater is not None:
@@ -95,8 +158,10 @@ class TelegramApprovalBot:
         keyboard = InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("✅ Approve", callback_data=f"approve|{intent_id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"reject|{intent_id}"),
+                    InlineKeyboardButton(
+                        BUTTON_APPROVE_LABEL, callback_data=f"approve|{intent_id}"
+                    ),
+                    InlineKeyboardButton(BUTTON_REJECT_LABEL, callback_data=f"reject|{intent_id}"),
                 ]
             ]
         )
@@ -130,6 +195,98 @@ class TelegramApprovalBot:
         finally:
             async with self._lock:
                 self._pending.pop(intent_id, None)
+
+    # -- Phase 3 Part 2: outbound + command surface ------------------
+
+    async def send_text(self, text: str, *, silent: bool = True) -> None:
+        """Send a one-way message to the allowlisted chat. Used by
+        :class:`AlertDispatcher`, the heartbeat loop, the daily digest,
+        and the settlement notifier. ``silent`` maps to Telegram's
+        ``disable_notification``; per spec, only critical alerts pass
+        ``silent=False``."""
+        if self._app is None:
+            raise RuntimeError("TelegramApprovalBot.start() has not been called")
+        await self._app.bot.send_message(  # type: ignore[attr-defined]
+            chat_id=self._chat_id_int,
+            text=text,
+            disable_notification=silent,
+        )
+
+    async def _on_command(self, update, _context) -> None:  # type: ignore[no-untyped-def]
+        """Dispatch one ``/command`` to the appropriate handler.
+
+        Validation:
+        - Allowlist: messages from any other chat are dropped + logged.
+        - Rate-limit: 30/min/chat by default; bursts return a
+          USER-FACING usage hint rather than silently failing.
+        - Unknown args / handler errors: replies with a usage hint
+          rendered from a template -- never an inline string.
+        """
+        msg = update.message
+        if msg is None:
+            return
+        if msg.chat.id != self._chat_id_int:
+            log.warning("telegram_command_from_unauthorized_chat", chat_id=msg.chat.id)
+            # Phase 3 Part 2 spec: write a system_events row so the
+            # operational audit log has a record of the rejection,
+            # not just the structlog stream.
+            if self._db is not None:
+                from trumpbot.db.repositories import insert_system_event
+
+                insert_system_event(
+                    self._db,
+                    event_type="unauthorized_command",
+                    severity="warning",
+                    component="telegram_bot",
+                    message=(
+                        f"command from unauthorized chat_id={msg.chat.id}; "
+                        f"text={(msg.text or '')[:120]!r}"
+                    ),
+                    detail={"chat_id": msg.chat.id, "text": (msg.text or "")[:120]},
+                )
+            return
+        if not self._rate_limiter.check(msg.chat.id):
+            log.warning("telegram_command_rate_limited", chat_id=msg.chat.id)
+            return
+        # Tokenize: msg.text is "/cmd arg1 arg2" or "/cmd@bot arg1".
+        text = (msg.text or "").strip()
+        if not text.startswith("/"):
+            return
+        parts = text.split()
+        cmd_token = parts[0].lstrip("/").split("@", 1)[0]  # strip optional @bot suffix
+        args = parts[1:]
+        handler = dispatch(cmd_token)
+        if handler is None or self._db is None:
+            rendered = render_template("command_reply_unknown", {"command": "/" + cmd_token})
+            await self.send_text(rendered.text, silent=True)
+            return
+        ctx = CommandContext(
+            db=self._db,
+            args=args,
+            cost_guard=self._cost_guard,
+            bankroll_usd_cents=self._bankroll_usd_cents,
+            daemon_started_at=self._daemon_started_at,
+            sources_total=self._sources_total,
+            sources_active=self._sources_active,
+        )
+        try:
+            rendered = await handler(ctx)
+        except Exception as exc:  # pragma: no cover -- defensive
+            log.error("command_handler_error", cmd=cmd_token, error=repr(exc))
+            rendered = render_template("command_reply_unknown", {"command": "/" + cmd_token})
+        await self.send_text(rendered.text, silent=True)
+
+    async def _on_unknown_command(self, update, _context) -> None:  # type: ignore[no-untyped-def]
+        """Catch-all for /foo bar where 'foo' isn't a registered
+        command. python-telegram-bot routes registered commands first;
+        this handler only fires for unregistered ones."""
+        msg = update.message
+        if msg is None or msg.chat.id != self._chat_id_int:
+            return
+        text = (msg.text or "").strip()
+        cmd_token = text.split()[0] if text else "(unknown)"
+        rendered = render_template("command_reply_unknown", {"command": cmd_token})
+        await self.send_text(rendered.text, silent=True)
 
     # -- Telegram callback --------------------------------------------
 

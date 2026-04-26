@@ -1,0 +1,26 @@
+# litestream config. Replicates the SQLite database to S3 (or any
+# S3-compatible store like Backblaze B2) continuously.
+#
+# Install: https://litestream.io/install/
+# Run:     systemctl enable --now litestream
+#
+# Required env vars (provided by /etc/trumpbot/secrets.env):
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#   LITESTREAM_BUCKET (e.g. trumpbot-backups)
+#   LITESTREAM_REGION (e.g. us-east-1)
+#   LITESTREAM_ENDPOINT (optional; for B2 or non-AWS S3)
+
+dbs:
+  - path: /var/lib/trumpbot/trumpbot.db
+    replicas:
+      - type: s3
+        bucket: ${LITESTREAM_BUCKET}
+        path: trumpbot/db
+        region: ${LITESTREAM_REGION}
+        endpoint: ${LITESTREAM_ENDPOINT}
+        # Snapshot every hour, keep 30 days of history.
+        snapshot-interval: 1h
+        retention: 720h
+        # Sync continuously.
+        sync-interval: 10s

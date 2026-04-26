@@ -1,25 +1,54 @@
 # trading-algo
 
-Algorithmic trading bot for Kalshi prediction markets. Single-server, single-process Python 3.11+ system, human-in-the-loop via Telegram. See `TRADING.md` (kept outside this repo) for the full architectural spec.
+Algorithmic trading bot for Kalshi prediction markets focused on "Will Trump talk to/meet/mention X this month?" markets. The system observes markets and news in real time, scores each article against the active markets, and persists everything for later analysis. **Phase 1 is observation only — no orders are placed.**
 
-This is the v1 scaffold. No business logic is implemented yet; only abstract base classes for the five core modules, the SQLite schema, and the systemd unit file.
+See `TRADING.md` (kept outside this repo) for the full architectural spec.
 
 ## Project layout
 
 ```
 trumpbot/
-  market_data/   MarketDataFeed ABC
-  news/          NewsMonitor ABC
-  decision/      DecisionEngine ABC
-  risk/          RiskManager ABC
-  executor/      Executor + ApprovalGate ABCs
-  db/            SQLite connection + migration runner
+  kalshi/          REST client (auth, rate-limit, schemas, client, exceptions)
+  market_data/     MarketDataFeed ABC + KalshiWebSocketFeed
+  news/            NewsMonitor ABC + RSSPoller + TwitterScraper +
+                   TruthSocialScraper + NewsMatcher
+  discovery/       MarketDiscoveryService + SubjectExtractor
+  decision/        DecisionEngine ABC (Phase 2)
+  risk/            RiskManager ABC (Phase 2)
+  executor/        Executor + ApprovalGate ABCs (Phase 3)
+  db/              Database + migrations runner + repositories
+  events/          In-process pub/sub event bus
+  health/          Localhost /health + /metrics HTTP server
+  utils/           timeutil, url canonicalization, structlog setup
+  config.py        Pydantic-validated YAML config loader
+  daemon.py        Top-level orchestrator + MatcherWorker + HeartbeatLogger
+  __main__.py      `python -m trumpbot`
+
+config/
+  config.example.yaml      full source list and tuning knobs
+  subject_aliases.yaml     subject -> alias dictionary (configurable)
+  match_verbs.yaml         documentation of matcher verb lists
+
 migrations/
-  001_initial.sql   full schema (markets, price_snapshots, news_events,
-                    trades, trade_news_links, risk_decisions, system_events)
+  001_initial.sql          full Phase 1 + Phase 2/3 table definitions
+
 deploy/
-  trumpbot.service  systemd unit
-tests/             pytest suite (empty)
+  trumpbot.service         hardened systemd unit
+  litestream.yml           continuous SQLite replication to S3/B2
+  setup.sh                 idempotent one-shot installer
+
+scripts/
+  inspect_data.py          read-only summary of captured data
+  replay_news_match.py     re-run matcher against a stored event
+
+tests/
+  test_kalshi_*.py         auth, rate-limit, REST client (respx-mocked)
+  test_news_matcher.py     ~70 tests covering positives, negation,
+                           future tense, indirect language, alias
+                           variations, partial-name safety, windows
+  test_db.py               schema + repositories + idempotency
+  test_rss_poller.py       end-to-end RSS persistence with respx
+  test_*.py                config loader, event bus, utils, subjects
 ```
 
 ## Setup
@@ -27,62 +56,95 @@ tests/             pytest suite (empty)
 Requirements: Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-# install dependencies (creates .venv, installs everything pinned in pyproject.toml)
+# install all pinned deps + dev tools
 uv sync
 
-# install pre-commit hooks
+# one-time pre-commit hook install
 uv run pre-commit install
 
-# initialize the detect-secrets baseline (one-time)
-uv run detect-secrets scan > .secrets.baseline
+# regenerate the detect-secrets baseline (only after auditing real findings)
+uv run detect-secrets scan --baseline .secrets.baseline
 ```
 
 ## Environment variables
 
-Production reads secrets from `/etc/trumpbot/secrets.env` (mode 0600, owned by the `trumpbot` service user). For local development, copy the template below into a local `.env` (gitignored) and source it before running.
+Production reads secrets from `/etc/trumpbot/secrets.env` (mode 0600, owned by the `trumpbot` service user, sourced by systemd via `EnvironmentFile=`). For local development, copy the template below into a local `.env` (gitignored) and source it before running.
 
 | Variable | Purpose |
 | --- | --- |
-| `TRUMPBOT_DB_PATH` | Path to the SQLite database file (default: `./trumpbot.db`) |
+| `TRUMPBOT_CONFIG` | Path to the YAML config (default `/etc/trumpbot/config.yaml`) |
 | `KALSHI_API_KEY_ID` | Kalshi API key identifier |
-| `KALSHI_PRIVATE_KEY_PATH` | Path to the encrypted RSA private key (mode 0600) |
-| `KALSHI_PRIVATE_KEY_PASSPHRASE` | Passphrase entered manually at bot startup |
-| `KALSHI_ENV` | `demo` or `prod` |
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather |
-| `TELEGRAM_CHAT_ID_ALLOWLIST` | Comma-separated list of allowed chat ids (typically one) |
-| `EXECUTOR_MODE` | `dry_run`, `paper`, or `live` (default: `dry_run`) |
-| `APPROVAL_MODE` | `human` or `auto` (default: `human`) |
+| `KALSHI_PRIVATE_KEY_PASSPHRASE` | Passphrase for the encrypted RSA private key |
+| `TWITTER_BEARER_TOKEN` | Optional. If unset, Twitter ingestion is silently disabled. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | For litestream backups |
+| `LITESTREAM_BUCKET`, `LITESTREAM_REGION`, `LITESTREAM_ENDPOINT` | litestream destination |
 
-None of these are read by code yet; they are documented here so future sessions wire them in consistently.
+The Kalshi RSA private key lives at `/etc/trumpbot/kalshi_private.pem` (mode 0600). Encrypt at rest with a passphrase the operator types on every restart.
+
+## Configuration
+
+`config/config.example.yaml` enumerates every news source from the Phase 1 brief with appropriate weights and `is_kalshi_approved` flags. Verify the exact `target_series` strings against the live Kalshi platform before deployment — the spec uses `KXTRUMPCALL`, `KXTRUMPMEET`, `KXTRUMPMENTION` as a starting point, but Kalshi may rename or split series.
 
 ## Running migrations
 
-Migrations live in `migrations/` and are applied automatically the first time `trumpbot.db.Database.connect()` is called. The connection helper tracks applied filenames in a `schema_migrations` table.
-
-To apply migrations from a fresh shell:
+Migrations live in `migrations/` and are applied automatically the first time `Database.connect()` is called. The connection helper tracks applied filenames in a `schema_migrations` table.
 
 ```bash
 uv run python -c "from trumpbot.db import Database; Database('trumpbot.db').connect()"
 ```
 
-## Tests
+## Running the daemon
 
 ```bash
-uv run pytest
+# Local development with a hand-edited config:
+TRUMPBOT_CONFIG=/path/to/config.yaml uv run python -m trumpbot
+
+# Or via the systemd unit on a deployed VPS:
+sudo systemctl start trumpbot
+sudo journalctl -u trumpbot -f
 ```
 
-The suite is empty in this scaffold; the command exits successfully with no tests collected.
+The daemon starts the following concurrent tasks:
 
-## Lint and type-check
+1. **MarketDiscoveryService** — polls Kalshi REST every 5 min, upserts target-series markets.
+2. **KalshiWebSocketFeed** — live orderbook + trade feed, periodic price snapshots, automatic reconnect.
+3. **RSSPoller** — one task per source from the configured list.
+4. **TwitterScraper** — one task per handle (requires bearer token; otherwise no-op).
+5. **TruthSocialScraper** — polls @realDonaldTrump.
+6. **MatcherWorker** — consumes new news events, runs the matcher against active markets.
+7. **HeartbeatLogger** — logs one-line state every 60 seconds.
+8. **HealthcheckServer** — `127.0.0.1:9090/health` and `/metrics` (Prometheus).
+
+SIGTERM/SIGINT trigger graceful shutdown.
+
+## Inspecting captured data
 
 ```bash
+# summary of markets, recent news, high-confidence matches, daily stats
+uv run python scripts/inspect_data.py --db /var/lib/trumpbot/trumpbot.db
+
+# re-run the matcher on a specific stored news event for debugging
+uv run python scripts/replay_news_match.py 12345 --db /var/lib/trumpbot/trumpbot.db
+```
+
+## Tests, lint, type-check
+
+```bash
+uv run pytest          # 127 tests, ~1.5s
 uv run ruff check .
 uv run black --check .
 uv run mypy
 ```
 
-All three are required to pass in CI before any change is merged.
+All four are required to pass in CI. The matcher test suite (`tests/test_news_matcher.py`) is the spec for the matcher — when matcher behavior changes, those tests change with it.
 
 ## Build order
 
-Phase 1 (the next milestone) is read-only data collection: Kalshi REST client, market discovery, price snapshot collector, RSS news monitor, keyword matcher. No decision engine, no executor, no real money. See `TRADING.md` § Build Order for the full sequence.
+- **Phase 1 (this scaffold)**: data collection only. Markets, prices, news, matches. No trading.
+- **Phase 2**: DecisionEngine + RiskManager + DryRunExecutor. Backtest against Phase 1 data. Tune thresholds.
+- **Phase 3**: Telegram approval gate, kill switch, monitoring. Continue dry-run.
+- **Phase 4**: Switch to live executor with $500 bankroll and 2% max position size.
+- **Phase 5**: Increase bankroll based on observed Sharpe / drawdown. Consider auto-mode after 60+ days of clean human-approved data.
+- **Future**: Web observability backend reads from the same SQLite database via `bot.queries`. Daemon does not change.
+
+See `TRADING.md` § Build Order for the full sequence.

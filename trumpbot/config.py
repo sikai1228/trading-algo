@@ -360,9 +360,19 @@ def _expand_env(value: Any) -> Any:
 
 
 def load_config(path: Path | str) -> TrumpbotConfig:
-    """Load YAML config, expand ``${ENV}`` placeholders, parse with Pydantic."""
+    """Load YAML config, expand ``${ENV}`` placeholders, parse with Pydantic.
+
+    Phase 4 Part 2.10 robustness: a top-level YAML key that has been
+    emptied of all its children (e.g. ``daemon:`` followed by nothing
+    after the operator stripped a deprecated key) parses as ``None``
+    in PyYAML. Pydantic then rejects it as ``"Input should be a valid
+    dictionary"``. We coerce those to empty dicts so the section-level
+    default_factory takes over and the daemon starts cleanly.
+    """
     raw = yaml.safe_load(Path(path).read_text())
     if raw is None:
         raise ValueError(f"config at {path} is empty")
     expanded = _expand_env(raw)
+    if isinstance(expanded, dict):
+        expanded = {k: ({} if v is None else v) for k, v in expanded.items()}
     return TrumpbotConfig.model_validate(expanded)

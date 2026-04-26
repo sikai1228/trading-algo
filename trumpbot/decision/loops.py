@@ -55,10 +55,69 @@ DepthFn = Callable[[str], list[tuple[int, int]] | None]
 daemon wires this to a thin wrapper over the WS feed."""
 
 
-def _bankroll_state(db: Database, *, starting_amount_usd: float) -> BankrollState:
+def _bankroll_state(
+    db: Database,
+    *,
+    starting_amount_usd: float,
+    execution_mode: str = "dry_run",
+) -> BankrollState:
+    """Build a :class:`BankrollState` for one engine evaluation.
+
+    Pre-live fix #1: when ``execution_mode == "live"``, prefer the
+    cached Kalshi balance written by ``bankroll_sync_loop`` into
+    ``system_state['bankroll_usd_cents']``. Falls back to the
+    configured starting amount when the cache is empty (daemon just
+    started OR sync has never succeeded). Records the provenance via
+    :class:`~trumpbot.decision.engine.BankrollSource` so the
+    reasoning text can disclose it.
+
+    Dry-run mode always returns the configured value — dry-run is
+    explicitly a "trade against this fake bankroll" rehearsal.
+    """
+    open_cost_cents = total_open_position_cost_cents(db)
+    if execution_mode != "live":
+        return BankrollState(
+            bankroll_usd_cents=int(round(starting_amount_usd * 100)),
+            open_position_cost_usd_cents=open_cost_cents,
+            source="config",
+            last_synced_at=None,
+        )
+    # Live mode: consult the synced cache.
+    from trumpbot.account.bankroll_sync import (
+        BANKROLL_LAST_SYNC_KEY,
+        BANKROLL_STATE_KEY,
+    )
+
+    cached_raw = get_system_state(db, BANKROLL_STATE_KEY)
+    last_sync_iso = get_system_state(db, BANKROLL_LAST_SYNC_KEY)
+    last_synced_at: datetime | None = None
+    if last_sync_iso:
+        with contextlib.suppress(ValueError):
+            last_synced_at = datetime.fromisoformat(last_sync_iso.replace("Z", "+00:00"))
+    if cached_raw is None:
+        # No sync has succeeded yet — fall back, but tag the state
+        # so the reasoning text discloses the fallback.
+        return BankrollState(
+            bankroll_usd_cents=int(round(starting_amount_usd * 100)),
+            open_position_cost_usd_cents=open_cost_cents,
+            source="kalshi_fallback",
+            last_synced_at=None,
+        )
+    try:
+        cached_cents = int(cached_raw)
+    except ValueError:
+        log.error("bankroll_state_corrupt", raw=cached_raw)
+        return BankrollState(
+            bankroll_usd_cents=int(round(starting_amount_usd * 100)),
+            open_position_cost_usd_cents=open_cost_cents,
+            source="kalshi_fallback",
+            last_synced_at=last_synced_at,
+        )
     return BankrollState(
-        bankroll_usd_cents=int(round(starting_amount_usd * 100)),
-        open_position_cost_usd_cents=total_open_position_cost_cents(db),
+        bankroll_usd_cents=cached_cents,
+        open_position_cost_usd_cents=open_cost_cents,
+        source="kalshi_synced",
+        last_synced_at=last_synced_at,
     )
 
 
@@ -77,6 +136,7 @@ async def decision_loop(
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
+    execution_mode: str,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
 ) -> None:
@@ -93,6 +153,7 @@ async def decision_loop(
                 orderbook=orderbook,
                 depth=depth,
                 starting_amount_usd=starting_amount_usd,
+                execution_mode=execution_mode,
             )
         except asyncio.CancelledError:
             raise
@@ -120,6 +181,7 @@ async def _run_decision_cycle(
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
+    execution_mode: str = "dry_run",
 ) -> None:
     # Phase 3 Part 2: respect /halt as the first thing every cycle.
     # When the user has issued /halt the entire cycle is a no-op until
@@ -149,7 +211,11 @@ async def _run_decision_cycle(
             continue
         position_row = get_open_trade_for_ticker(db, ticker)
         position = _row_to_position(position_row)
-        bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
+        bankroll = _bankroll_state(
+            db,
+            starting_amount_usd=starting_amount_usd,
+            execution_mode=execution_mode,
+        )
         snap = _row_to_snapshot(match, market_row)
         market_state = _market_state(orderbook, ticker, db=db)
         levels = depth(ticker) or []
@@ -192,6 +258,7 @@ async def stop_loss_loop(
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
+    execution_mode: str,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
 ) -> None:
@@ -212,7 +279,11 @@ async def stop_loss_loop(
                 stop_intent = engine.evaluate_stop_loss(position, market_state)
                 if stop_intent is None:
                     continue
-                bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
+                bankroll = _bankroll_state(
+                    db,
+                    starting_amount_usd=starting_amount_usd,
+                    execution_mode=execution_mode,
+                )
                 state = RiskState(bankroll=bankroll, open_position_tickers=_open_tickers(db))
                 decision = risk.evaluate(stop_intent, state)
                 if isinstance(decision, RiskRejection):
@@ -267,6 +338,7 @@ async def reentry_loop(
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
+    execution_mode: str,
     poll_interval_sec: int,
     stop_event: asyncio.Event,
 ) -> None:
@@ -293,6 +365,7 @@ async def reentry_loop(
                         orderbook=orderbook,
                         depth=depth,
                         starting_amount_usd=starting_amount_usd,
+                        execution_mode=execution_mode,
                         match=match,
                         ticker=ticker,
                     )
@@ -315,6 +388,7 @@ async def _maybe_reentry(  # type: ignore[no-untyped-def]
     orderbook: OrderbookFn,
     depth: DepthFn,
     starting_amount_usd: float,
+    execution_mode: str,
     match,
     ticker: str,
 ) -> None:
@@ -331,7 +405,11 @@ async def _maybe_reentry(  # type: ignore[no-untyped-def]
         return
     snap = _row_to_snapshot(match, market_row)
     market_state = _market_state(orderbook, ticker, db=db)
-    bankroll = _bankroll_state(db, starting_amount_usd=starting_amount_usd)
+    bankroll = _bankroll_state(
+        db,
+        starting_amount_usd=starting_amount_usd,
+        execution_mode=execution_mode,
+    )
     prior_position = _row_to_position(prior_row)
     if prior_position is None:
         return

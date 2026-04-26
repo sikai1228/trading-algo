@@ -87,6 +87,10 @@ def test_only_critical_alerts_are_audible() -> None:
         # Phase 4 Part 1: live-mode critical alerts.
         "reconciliation_failed",
         "mode_switched_live",
+        # Phase 4 Part 2.2 (pre-live fix #2): bankroll sync auto-halt
+        # is operationally critical — operator must know the bot is
+        # trading off stale balance.
+        "alert_critical_bankroll_sync_failed",
     }
     assert audible_names == expected
 

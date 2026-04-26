@@ -359,6 +359,7 @@ async def _amain(config_path: Path) -> int:
                     orderbook=_orderbook,
                     depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    execution_mode=cfg.execution.mode,
                     poll_interval_sec=cfg.decision.decision_loop_interval_sec,
                     stop_event=stop_event,
                 ),
@@ -377,6 +378,7 @@ async def _amain(config_path: Path) -> int:
                     orderbook=_orderbook,
                     depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    execution_mode=cfg.execution.mode,
                     poll_interval_sec=cfg.decision.stop_loss_loop_interval_sec,
                     stop_event=stop_event,
                 ),
@@ -406,6 +408,7 @@ async def _amain(config_path: Path) -> int:
                     orderbook=_orderbook,
                     depth=_depth,
                     starting_amount_usd=cfg.bankroll.starting_amount_usd,
+                    execution_mode=cfg.execution.mode,
                     poll_interval_sec=cfg.decision.reentry_loop_interval_sec,
                     stop_event=stop_event,
                 ),
@@ -669,6 +672,22 @@ async def _amain(config_path: Path) -> int:
             except Exception as exc:
                 log.warning("settlement_notify_failed", error=repr(exc))
 
+        # Pre-live fix #2: pass the Telegram send fn so the loop can
+        # fire alert_critical_bankroll_sync_failed / alert_info_bankroll_
+        # sync_recovered. Defined locally because _send_text may not
+        # have been bound if telegram_bot is None (defensive — live
+        # mode in practice always has a Telegram bot, but don't trip
+        # NameError if someone runs live-headless).
+        if telegram_bot is not None:
+
+            async def _send_text_for_bankroll(text: str, silent: bool) -> None:
+                assert telegram_bot is not None  # checked above
+                await telegram_bot.send_text(text, silent=silent)
+
+            _bankroll_send: Callable[[str, bool], Awaitable[None]] | None = _send_text_for_bankroll
+        else:
+            _bankroll_send = None
+
         tasks["bankroll_sync_loop"] = asyncio.create_task(
             _supervised(
                 lambda: bankroll_sync_loop(
@@ -676,6 +695,7 @@ async def _amain(config_path: Path) -> int:
                     kalshi=rest_client,
                     poll_interval_sec=300,
                     stop_event=stop_event,
+                    send_text=_bankroll_send,
                 ),
                 "bankroll_sync_loop",
                 critical=False,

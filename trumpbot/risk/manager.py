@@ -106,12 +106,12 @@ class RiskManager:
             )
 
         # 1. Bankroll check
-        if intent.target_size_usd_cents > state.bankroll.available_bankroll_usd_cents:
+        if intent.target_size_usd_cents > state.bankroll.available_usd_cents:
             return self._reject(
                 intent,
                 "insufficient_bankroll",
                 f"target ${intent.target_size_usd_cents/100:.2f} > available "
-                f"${state.bankroll.available_bankroll_usd_cents/100:.2f}",
+                f"${state.bankroll.available_usd_cents/100:.2f}",
                 "available_bankroll",
             )
 

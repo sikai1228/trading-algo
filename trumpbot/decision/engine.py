@@ -136,27 +136,60 @@ class Position:
     triggering_match_id: int
 
 
+BankrollSource = Literal["config", "kalshi_synced", "kalshi_fallback"]
+"""Provenance tag for a :class:`BankrollState`. Helps reasoning text
+honestly disclose whether the engine sized off a real Kalshi balance
+or a stale fallback.
+
+- ``config``: dry-run mode; engine used ``cfg.bankroll.starting_amount_usd``.
+- ``kalshi_synced``: live mode; ``system_state['bankroll_usd_cents']``
+  was populated by the bankroll sync loop and is what we used.
+- ``kalshi_fallback``: live mode but the cache was empty (daemon just
+  started OR sync has never succeeded); engine fell back to
+  ``cfg.bankroll.starting_amount_usd``.
+"""
+
+
 @dataclass(frozen=True)
 class BankrollState:
     """Snapshot of bankroll + open exposure at evaluation time.
 
-    The fixed-dollar cap migration removed the ``live_trading_started_at``
-    field — there's no longer a time-based switch. Bankroll still
-    governs the 30 % total exposure cap and is referenced in the
-    reasoning text, but per-trade sizing is dictated by
-    :attr:`DecisionConfig.position_size_cap_usd_cents`.
+    Phase 4 Part 2.2 (pre-live fix #1): added :attr:`source` and
+    :attr:`last_synced_at` so reasoning text can disclose the
+    provenance of the bankroll number. The engine and risk gate
+    still consult :attr:`available_usd_cents` for sizing decisions.
     """
 
     bankroll_usd_cents: int
-    """Total starting bankroll, in USDCents."""
+    """Total bankroll at evaluation time, in USDCents.
+
+    In dry-run mode this is the configured starting amount. In live
+    mode it's the cached Kalshi balance (or the configured fallback
+    if the cache is empty)."""
 
     open_position_cost_usd_cents: int
     """Sum of cost_basis across all open positions."""
 
+    source: BankrollSource = "config"
+    """Where this number came from. Surfaced in reasoning text."""
+
+    last_synced_at: datetime | None = None
+    """When the cache was last refreshed from Kalshi (UTC). ``None``
+    in dry-run mode and on the first cycle of a live-mode startup."""
+
+    @property
+    def available_usd_cents(self) -> int:
+        """Bankroll minus already-deployed cost basis. The risk gate
+        and engine size off this, NOT off ``bankroll_usd_cents``.
+        Clamped at 0 — never returns negative."""
+        return max(0, self.bankroll_usd_cents - self.open_position_cost_usd_cents)
+
+    # Back-compat alias. Older tests / external consumers reference
+    # the verbose name; keep both pointing at the same number so we
+    # don't break callsites unnecessarily.
     @property
     def available_bankroll_usd_cents(self) -> int:
-        """Bankroll minus already-deployed cost basis."""
-        return max(0, self.bankroll_usd_cents - self.open_position_cost_usd_cents)
+        return self.available_usd_cents
 
 
 class DecisionEngine:
@@ -284,6 +317,7 @@ class DecisionEngine:
             cap_binding=cap_binding,
             effective_cap_cents=effective_cap_cents,
             walk=walk,
+            bankroll=bankroll,
         )
 
         return TradeIntent(
@@ -491,6 +525,7 @@ def _build_entry_reasoning(
     cap_binding: CapBinding,
     effective_cap_cents: int,
     walk: OrderbookWalkResult,
+    bankroll: BankrollState,
 ) -> str:
     """Phase 3 reasoning text — multi-paragraph audit log.
 
@@ -554,7 +589,30 @@ def _build_entry_reasoning(
     )
     ceiling = f"Current YES ask is {best_ask}c (max-buy ceiling 80c)."
 
-    return "\n\n".join([header, ceiling, cap_para, walk_para, cost_para, pnl_para])
+    # Phase 4 Part 2.2 (pre-live fix #1): disclose where the bankroll
+    # number came from so the operator can spot a stale-fallback
+    # situation in the reasoning text itself.
+    bankroll_label = {
+        "config": "configured starting amount (dry-run)",
+        "kalshi_synced": "Kalshi-synced balance",
+        "kalshi_fallback": "configured starting amount (Kalshi sync hasn't run yet)",
+    }.get(bankroll.source, bankroll.source)
+    sync_age = ""
+    if bankroll.last_synced_at is not None:
+        from datetime import UTC
+
+        age_secs = int((datetime.now(UTC) - bankroll.last_synced_at).total_seconds())
+        sync_age = (
+            f", last synced {age_secs // 60}m ago"
+            if age_secs >= 60
+            else f", last synced {age_secs}s ago"
+        )
+    bankroll_para = (
+        f"Bankroll: ${bankroll.bankroll_usd_cents / 100:.2f} ({bankroll_label}{sync_age}); "
+        f"available ${bankroll.available_usd_cents / 100:.2f} after open positions."
+    )
+
+    return "\n\n".join([header, ceiling, bankroll_para, cap_para, walk_para, cost_para, pnl_para])
 
 
 __all__ = [

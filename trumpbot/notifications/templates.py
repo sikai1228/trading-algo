@@ -469,6 +469,38 @@ _ALERT_INFO_SOURCE_RECOVERED = MessageTemplate(
 )
 
 # ---------------------------------------------------------------------------
+# Pre-live fix #2 — bankroll sync auto-halt + auto-resume
+# ---------------------------------------------------------------------------
+
+_ALERT_CRITICAL_BANKROLL_SYNC_FAILED = MessageTemplate(
+    category="alert_critical",
+    audible=True,
+    # fields: failure_count, first_failure_time, last_error,
+    #         last_success_time, age
+    format=(
+        "🚨 CRITICAL: Kalshi balance sync failing\n\n"
+        "Failed {failure_count} consecutive times since {first_failure_time}.\n"
+        "Last error: {last_error}\n"
+        "Last successful sync: {last_success_time} ({age} ago)\n\n"
+        "Trading halted to prevent decisions on stale balance.\n"
+        "Will auto-resume when sync succeeds.\n\n"
+        "If outage continues, check Kalshi status page."
+    ),
+)
+
+_ALERT_INFO_BANKROLL_SYNC_RECOVERED = MessageTemplate(
+    category="alert_info",
+    audible=False,
+    # fields: time_et, balance
+    format=(
+        "✅ Kalshi balance sync recovered\n\n"
+        "Successful sync at {time_et}.\n"
+        "Reported balance: {balance}\n\n"
+        "Auto-halt cleared (was set by bankroll_sync_loop)."
+    ),
+)
+
+# ---------------------------------------------------------------------------
 # Command replies
 # ---------------------------------------------------------------------------
 
@@ -995,6 +1027,9 @@ TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
     "alert_info_subject_enriched": _ALERT_INFO_SUBJECT_ENRICHED,
     "alert_info_llm_spend_update": _ALERT_INFO_LLM_SPEND_UPDATE,
     "alert_info_source_recovered": _ALERT_INFO_SOURCE_RECOVERED,
+    # Phase 4 Part 2.2 (pre-live fix #2) — bankroll sync auto-halt
+    "alert_critical_bankroll_sync_failed": _ALERT_CRITICAL_BANKROLL_SYNC_FAILED,
+    "alert_info_bankroll_sync_recovered": _ALERT_INFO_BANKROLL_SYNC_RECOVERED,
     # Command replies
     "command_reply_status": _COMMAND_REPLY_STATUS,
     "command_reply_positions": _COMMAND_REPLY_POSITIONS,

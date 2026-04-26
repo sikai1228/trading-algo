@@ -102,9 +102,19 @@ class RiskPhaseConfig(BaseModel):
 
 
 class ApprovalPhaseConfig(BaseModel):
+    """Approval-flow timeouts.
+
+    NOTE: ``mode`` is HARDCODED to ``"human"`` in v1 (see CLAUDE.md
+    "Hardcoded human-in-the-loop"). It used to live here as a
+    configurable field but was deliberately removed in Phase 4 — auto-
+    approve must NOT be reachable through any config knob, only by
+    deleting the constant in the code itself. The shadow_decisions
+    table (Phase 4 Part 1) collects evidence for whether auto-approve
+    would be safe in the future.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    mode: str = "human"
     entry_timeout_sec: int = 180
     stop_loss_timeout_sec: int | None = None
     reentry_timeout_sec: int | None = None

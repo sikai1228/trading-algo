@@ -392,6 +392,173 @@ doesn't repeat).
 
 ---
 
+## Phase 4 Part 1 — live trading executor + reconciliation
+
+Phase 4 promotes the bot from dry-run to real Kalshi orders. The
+strategy contract from Phases 2 / 3 doesn't change: same engine, same
+risk gate, same approval flow. What changes is the executor at the
+bottom of the pipeline — and a halo of supporting infrastructure
+that exists only to keep live trading safe.
+
+### Executor switching — `cfg.execution.mode`
+
+The daemon picks `DryRunExecutor` or `KalshiExecutor` based on
+`cfg.execution.mode`. Both implement the same `async submit` /
+`update_position_marks` / `close_resolved` surface, so the loops in
+`trumpbot/decision/loops.py` are oblivious to which is wired in. The
+`Executor` union in `loops.py` is the type all four loops accept.
+
+`DryRunExecutor.submit` was made `async` in Phase 4 even though it
+doesn't await anything internally — so the call site in
+`_approve_and_submit` is uniform. Don't add a sync overload back.
+
+### Live executor — `trumpbot/execution/live_executor.py`
+
+`KalshiExecutor` runs the same Phase 3 FOK gate before talking to
+Kalshi (re-walk, kill if avg drift / qty drift), then:
+
+1. Mints a UUIDv4 `client_order_id`.
+2. Inserts a `trades` row with `status='pending'` and the
+   `client_order_id` populated. **This insert MUST happen BEFORE the
+   API call** — otherwise a network failure mid-submit leaves
+   reconciliation unable to find the row. Pinned by the
+   `test_pending_row_inserted_before_api_call` regression test.
+3. Calls `KalshiClient.place_order(time_in_force='FOK',
+   client_order_id=...)`. The Kalshi client is configured with
+   `retry_on_transient=False` for `POST /portfolio/orders` so a
+   transient failure surfaces immediately rather than risking a
+   duplicate.
+4. On success, updates the row to `status='live'` (or
+   `killed_no_fill` if Kalshi reported FOK rejection).
+5. On exception, categorizes via `trumpbot/kalshi/errors.py` and
+   stores the appropriate terminal status:
+   - `ValidationError` → `error_validation` (code bug, alert user)
+   - `TransientError` → `error_transient` (reconciliation will look
+     up by `client_order_id` on next restart)
+   - `StateError` → `error_validation` + **HALT the bot** (insufficient
+     funds / market closed / account suspended)
+   - `ValidationError` containing `duplicate_client_order_id` →
+     promote to `live` optimistically (the original submission
+     landed; we lost only the response)
+
+### Hardcoded human-in-the-loop
+
+Auto-approval is **NOT** reachable through any config knob in v1.
+The constant `APPROVAL_MODE = "human"` in
+`trumpbot/approval/gate.py` is the only switch. The Phase 2
+`cfg.approval.mode` field was deliberately removed in Phase 4 — adding
+it back is forbidden, regression-tested by
+`test_approval_mode_hardcoded_human` in
+`tests/test_kalshi_executor.py`.
+
+The `shadow_decisions` table (Phase 4 Part 1, migration 007) records
+the orderbook snapshot at message-send-time AND at human-decision-time
+for every `TRADE PROPOSAL`. The `/shadow_report` command aggregates
+these into a "what would have happened if auto-approved?" summary.
+This is data-only: the bot still always asks the human. The table
+is the empirical foundation for the eventual auto-approve graduation
+decision.
+
+### Bankroll syncing — `trumpbot/account/bankroll_sync.py`
+
+In live mode the daemon runs `bankroll_sync_loop` every 5 minutes.
+It calls `KalshiClient.get_balance` and stores the integer-cents
+balance in `system_state['bankroll_usd_cents']`. Consumers call
+`get_synced_bankroll_cents()` which falls back to
+`cfg.bankroll.starting_amount_usd` (cents) when the sync hasn't
+written yet. Loop never zeroes the cache on failure — sizing off
+slightly-stale data beats freezing trading.
+
+### Startup reconciliation — `trumpbot/account/reconcile.py`
+
+In live mode the daemon runs `reconcile_once` BEFORE starting the
+trading loops. It cross-references local `trades` rows against
+Kalshi `/orders` and `/positions`:
+
+1. **Pending without ack** → look up by `client_order_id`. If Kalshi
+   has it, promote to `live`; if not, mark `killed_no_fill`.
+2. **Live without position** → tag `reconcile_orphaned`; require
+   `/reconcile_resolve <trade_id>` to acknowledge.
+3. **Position without trade** → insert a `live_imported` row;
+   require `/reconcile_resolve` too.
+
+If reconciliation fails to reach Kalshi, the daemon retries every
+60 s and refuses to start trading until the call succeeds. A
+`reconciliation_failed` audible alert fires once on failure; a
+`reconciliation_drift` warning fires when drift is detected.
+
+### Live settlement detector — `trumpbot/account/settlement_detector.py`
+
+Runs every 5 minutes in live mode. Polls `/portfolio/settlements`
+and closes any open `live` trade whose market resolved:
+
+- `market_result == 'yes'` → 100c → `live_closed_resolved_yes`
+- `market_result == 'no'`  → 0c → `live_closed_resolved_no`
+- `market_result == 'void'` → entry price → `live_closed_resolved_no`
+
+Idempotent — already-closed trades are skipped.
+
+### Trade lifecycle states (migration 007)
+
+The Phase 2 `trades.status` CHECK constraint was widened in
+migration 007 to admit Phase 4 statuses. The `trades` table was
+rebuilt (SQLite can't ALTER CHECK constraints) with FK pragma
+disabled across the swap to preserve `trade_news_links` rows.
+Existing data is bit-for-bit preserved.
+
+| status | meaning |
+|---|---|
+| `dry_run` | Phase 2 simulated open position |
+| `dry_run_closed_*` | Phase 2 simulated close (stop / resolution) |
+| `pending` | Phase 4 submitted to Kalshi, no ack received yet |
+| `live` | Phase 4 filled, position open |
+| `live_closed_stop` | Phase 4 closed by stop-loss |
+| `live_closed_resolved_yes` | Phase 4 settled YES |
+| `live_closed_resolved_no` | Phase 4 settled NO |
+| `killed_book_moved` | FOK kill, executor's re-walk drifted |
+| `killed_no_fill` | FOK kill, Kalshi rejected (book too thin) |
+| `error_validation` | Kalshi 4xx, code bug |
+| `error_transient` | Kalshi 5xx / network, reconciliation pending |
+| `live_imported` | reconciliation found unknown Kalshi position |
+| `reconcile_orphaned` | local `live` row but Kalshi has no position |
+
+### Idempotency via `client_order_id`
+
+UUIDv4 we generate locally. Persisted to `trades.client_order_id`
+BEFORE the Kalshi API call. Kalshi treats it as a primary key —
+re-submitting the same value returns the original order. Two
+columns enforce uniqueness via partial indexes (only NULL for
+dry-run rows): `idx_trades_client_order_id` and
+`idx_trades_kalshi_order_id`.
+
+### Pre-live checklist — `scripts/pre_live_checklist.py`
+
+Run before flipping `cfg.execution.mode = "live"`:
+
+```
+uv run python -m scripts.pre_live_checklist
+```
+
+Verifies: Kalshi auth, bankroll >= $50, reconciliation clean,
+recent dry-run history, risk caps configured, approval mode
+hardcoded. Exits 0 only on all-green.
+
+### Audit columns added by migration 007
+
+- `trades.client_order_id` — UUIDv4 idempotency key
+- `trades.kalshi_order_id` — Kalshi server-side id
+- `shadow_decisions` table — full counterfactual record per
+  `TRADE PROPOSAL`. Backs `/shadow_report`.
+
+### New `/commands` (Phase 4 Part 1)
+
+- `/shadow_report [Nd]` — auto-approve simulation summary, default
+  7-day window.
+- `/reconcile_resolve <trade_id>` — acknowledge a
+  `reconcile_orphaned` or `live_imported` row.
+
+---
+
 ## Type-system enforcement of risk gating
 
 The single most important invariant in Phase 2: **only `RiskManager` can

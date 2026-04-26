@@ -43,6 +43,7 @@ from trumpbot.db.repositories import (
     list_open_trades,
     list_source_status,
     set_system_state,
+    shadow_report_summary,
     upsert_snoozed_market,
 )
 from trumpbot.notifications.llm_cost import LLMCostGuard
@@ -442,8 +443,101 @@ def parse_duration(s: str) -> timedelta:
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter
+# Phase 4 Part 1 — /shadow_report and /reconcile_resolve
 # ---------------------------------------------------------------------------
+
+
+async def handle_shadow_report(ctx: CommandContext) -> RenderedMessage:
+    """Aggregate stats over the shadow_decisions table for the past
+    period. Default window: 7 days. Pass ``Nd`` (e.g. ``30d``) as the
+    first arg to widen the window.
+
+    Output is a "what would have happened if auto-approved?" summary.
+    Auto-approve is HARDCODED OFF in v1; this command is the empirical
+    foundation for the eventual graduation decision.
+    """
+    days = 7
+    if ctx.args:
+        m = re.fullmatch(r"(\d+)d", ctx.args[0])
+        if m:
+            days = int(m.group(1))
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    summary = shadow_report_summary(ctx.db, since_iso=since)
+    return render_template(
+        "command_reply_shadow_report",
+        {
+            "window": f"last {days}d",
+            "total_proposals": summary["total_proposals"],
+            "approved_count": summary["approved_count"],
+            "rejected_count": summary["rejected_count"],
+            "expired_count": summary["expired_count"],
+            "avg_decision_lag": (
+                f"{int(summary['avg_decision_lag_seconds'])}s"
+                if summary["avg_decision_lag_seconds"]
+                else "n/a"
+            ),
+            "avg_price_movement": (
+                f"{int(summary['avg_price_movement_cents']):+d}c"
+                if summary["avg_price_movement_cents"]
+                else "0c"
+            ),
+            "hypothetical_pnl_diff": _dollars_signed(
+                int(summary["sum_hypothetical_pnl_diff_cents"])
+            ),
+        },
+    )
+
+
+async def handle_reconcile_resolve(ctx: CommandContext) -> RenderedMessage:
+    """Acknowledge a reconciliation drift row.
+
+    Usage: ``/reconcile_resolve <trade_id>``
+
+    Marks an ``reconcile_orphaned`` or ``live_imported`` trade as
+    handled by the operator. The status moves to a closed state with
+    realized_pnl=0 (the operator implicitly accepted that the
+    position is no longer active).
+    """
+    if not ctx.args:
+        return render_template(
+            "command_reply_usage_hint",
+            {"command": "/reconcile_resolve", "usage": "<trade_id>"},
+        )
+    try:
+        trade_id = int(ctx.args[0])
+    except ValueError:
+        return render_template(
+            "command_reply_usage_hint",
+            {"command": "/reconcile_resolve", "usage": "<trade_id>"},
+        )
+    conn = ctx.db.connect()
+    row = conn.execute(
+        "SELECT id, status, ticker FROM trades WHERE id = ?",
+        (trade_id,),
+    ).fetchone()
+    if row is None or row["status"] not in {"reconcile_orphaned", "live_imported"}:
+        return render_template(
+            "command_reply_reconcile_resolve_not_found",
+            {"trade_id": trade_id},
+        )
+    new_status = "live_closed_resolved_no"  # treat as closed-no-pnl
+    with ctx.db.transaction() as txn:
+        txn.execute(
+            """
+            UPDATE trades
+               SET status = ?, exit_price_cents = 0,
+                   realized_pnl_usd_cents = 0, exited_at = ?
+             WHERE id = ?
+            """,
+            (new_status, utcnow_iso(), trade_id),
+        )
+    return render_template(
+        "command_reply_reconcile_resolve",
+        {
+            "trade_id": trade_id,
+            "action_taken": (f"trade marked {new_status} (acknowledged by operator)"),
+        },
+    )
 
 
 @dataclass
@@ -486,6 +580,9 @@ _HANDLERS: dict[str, CommandHandler] = {
     "mode": handle_mode,
     "snooze": handle_snooze,
     "unsnooze": handle_unsnooze,
+    # Phase 4 Part 1
+    "shadow_report": handle_shadow_report,
+    "reconcile_resolve": handle_reconcile_resolve,
 }
 
 

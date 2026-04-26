@@ -100,7 +100,7 @@ def _book(*, bid: int | None, ask: int | None) -> Quote:
 
 
 class TestEntrySubmission:
-    def test_simulated_fill_at_current_ask(self, tmp_path: Path) -> None:
+    async def test_simulated_fill_at_current_ask(self, tmp_path: Path) -> None:
         db = _db(tmp_path)
         match_id = _seed_match(db)
         intent = TradeIntent(
@@ -115,7 +115,7 @@ class TestEntrySubmission:
         )
         approved = _approve(db, intent)
         executor = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=49, ask=50))
-        result = executor.submit(approved)
+        result = await executor.submit(approved)
         assert result.status == "filled"
         assert result.fill_price_cents == 50
         assert result.fill_quantity == 10
@@ -125,7 +125,7 @@ class TestEntrySubmission:
         assert rows[0]["entry_price_cents"] == 50
         assert rows[0]["cost_basis_usd_cents"] == 500
 
-    def test_no_ask_rejects(self, tmp_path: Path) -> None:
+    async def test_no_ask_rejects(self, tmp_path: Path) -> None:
         db = _db(tmp_path)
         match_id = _seed_match(db)
         intent = TradeIntent(
@@ -140,10 +140,10 @@ class TestEntrySubmission:
         )
         approved = _approve(db, intent)
         executor = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=None, ask=None))
-        result = executor.submit(approved)
+        result = await executor.submit(approved)
         assert result.status == "rejected"
 
-    def test_adjusted_quantity_honored(self, tmp_path: Path) -> None:
+    async def test_adjusted_quantity_honored(self, tmp_path: Path) -> None:
         db = _db(tmp_path)
         match_id = _seed_match(db)
         # Construct an intent that would normally buy 100 contracts but
@@ -175,7 +175,7 @@ class TestEntrySubmission:
                 "VALUES ('entry', '{}', 'approved', NULL, NULL, 't')"
             )
         executor = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=49, ask=50))
-        result = executor.submit(approved)
+        result = await executor.submit(approved)
         assert result.fill_quantity == 4
         assert result.fill_price_cents == 50
 
@@ -186,7 +186,7 @@ class TestEntrySubmission:
 
 
 class TestStopLossSubmission:
-    def test_closes_at_current_bid(self, tmp_path: Path) -> None:
+    async def test_closes_at_current_bid(self, tmp_path: Path) -> None:
         db = _db(tmp_path)
         match_id = _seed_match(db)
         # First, create an open trade.
@@ -202,7 +202,7 @@ class TestStopLossSubmission:
         )
         approved = _approve(db, intent)
         executor = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=80, ask=80))
-        entry_result = executor.submit(approved)
+        entry_result = await executor.submit(approved)
         assert entry_result.fill_quantity is not None
 
         # Now stop-loss it: bid drops to 20c.
@@ -220,7 +220,7 @@ class TestStopLossSubmission:
         )
         approved_stop = _approve(db, stop)
         executor2 = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=20, ask=22))
-        stop_result = executor2.submit(approved_stop)
+        stop_result = await executor2.submit(approved_stop)
         assert stop_result.fill_price_cents == 20
         assert stop_result.realized_pnl_usd_cents == (20 - 80) * entry_result.fill_quantity
         # Status updated to closed.
@@ -241,7 +241,7 @@ class TestStopLossSubmission:
 
 
 class TestUpdatePositionMarks:
-    def test_marks_open_dry_run_trades_only(self, tmp_path: Path) -> None:
+    async def test_marks_open_dry_run_trades_only(self, tmp_path: Path) -> None:
         db = _db(tmp_path)
         match_id = _seed_match(db)
         intent = TradeIntent(
@@ -256,7 +256,7 @@ class TestUpdatePositionMarks:
         )
         approved = _approve(db, intent)
         executor = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=50, ask=50))
-        executor.submit(approved)
+        await executor.submit(approved)
 
         # Now bid moved to 70c — unrealized P&L should be +200c.
         executor2 = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=70, ask=72))
@@ -276,7 +276,7 @@ class TestUpdatePositionMarks:
 
 
 class TestCloseResolved:
-    def test_yes_resolution_pays_full_dollar(self, tmp_path: Path) -> None:
+    async def test_yes_resolution_pays_full_dollar(self, tmp_path: Path) -> None:
         db = _db(tmp_path)
         match_id = _seed_match(db)
         intent = TradeIntent(
@@ -291,13 +291,13 @@ class TestCloseResolved:
         )
         approved = _approve(db, intent)
         executor = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=42, ask=42))
-        executor.submit(approved)
+        await executor.submit(approved)
         result = executor.close_resolved(ticker="X", resolution="settled_yes")
         assert result is not None
         assert result.fill_price_cents == 100
         assert result.realized_pnl_usd_cents == (100 - 42) * 10
 
-    def test_no_resolution_pays_zero(self, tmp_path: Path) -> None:
+    async def test_no_resolution_pays_zero(self, tmp_path: Path) -> None:
         db = _db(tmp_path)
         match_id = _seed_match(db)
         intent = TradeIntent(
@@ -312,7 +312,7 @@ class TestCloseResolved:
         )
         approved = _approve(db, intent)
         executor = DryRunExecutor(db=db, orderbook_fn=lambda _t: _book(bid=42, ask=42))
-        executor.submit(approved)
+        await executor.submit(approved)
         result = executor.close_resolved(ticker="X", resolution="settled_no")
         assert result is not None
         assert result.fill_price_cents == 0
@@ -356,7 +356,7 @@ def _entry_intent_with_walk(
 
 
 class TestFokGate:
-    def test_fok_fill_when_book_unchanged(self, tmp_path: Path) -> None:
+    async def test_fok_fill_when_book_unchanged(self, tmp_path: Path) -> None:
         """Re-walk produces same numbers -> FOK passes -> trade row
         written with the audit columns from the re-walk."""
         db = _db(tmp_path)
@@ -368,7 +368,7 @@ class TestFokGate:
             orderbook_fn=lambda _t: _book(bid=49, ask=50),
             depth_fn=lambda _t: [(50, 1000)],
         )
-        result = executor.submit(approved)
+        result = await executor.submit(approved)
         assert result.status == "filled"
         assert result.fill_price_cents == 50
         assert result.fill_quantity == 40
@@ -382,7 +382,7 @@ class TestFokGate:
         assert row["entry_fees_cents"] is not None
         assert row["levels_consumed_json"] is not None
 
-    def test_fok_killed_when_book_moves_unfavorably(self, tmp_path: Path) -> None:
+    async def test_fok_killed_when_book_moves_unfavorably(self, tmp_path: Path) -> None:
         """Re-walk fills the target QUANTITY but at a HIGHER avg than
         the engine targeted -> KILL with 'fok_killed_book_moved'.
 
@@ -400,7 +400,7 @@ class TestFokGate:
             orderbook_fn=lambda _t: _book(bid=68, ask=70),
             depth_fn=lambda _t: [(70, 1000)],
         )
-        result = executor.submit(approved)
+        result = await executor.submit(approved)
         assert result.status == "rejected"
         assert "FOK killed" in result.notes
         # No trade row written.
@@ -415,7 +415,7 @@ class TestFokGate:
         assert len(events) == 1
         assert events[0]["event_type"] == "fok_killed_book_moved"
 
-    def test_fok_killed_when_insufficient_liquidity(self, tmp_path: Path) -> None:
+    async def test_fok_killed_when_insufficient_liquidity(self, tmp_path: Path) -> None:
         """Re-walk fills fewer contracts than target -> KILL with
         'fok_killed_insufficient_liquidity'."""
         db = _db(tmp_path)
@@ -428,7 +428,7 @@ class TestFokGate:
             orderbook_fn=lambda _t: _book(bid=49, ask=50),
             depth_fn=lambda _t: [(50, 5)],
         )
-        result = executor.submit(approved)
+        result = await executor.submit(approved)
         assert result.status == "rejected"
         rows = list(db.connect().execute("SELECT id FROM trades"))
         assert rows == []
@@ -439,7 +439,7 @@ class TestFokGate:
         )
         assert events[0]["event_type"] == "fok_killed_insufficient_liquidity"
 
-    def test_fok_killed_when_no_depth_at_all(self, tmp_path: Path) -> None:
+    async def test_fok_killed_when_no_depth_at_all(self, tmp_path: Path) -> None:
         """depth_fn returns None / empty -> KILL with insufficient_liquidity."""
         db = _db(tmp_path)
         match_id = _seed_match(db)
@@ -450,7 +450,7 @@ class TestFokGate:
             orderbook_fn=lambda _t: _book(bid=None, ask=None),
             depth_fn=lambda _t: None,
         )
-        result = executor.submit(approved)
+        result = await executor.submit(approved)
         assert result.status == "rejected"
         rows = list(db.connect().execute("SELECT id FROM trades"))
         assert rows == []

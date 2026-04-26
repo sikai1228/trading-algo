@@ -662,18 +662,20 @@ _COMMAND_REPLY_HELP = MessageTemplate(
     # fields: (none)
     format=(
         "Commands:\n"
-        "  /status                   bot state, P&L, sources, LLM spend\n"
-        "  /positions                open trades + mark-to-market\n"
-        "  /why <trade_id>           reasoning for a specific trade\n"
-        "  /history [N]              last N closed trades (default 10)\n"
-        "  /spend                    LLM spend (today / week / month)\n"
-        "  /mode                     current execution + approval mode\n"
-        "  /halt                     pause new trade proposals\n"
-        "  /resume                   resume new trade proposals\n"
-        "  /snooze <ticker> [dur]    snooze one market (e.g. /snooze X 24h)\n"
-        "  /unsnooze <ticker>        unsnooze one market\n"
-        "  /heartbeat                quick liveness check\n"
-        "  /help                     this list"
+        "  /status                       bot state, P&L, sources, LLM spend\n"
+        "  /positions                    open trades + mark-to-market\n"
+        "  /why <trade_id>               reasoning for a specific trade\n"
+        "  /history [N]                  last N closed trades (default 10)\n"
+        "  /spend                        LLM spend (today / week / month)\n"
+        "  /mode                         current execution + approval mode\n"
+        "  /halt                         pause new trade proposals\n"
+        "  /resume                       resume new trade proposals\n"
+        "  /snooze <ticker> [dur]        snooze one market\n"
+        "  /unsnooze <ticker>            unsnooze one market\n"
+        "  /heartbeat                    quick liveness check\n"
+        "  /shadow_report [Nd]           auto-approve simulation (default 7d)\n"
+        "  /reconcile_resolve <trade_id> acknowledge a reconcile drift row\n"
+        "  /help                         this list"
     ),
 )
 
@@ -689,6 +691,182 @@ _COMMAND_REPLY_USAGE_HINT = MessageTemplate(
     audible=False,
     # fields: command, usage
     format="Usage: {command} {usage}",
+)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — live trading lifecycle notifications
+# ---------------------------------------------------------------------------
+
+_TRADE_FILLED_LIVE = MessageTemplate(
+    category="trade_outcome",
+    audible=False,
+    # fields: ticker, quantity, fill_price, total_cost_dollars, fees_dollars,
+    #         kalshi_order_id, slippage, target_avg
+    format=(
+        "✅ Live fill: {ticker}\n"
+        "{quantity} contracts @ avg {fill_price}c\n"
+        "Total cost: {total_cost_dollars} (+{fees_dollars} fees)\n\n"
+        "Slippage from target: {slippage}c (target avg {target_avg}c)\n"
+        "Kalshi order: {kalshi_order_id}"
+    ),
+)
+
+_TRADE_KILLED_BOOK_MOVED_LIVE = MessageTemplate(
+    category="trade_outcome",
+    audible=False,
+    # fields: ticker, target_avg, target_qty, new_avg, new_qty
+    format=(
+        "🛑 Live order killed (book moved): {ticker}\n\n"
+        "Target avg fill: {target_avg}c for {target_qty} contracts\n"
+        "Re-walk produced: {new_avg}c for {new_qty} contracts\n\n"
+        "Order was NOT submitted. No position opened.\n"
+        "Re-trigger requires fresh news signal."
+    ),
+)
+
+_TRADE_KILLED_NO_FILL_LIVE = MessageTemplate(
+    category="trade_outcome",
+    audible=False,
+    # fields: ticker, target_qty, filled_qty
+    format=(
+        "🛑 Live order killed (no fill): {ticker}\n\n"
+        "FOK rejected by Kalshi. Filled {filled_qty} of {target_qty} "
+        "contracts (FOK requires all-or-nothing).\n\n"
+        "Order canceled. No position opened.\n"
+        "Common cause: order book emptied between approval and submission."
+    ),
+)
+
+_TRADE_ERROR_VALIDATION = MessageTemplate(
+    category="alert_warning",
+    audible=False,
+    # fields: ticker, detail, client_order_id
+    format=(
+        "⚠️ Live order rejected by Kalshi (validation): {ticker}\n\n"
+        "Detail: {detail}\n"
+        "Client order id: {client_order_id}\n\n"
+        "This indicates a code bug -- the request was malformed.\n"
+        "Trade row tagged error_validation. Investigate logs."
+    ),
+)
+
+_TRADE_ERROR_TRANSIENT = MessageTemplate(
+    category="alert_warning",
+    audible=False,
+    # fields: ticker, detail, client_order_id
+    format=(
+        "⚠️ Live order may have failed (transient): {ticker}\n\n"
+        "Network or 5xx error: {detail}\n"
+        "Client order id: {client_order_id}\n\n"
+        "We don't know if the order landed. Trade row tagged\n"
+        "error_transient. On next restart, reconciliation will look\n"
+        "this up by client_order_id and recover the real state."
+    ),
+)
+
+_RECONCILIATION_FAILED = MessageTemplate(
+    category="alert_critical",
+    audible=True,
+    # fields: detail
+    format=(
+        "🚨 CRITICAL: startup reconciliation failed\n\n"
+        "Couldn't reach Kalshi for order/position lookup: {detail}\n\n"
+        "Trading loops are GATED until reconciliation succeeds. The\n"
+        "daemon will keep retrying. No new orders will go out until\n"
+        "this clears."
+    ),
+)
+
+_RECONCILIATION_DRIFT = MessageTemplate(
+    category="alert_warning",
+    audible=False,
+    # fields: drift_summary
+    format=(
+        "⚠️ Reconciliation drift detected\n\n"
+        "{drift_summary}\n\n"
+        "Use /reconcile_resolve <trade_id> to acknowledge each.\n"
+        "See system_events table for the full audit trail."
+    ),
+)
+
+_RECONCILIATION_OK = MessageTemplate(
+    category="alert_info",
+    audible=False,
+    # fields: pending_count, live_count, kalshi_position_count
+    format=(
+        "✅ Reconciliation clean\n\n"
+        "Pending: {pending_count} | Live: {live_count} | "
+        "Kalshi positions: {kalshi_position_count}\n"
+        "No drift detected. Trading loops starting."
+    ),
+)
+
+_MODE_SWITCHED_LIVE = MessageTemplate(
+    category="alert_critical",
+    audible=True,
+    # fields: bankroll, time_et
+    format=(
+        "🟢 LIVE TRADING ENABLED\n\n"
+        "Execution mode is now: live\n"
+        "Bankroll synced: {bankroll}\n"
+        "Time: {time_et}\n\n"
+        "Real money is now at risk. Every trade still requires your\n"
+        "approval in Telegram. Use /halt to pause new proposals."
+    ),
+)
+
+_MODE_SWITCHED_DRY_RUN = MessageTemplate(
+    category="alert_info",
+    audible=False,
+    # fields: time_et
+    format=(
+        "🔵 Dry-run mode active\n\n"
+        "Execution mode is now: dry_run\n"
+        "Time: {time_et}\n\n"
+        "All trades are simulated; no real money is at risk."
+    ),
+)
+
+_COMMAND_REPLY_SHADOW_REPORT = MessageTemplate(
+    category="command_reply",
+    audible=False,
+    # fields: window, total_proposals, approved_count, rejected_count,
+    #         expired_count, avg_decision_lag, avg_price_movement,
+    #         hypothetical_pnl_diff
+    format=(
+        "🕯️ Shadow Auto-Approval Report ({window})\n\n"
+        "Total proposals: {total_proposals}\n"
+        "  Approved by you: {approved_count}\n"
+        "  Rejected by you: {rejected_count}\n"
+        "  Expired (timeout): {expired_count}\n\n"
+        "Average decision lag: {avg_decision_lag}\n"
+        "Average price movement during lag: {avg_price_movement}\n\n"
+        "Hypothetical P&L difference if auto-approved: {hypothetical_pnl_diff}\n"
+        "(positive == auto-approve would have done better)\n\n"
+        "Note: auto-approve is HARDCODED OFF in v1. This is data only."
+    ),
+)
+
+_COMMAND_REPLY_RECONCILE_RESOLVE = MessageTemplate(
+    category="command_reply",
+    audible=False,
+    # fields: trade_id, action_taken
+    format=(
+        "✅ Reconciliation resolved for trade #{trade_id}\n\n"
+        "Action: {action_taken}\n\n"
+        "Drift acknowledged and recorded in system_events."
+    ),
+)
+
+_COMMAND_REPLY_RECONCILE_RESOLVE_NOT_FOUND = MessageTemplate(
+    category="command_reply",
+    audible=False,
+    # fields: trade_id
+    format=(
+        "Trade #{trade_id} not found, or not in a reconcile-pending state.\n"
+        "Try /positions to list active rows."
+    ),
 )
 
 
@@ -743,6 +921,20 @@ TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
     "command_reply_help": _COMMAND_REPLY_HELP,
     "command_reply_unknown": _COMMAND_REPLY_UNKNOWN,
     "command_reply_usage_hint": _COMMAND_REPLY_USAGE_HINT,
+    # Phase 4 — live trading lifecycle
+    "trade_filled_live": _TRADE_FILLED_LIVE,
+    "trade_killed_book_moved_live": _TRADE_KILLED_BOOK_MOVED_LIVE,
+    "trade_killed_no_fill_live": _TRADE_KILLED_NO_FILL_LIVE,
+    "trade_error_validation": _TRADE_ERROR_VALIDATION,
+    "trade_error_transient": _TRADE_ERROR_TRANSIENT,
+    "reconciliation_failed": _RECONCILIATION_FAILED,
+    "reconciliation_drift": _RECONCILIATION_DRIFT,
+    "reconciliation_ok": _RECONCILIATION_OK,
+    "mode_switched_live": _MODE_SWITCHED_LIVE,
+    "mode_switched_dry_run": _MODE_SWITCHED_DRY_RUN,
+    "command_reply_shadow_report": _COMMAND_REPLY_SHADOW_REPORT,
+    "command_reply_reconcile_resolve": _COMMAND_REPLY_RECONCILE_RESOLVE,
+    "command_reply_reconcile_resolve_not_found": _COMMAND_REPLY_RECONCILE_RESOLVE_NOT_FOUND,
     # Sub-templates exposed for callers that need to render rows /
     # lines that get joined into a parent template.
     "_position_line": _POSITION_LINE,

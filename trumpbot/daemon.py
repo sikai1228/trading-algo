@@ -74,6 +74,32 @@ ACTIVE_MARKETS = Gauge("trumpbot_active_markets", "Markets currently in 'active'
 WS_CONNECTED = Gauge("trumpbot_kalshi_ws_connected", "1 if WS connection is open")
 TASK_HEALTHY = Gauge("trumpbot_task_healthy", "1 if task healthy", ["task"])
 
+# Phase 4 Part 2.12 — articles older than this are skipped before the
+# LLM cascade (Stage 2). Prevents wasted Anthropic spend on
+# historical content that proxies (Google News, Bing) periodically
+# surface as "new". 48 h is conservatively above the 24 h
+# DecisionEngine entry-window check so an article that's just barely
+# inside the engine's window still reaches Stage 2.
+STALE_ARTICLE_HOURS: int = 48
+
+
+def _article_is_stale(raw_published_ts: str | None, threshold_hours: int) -> bool:
+    """True if the article was published more than ``threshold_hours``
+    ago. ``None`` / unparseable timestamps are TREATED AS STALE so
+    the LLM never spends budget on an article whose publish time we
+    can't verify."""
+    if not raw_published_ts:
+        return True
+    s = raw_published_ts.replace("Z", "+00:00")
+    try:
+        published = datetime.fromisoformat(s)
+    except ValueError:
+        return True
+    if published.tzinfo is None:
+        published = published.replace(tzinfo=UTC)
+    age = datetime.now(UTC) - published
+    return age.total_seconds() > threshold_hours * 3600
+
 
 async def _amain(config_path: Path) -> int:
     cfg = load_config(config_path)
@@ -1208,12 +1234,50 @@ class MatcherWorker:
         return len(events)
 
     async def _classify_and_patch(self, events_needing_llm: list[dict[str, Any]]) -> None:
-        """Call the LLM for each event and patch the corresponding match rows."""
+        """Call the LLM for each event and patch the corresponding match rows.
+
+        Phase 4 Part 2.12 — added a freshness guard: events whose
+        ``raw_published_ts`` is older than
+        :data:`STALE_ARTICLE_HOURS` (or NULL) skip the LLM call and
+        get patched with ``classifier_type='keyword_only'`` +
+        ``match_reason='skipped_stale'``. This prevents wasting LLM
+        budget on the historical content Google News (and similar
+        proxies) periodically surfaces.
+        """
         assert self._classifier is not None
         for item in events_needing_llm:
             evt = item["evt"]
             inserted: list[tuple[int, Any]] = item["inserted"]
             candidates: dict[str, list[str]] = item["subject_candidates"]
+
+            # ``evt`` is a sqlite3.Row (no .get); guard for missing
+            # column safely via try/except.
+            try:
+                raw_published_ts = evt["raw_published_ts"]
+            except (IndexError, KeyError):
+                raw_published_ts = None
+            if _article_is_stale(raw_published_ts, STALE_ARTICLE_HOURS):
+                log.info(
+                    "llm_skipped_stale_article",
+                    news_event_id=evt["id"],
+                    raw_published_ts=raw_published_ts,
+                )
+                # Patch every passed row to reflect the skip so the
+                # audit trail records why no LLM call happened.
+                for row_id, mr in inserted:
+                    update_match_with_classification(
+                        self._db,
+                        match_id=row_id,
+                        update=LLMMatchUpdate(
+                            classifier_type="keyword_only",
+                            confidence=0.0,
+                            matched_subject=mr.matched_subject,
+                            match_reason="skipped_stale",
+                            llm_classification_id=None,
+                        ),
+                    )
+                continue
+
             try:
                 classified = await self._classifier.classify(
                     news_event_id=evt["id"],

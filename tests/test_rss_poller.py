@@ -108,3 +108,90 @@ async def test_429_does_not_persist(tmp_db: Database) -> None:
         asyncio.sleep = orig
     rows = list(tmp_db.connect().execute("SELECT * FROM news_events"))
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 Part 2.12 — If-Modified-Since / If-None-Match
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_conditional_request_sent_on_second_poll(tmp_db: Database) -> None:
+    """First poll lands a 200 with Last-Modified + ETag. Second
+    poll should send those values back as If-Modified-Since /
+    If-None-Match. We check both the request headers AND that the
+    bot honors a 304 by skipping insertion."""
+    bus = EventBus()
+    source = NewsSourceConfig(
+        name="reuters",
+        type="rss",
+        url="https://example.com/feed.xml",
+        poll_interval_sec=60,
+        is_kalshi_approved=True,
+    )
+    last_modified = "Sun, 26 Apr 2026 12:00:00 GMT"
+    etag = '"abc123"'
+    respx.get("https://example.com/feed.xml").mock(
+        return_value=httpx.Response(
+            200,
+            text=SAMPLE_RSS,
+            headers={
+                "Content-Type": "application/rss+xml",
+                "Last-Modified": last_modified,
+                "ETag": etag,
+            },
+        )
+    )
+
+    poller = RSSPoller(sources=[source], db=tmp_db, event_bus=bus)
+    await poller._poll_source(source)
+
+    # First poll: no conditional headers sent (we had no prior values).
+    first_call = respx.calls[0].request
+    assert first_call.headers.get("if-modified-since") is None
+    assert first_call.headers.get("if-none-match") is None
+
+    # Second poll: conditional headers should be present.
+    await poller._poll_source(source)
+    second_call = respx.calls[1].request
+    assert second_call.headers.get("if-modified-since") == last_modified
+    assert second_call.headers.get("if-none-match") == etag
+
+
+@respx.mock
+async def test_304_response_skips_parsing(tmp_db: Database) -> None:
+    """When the source returns 304 Not Modified, the poller skips
+    inserting any rows for that poll cycle. Verifies bandwidth
+    savings translate into work savings."""
+    bus = EventBus()
+    source = NewsSourceConfig(
+        name="reuters",
+        type="rss",
+        url="https://example.com/feed.xml",
+        poll_interval_sec=60,
+        is_kalshi_approved=True,
+    )
+    # First poll returns 200; second poll returns 304.
+    route = respx.get("https://example.com/feed.xml")
+    route.side_effect = [
+        httpx.Response(
+            200,
+            text=SAMPLE_RSS,
+            headers={
+                "Content-Type": "application/rss+xml",
+                "Last-Modified": "Sun, 26 Apr 2026 12:00:00 GMT",
+                "ETag": '"abc123"',
+            },
+        ),
+        httpx.Response(304),
+    ]
+
+    poller = RSSPoller(sources=[source], db=tmp_db, event_bus=bus)
+    await poller._poll_source(source)
+    rows_after_first = list(tmp_db.connect().execute("SELECT id FROM news_events"))
+    assert len(rows_after_first) == 2
+
+    await poller._poll_source(source)
+    rows_after_second = list(tmp_db.connect().execute("SELECT id FROM news_events"))
+    # No new rows on 304 — the existing two are unchanged.
+    assert len(rows_after_second) == 2

@@ -31,58 +31,82 @@ kalshi:
 
 news:
   sources:
-    # Reuters / AP / Semafor have no working public RSS as of 2026-04-25
-    # (Reuters shut down feeds in 2020, AP moved to a partner-only API,
-    # Semafor never published one). We use a Google News source-filtered
-    # query as the discovery mechanism — the underlying article is still
-    # the Kalshi-approved outlet (the <source> field in the RSS confirms),
-    # so is_kalshi_approved stays true. URLs go through a Google
-    # redirector; URL canonicalization treats each as unique. See
-    # docs/VERIFICATION_PHASE_1_5.md for the URL-by-URL audit.
-    - {name: "reuters_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:reuters.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "ap_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:apnews.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, is_kalshi_approved: true}
+    # ------------------------------------------------------------------
+    # Phase 4 Part 2.12 — RSS source list rebuilt from the investigation
+    # at docs/investigations/rss_ingestion_analysis.md and the follow-up
+    # PR. Removed sources are documented in CLAUDE.md "Active news
+    # sources" with the failure mode that disqualified each. Do not
+    # re-add a removed source without re-verifying it works.
+    # ------------------------------------------------------------------
+
+    # ---- Wires (no working free direct feed) -------------------------
+    # Reuters and AP have no public RSS as of 2026-04-26. Reuters cut
+    # all public RSS in 2020 (paid Refinitiv only); AP retired their
+    # feeds in 2023. The previous Google-News-proxied workaround
+    # (`reuters_via_gnews`, `ap_via_gnews`) was REMOVED — the
+    # investigation showed only ~1 in 117 ingested articles was
+    # actually fresh; the rest were old content Google News indexed
+    # for the first time. Polluted the database without adding
+    # signal value.
+
+    # ---- Direct major-outlet feeds (verified working) ----------------
     - {name: "bloomberg", type: "rss", url: "https://feeds.bloomberg.com/politics/news.rss", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "nyt_politics", type: "rss", url: "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "nyt_world", type: "rss", url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", poll_interval_sec: 90, is_kalshi_approved: true}
-    # WaPo politics direct feed is intermittent (frequent timeouts);
-    # /world still serves about 8 items reliably. We supplement with a
-    # Google News query for fuller WaPo coverage.
+    # WaPo direct politics feed (was wapo_via_gnews; switched in
+    # Phase 4 Part 2.12 — direct feed is fresher and more reliable).
+    - {name: "wapo_politics", type: "rss", url: "https://feeds.washingtonpost.com/rss/politics", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "wapo_world", type: "rss", url: "https://feeds.washingtonpost.com/rss/world", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "wapo_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:washingtonpost.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "wsj_politics", type: "rss", url: "https://feeds.a.dj.com/rss/RSSPoliticsAndPolicy.xml", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "wsj_world", type: "rss", url: "https://feeds.a.dj.com/rss/RSSWorldNews.xml", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "axios", type: "rss", url: "https://api.axios.com/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "politico_picks", type: "rss", url: "https://www.politico.com/rss/politicopicks.xml", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "politico_wh", type: "rss", url: "https://rss.politico.com/whitehouse.xml", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "semafor_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:semafor.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 120, is_kalshi_approved: true}
-    - {name: "the_information", type: "rss", url: "https://www.theinformation.com/feed", poll_interval_sec: 120, is_kalshi_approved: true}
-    - {name: "cnn_politics", type: "rss", url: "http://rss.cnn.com/rss/cnn_allpolitics.rss", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "cnn_world", type: "rss", url: "http://rss.cnn.com/rss/cnn_world.rss", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "fox_politics", type: "rss", url: "https://moxie.foxnews.com/google-publisher/politics.xml", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "fox_world", type: "rss", url: "https://moxie.foxnews.com/google-publisher/world.xml", poll_interval_sec: 90, is_kalshi_approved: true}
-    # Old http://msnbc.com/feeds/latest returns the homepage HTML; the
-    # current RSS lives at /feed/.
     - {name: "msnbc", type: "rss", url: "https://www.msnbc.com/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "nbc_politics", type: "rss", url: "https://feeds.nbcnews.com/nbcnews/public/politics", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "nbc_world", type: "rss", url: "https://feeds.nbcnews.com/nbcnews/public/world", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "abc_politics", type: "rss", url: "https://abcnews.go.com/abcnews/politicsheadlines", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "abc_international", type: "rss", url: "https://abcnews.go.com/abcnews/internationalheadlines", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "cbs_politics", type: "rss", url: "https://www.cbsnews.com/latest/rss/politics", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "cbs_world", type: "rss", url: "https://www.cbsnews.com/latest/rss/world", poll_interval_sec: 90, is_kalshi_approved: true}
-    # Government and official sources (treated as authoritative for these markets).
-    - {name: "whitehouse_news", type: "rss", url: "https://www.whitehouse.gov/news/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "whitehouse_press", type: "rss", url: "https://www.whitehouse.gov/briefing-room/press-briefings/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "state_press", type: "rss", url: "https://www.state.gov/press-releases/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "state_readouts", type: "rss", url: "https://www.state.gov/secretary-readouts/feed/", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "fox_politics", type: "rss", url: "https://moxie.foxnews.com/google-publisher/politics.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "fox_world", type: "rss", url: "https://moxie.foxnews.com/google-publisher/world.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "abc_politics", type: "rss", url: "https://abcnews.go.com/abcnews/politicsheadlines", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "abc_international", type: "rss", url: "https://abcnews.go.com/abcnews/internationalheadlines", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "politico_wh", type: "rss", url: "https://rss.politico.com/whitehouse.xml", poll_interval_sec: 90, is_kalshi_approved: true}
+    - {name: "the_information", type: "rss", url: "https://www.theinformation.com/feed", poll_interval_sec: 120, is_kalshi_approved: true}
     - {name: "dod_news", type: "rss", url: "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=945&max=10", poll_interval_sec: 90, is_kalshi_approved: true}
-    # Press release distribution — lower weight because they distribute on
-    # behalf of others.
     - {name: "pr_newswire_gov", type: "rss", url: "https://www.prnewswire.com/rss/policy-public-interest-latest-news/policy-public-interest-latest-news-list.rss", poll_interval_sec: 120, is_kalshi_approved: true}
-    - {name: "business_wire", type: "rss", url: "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeGVtRVw==", poll_interval_sec: 120, is_kalshi_approved: true}
-    # Verified social media. Twitter polling requires TWITTER_BEARER_TOKEN
-    # in the environment; without it those sources are silently disabled
-    # (a system_event records the disablement). Truth Social uses an
-    # unauthenticated public scraper.
+
+    # ---- REMOVED in Phase 4 Part 2.12 (kept here as reference) -------
+    # The following sources were removed because they consistently
+    # failed in the deployed environment. Do not re-add without
+    # verifying the underlying issue is fixed.
+    #
+    #   reuters_via_gnews    Google News proxy — only 1/117 articles
+    #                        actually fresh; rest are stale historical
+    #                        content. Reuters direct RSS is paid only.
+    #   ap_via_gnews         Same problem as reuters_via_gnews. AP
+    #                        public RSS retired in 2023.
+    #   wapo_via_gnews       Replaced by direct wapo_politics above.
+    #   semafor_via_gnews    Same Google News stale-content problem.
+    #   wsj_politics         HTTP 403 Forbidden (paywalled syndication).
+    #   wsj_world            Returns 200 but content frozen at
+    #                        2025-01 (15+ months stale).
+    #   cnn_politics         CNN abandoned RSS infrastructure; feed
+    #                        last updated 2024-06.
+    #   cnn_world            Same; last updated 2023-09.
+    #   politico_picks       HTTP 403 in deployed environment
+    #                        (Politico anti-scraper hardening).
+    #   whitehouse_news      Returns stale content; no fresh updates
+    #                        since initial poll.
+    #   whitehouse_press     HTTP 404 — endpoint no longer exists.
+    #   state_press          Returns 200 with 0 entries.
+    #   state_readouts       Returns 200 (or 404) with 0 entries.
+    #   business_wire        Returns 200 with 0 entries; never
+    #                        ingested a single article.
+
+    # ---- Verified social media ---------------------------------------
+    # Twitter polling requires TWITTER_BEARER_TOKEN in the environment;
+    # without it those sources are silently disabled (a system_event
+    # records the disablement). Truth Social uses an unauthenticated
+    # public scraper. Trump posts on Truth Social are dispositive under
+    # Kalshi resolution rules ("verified social media accounts"), so
+    # @realDonaldTrump is the highest-value source for the strategy.
     - {name: "twitter:@WhiteHouse", type: "twitter", handle: "WhiteHouse", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "twitter:@PressSec", type: "twitter", handle: "PressSec", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "twitter:@POTUS", type: "twitter", handle: "POTUS", poll_interval_sec: 90, is_kalshi_approved: true}

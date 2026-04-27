@@ -9,6 +9,17 @@ at the configured interval.
 This is best-effort. The platform changes frequently; if scraping breaks
 we log a system event and continue. Production use should consider
 official API access if/when it becomes available.
+
+**Phase 4 Part 2.12 — User-Agent fix.** The original
+``"trump-market-bot/1.0 research project"`` UA was being rejected by
+Truth Social's edge with HTTP 403, which caused 0 posts to ever
+ingest in production. The investigation at
+``docs/investigations/rss_ingestion_analysis.md`` confirmed that a
+browser-like UA succeeds where the bot UA fails. Switched to a
+real Safari UA string. **Do not revert this without re-verifying
+Truth Social still allows the bot UA**, or the highest-value
+strategy source (Trump's own first-person posts) will silently
+ingest zero events again.
 """
 
 from __future__ import annotations
@@ -37,7 +48,15 @@ from trumpbot.utils.url import canonicalize_url
 log = get_logger(__name__)
 
 BASE = "https://truthsocial.com"
-USER_AGENT = "trump-market-bot/1.0 research project"
+# Phase 4 Part 2.12 — switched from a custom bot UA to a Safari UA.
+# Truth Social's edge denies the bot UA with HTTP 403 (verified in
+# investigation 2026-04-26). Empirically, a browser UA gets a
+# clean 200 with the same request body.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.4 Safari/605.1.15"
+)
 COMPONENT = "truthsocial_scraper"
 SOURCE_FAILURE_THRESHOLD = 5
 

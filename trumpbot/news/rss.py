@@ -40,6 +40,7 @@ from trumpbot.db.repositories import (
     NewsEventRow,
     insert_news_event,
     insert_system_event,
+    upsert_source_status,
 )
 from trumpbot.events.bus import Event, EventBus
 from trumpbot.news.base import NewsMonitor
@@ -195,7 +196,20 @@ class RSSPoller(NewsMonitor):
         response = await self._http.get(source.url, headers=request_headers or None)
         if response.status_code == 304:
             # Nothing new since our last poll. Skip parsing entirely.
+            # PR #33: a 304 still confirms the source is REACHABLE, so
+            # update last_successful_poll. We deliberately leave
+            # newest_feed_item_ts alone — 304 means "feed contents
+            # unchanged since you last asked", so the prior value is
+            # still correct. If a feed is genuinely paused, every
+            # poll will return 304 and newest_feed_item_ts will age
+            # out, which is the rotation_paused signal.
             log.debug("rss_not_modified", source=source.name)
+            upsert_source_status(
+                self._db,
+                source_name=source.name,
+                current_status="active",
+                last_successful_poll=utcnow_iso(),
+            )
             return
         if response.status_code == 429:
             # Honor 429 with extra backoff: pause this source for 5 intervals.
@@ -213,6 +227,18 @@ class RSSPoller(NewsMonitor):
             self._etag[source.name] = et
 
         feed = feedparser.parse(response.content)
+        # PR #33 — compute the newest article timestamp from the parsed
+        # entries (NOT the response headers, which are server-set and
+        # don't reflect content freshness for many feeds). Used by
+        # source_health_loop to detect rotation_paused feeds.
+        newest_feed_item_ts = _newest_entry_iso(feed.entries)
+        upsert_source_status(
+            self._db,
+            source_name=source.name,
+            current_status="active",
+            last_successful_poll=utcnow_iso(),
+            newest_feed_item_ts=newest_feed_item_ts,
+        )
         for entry in feed.entries:
             item = _entry_to_item(entry, source)
             if item is None:
@@ -297,3 +323,35 @@ def _clean_html(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(separator=" ", strip=True)
     return " ".join(text.split())
+
+
+def _newest_entry_iso(entries: list[Any]) -> str | None:
+    """PR #33 helper — pick the newest published/updated timestamp
+    across a parsed feed's entries and return it as an ISO-8601
+    string (UTC). Returns ``None`` when no entry carries a parseable
+    timestamp.
+
+    feedparser exposes ``published`` / ``updated`` strings on each
+    entry. We re-use ``parse_iso_to_str`` (the same parser used at
+    persistence time) so the returned format matches ``raw_published_ts``
+    in news_events for free downstream comparability.
+
+    A garbage timestamp on one entry must not crash the whole poll
+    (real feeds occasionally have malformed dates), so the per-entry
+    parse is wrapped in a swallow-and-skip.
+    """
+    newest: str | None = None
+    for entry in entries:
+        raw = entry.get("published") or entry.get("updated") or None
+        if not raw:
+            continue
+        try:
+            iso = parse_iso_to_str(raw)
+        except (ValueError, TypeError, OverflowError):
+            # Including dateutil's ParserError, which subclasses ValueError.
+            continue
+        if iso is None:
+            continue
+        if newest is None or iso > newest:
+            newest = iso
+    return newest

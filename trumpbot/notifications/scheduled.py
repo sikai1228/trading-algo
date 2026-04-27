@@ -294,18 +294,30 @@ async def source_health_loop(
     interval_seconds: int,
     down_threshold_minutes: int,
     stop_event: asyncio.Event,
+    rotation_paused_threshold_hours: int = 12,
 ) -> None:
     """Walk ``source_status`` every ``interval_seconds``. For each
     source whose ``last_successful_poll`` is older than
     ``down_threshold_minutes``, fire ``alert_warning_source_down``
     (deduped per source per hour). When a previously-down source
     transitions to ``current_status='active'`` (a successful poll
-    happened), fire ``alert_info_source_recovered`` once."""
+    happened), fire ``alert_info_source_recovered`` once.
+
+    PR #33 — additionally checks ``newest_feed_item_ts`` for each
+    source. When the newest article in the parsed feed is older than
+    ``rotation_paused_threshold_hours`` (default 12 h), the source is
+    classified as ``rotation_paused`` and
+    ``alert_warning_source_rotation_paused`` is sent (deduped per
+    source per 24 h). The audit's ``fox_politics`` (7 h stale) and
+    ``dod_news`` (52 h stale) cases motivate this signal.
+    """
     component = "source_health_loop"
     log.info(f"{component}_started", interval_sec=interval_seconds)
     while not stop_event.is_set():
         try:
-            await _check_source_health(db, dispatcher, down_threshold_minutes)
+            await _check_source_health(
+                db, dispatcher, down_threshold_minutes, rotation_paused_threshold_hours
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover -- defensive
@@ -315,14 +327,24 @@ async def source_health_loop(
     log.info(f"{component}_stopped")
 
 
+# PR #33 — dedup window for rotation_paused alerts. Per-source per
+# 24 h: the spec calls for "max 1 alert per source per 24h" so a feed
+# that's been paused for a week doesn't spam Telegram.
+ROTATION_PAUSED_DEDUP_WINDOW_SECONDS: int = 24 * 3600
+
+
 async def _check_source_health(
-    db: Database, dispatcher: AlertDispatcher, threshold_minutes: int
+    db: Database,
+    dispatcher: AlertDispatcher,
+    threshold_minutes: int,
+    rotation_paused_threshold_hours: int = 12,
 ) -> None:
     from zoneinfo import ZoneInfo
 
     _ET = ZoneInfo("America/New_York")
     rows = list_source_status(db)
     threshold = timedelta(minutes=threshold_minutes)
+    rotation_threshold = timedelta(hours=rotation_paused_threshold_hours)
     now = datetime.now(UTC)
     total = len(rows)
     active = sum(1 for r in rows if r.current_status == "active")
@@ -347,7 +369,8 @@ async def _check_source_health(
                 },
             )
             upsert_source_status(db, source_name=r.source_name, current_status="active")
-        elif r.current_status != "down" and gap >= threshold:
+            continue
+        if r.current_status != "down" and gap >= threshold:
             # Just crossed the down threshold.
             await dispatcher.send(
                 template_name="alert_warning_source_down",
@@ -362,6 +385,44 @@ async def _check_source_health(
                 dedup_key=f"src_down:{r.source_name}",
             )
             upsert_source_status(db, source_name=r.source_name, current_status="down")
+            continue
+
+        # PR #33 — rotation_paused check. Only meaningful for sources
+        # that ARE successfully polling (gap < threshold) but whose
+        # feed contents themselves are stale.
+        if r.current_status == "down":
+            continue  # don't double-alert; source_down already covers it
+        newest = r.newest_feed_item_ts
+        if newest is None:
+            continue  # need at least one successful fetch with parseable dates
+        try:
+            newest_dt = datetime.fromisoformat(newest.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        feed_gap = now - newest_dt
+        if feed_gap < rotation_threshold:
+            # Feed is fresh — if we previously marked rotation_paused,
+            # transition back to active. Don't fire a recovery alert
+            # for rotation_paused (silent recovery is fine; the active
+            # state will be reflected in /status).
+            if r.current_status == "rotation_paused":
+                upsert_source_status(db, source_name=r.source_name, current_status="active")
+            continue
+        # Feed has been stale > rotation_threshold. Fire the alert
+        # (deduped per source per 24 h) and mark rotation_paused.
+        await dispatcher.send(
+            template_name="alert_warning_source_rotation_paused",
+            data={
+                "source_name": r.source_name,
+                "newest_item_et": newest_dt.astimezone(_ET).strftime("%Y-%m-%d %H:%M ET"),
+                "duration_ago": _humanize_duration(feed_gap),
+                "active_count": active,
+                "total_count": total,
+            },
+            dedup_key=f"src_rotation_paused:{r.source_name}",
+            window_seconds_override=ROTATION_PAUSED_DEDUP_WINDOW_SECONDS,
+        )
+        upsert_source_status(db, source_name=r.source_name, current_status="rotation_paused")
 
 
 # ---------------------------------------------------------------------------

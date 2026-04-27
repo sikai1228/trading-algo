@@ -285,3 +285,128 @@ async def test_global_user_agent_used_when_override_unset(tmp_db: Database) -> N
 
     sent_ua = respx.calls[0].request.headers.get("user-agent")
     assert sent_ua == GLOBAL_UA
+
+
+# ---------------------------------------------------------------------------
+# PR #33 — RSS poller writes newest_feed_item_ts to source_status
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_successful_poll_writes_newest_feed_item_ts(tmp_db: Database) -> None:
+    """After a successful fetch, the poller upserts source_status with
+    last_successful_poll AND newest_feed_item_ts derived from the
+    parsed feed entries."""
+    from trumpbot.db.repositories import get_source_status
+
+    bus = EventBus()
+    source = NewsSourceConfig(
+        name="reuters",
+        type="rss",
+        url="https://example.com/feed.xml",
+        poll_interval_sec=60,
+        is_kalshi_approved=True,
+    )
+    respx.get("https://example.com/feed.xml").mock(
+        return_value=httpx.Response(
+            200, text=SAMPLE_RSS, headers={"Content-Type": "application/rss+xml"}
+        )
+    )
+
+    poller = RSSPoller(sources=[source], db=tmp_db, event_bus=bus)
+    await poller._poll_source(source)
+
+    row = get_source_status(tmp_db, "reuters")
+    assert row is not None
+    assert row.current_status == "active"
+    assert row.last_successful_poll is not None
+    # SAMPLE_RSS's newest item is "Mon, 25 Apr 2026 12:01:00 GMT"
+    assert row.newest_feed_item_ts is not None
+    assert row.newest_feed_item_ts.startswith("2026-04-25T12:01")
+
+
+@respx.mock
+async def test_304_response_advances_poll_ts_but_not_newest_item(tmp_db: Database) -> None:
+    """A 304 Not Modified means the feed contents haven't changed.
+    last_successful_poll advances (the source is reachable) but
+    newest_feed_item_ts stays put — needed for rotation_paused
+    detection to age out correctly when the feed itself is paused."""
+    from trumpbot.db.repositories import get_source_status
+
+    bus = EventBus()
+    source = NewsSourceConfig(
+        name="reuters",
+        type="rss",
+        url="https://example.com/feed.xml",
+        poll_interval_sec=60,
+        is_kalshi_approved=True,
+    )
+    route = respx.get("https://example.com/feed.xml")
+    route.side_effect = [
+        httpx.Response(
+            200,
+            text=SAMPLE_RSS,
+            headers={
+                "Content-Type": "application/rss+xml",
+                "Last-Modified": "Sun, 26 Apr 2026 12:00:00 GMT",
+                "ETag": '"abc123"',
+            },
+        ),
+        httpx.Response(304),
+    ]
+
+    poller = RSSPoller(sources=[source], db=tmp_db, event_bus=bus)
+    await poller._poll_source(source)
+    first = get_source_status(tmp_db, "reuters")
+    assert first is not None
+    first_newest = first.newest_feed_item_ts
+    first_poll = first.last_successful_poll
+    assert first_newest is not None
+    assert first_poll is not None
+
+    await poller._poll_source(source)
+    second = get_source_status(tmp_db, "reuters")
+    assert second is not None
+    # last_successful_poll advanced (304 is a successful poll).
+    assert second.last_successful_poll is not None
+    assert second.last_successful_poll >= first_poll
+    # newest_feed_item_ts unchanged (304 means feed contents didn't change).
+    assert second.newest_feed_item_ts == first_newest
+
+
+def test_newest_entry_iso_handles_empty_and_undated() -> None:
+    """The helper returns None when no entry has a parseable date."""
+    from trumpbot.news.rss import _newest_entry_iso
+
+    class _Entry:
+        def __init__(self, **kw: object) -> None:
+            self._d = kw
+
+        def get(self, k: str, default: object = None) -> object:
+            return self._d.get(k, default)
+
+    assert _newest_entry_iso([]) is None
+    assert _newest_entry_iso([_Entry()]) is None
+    assert _newest_entry_iso([_Entry(published="not-a-date")]) is None
+
+
+def test_newest_entry_iso_picks_max() -> None:
+    """The helper returns the lexicographically-greatest ISO string
+    (which is also the latest moment in time for ISO-8601 UTC)."""
+    from trumpbot.news.rss import _newest_entry_iso
+
+    class _Entry:
+        def __init__(self, **kw: object) -> None:
+            self._d = kw
+
+        def get(self, k: str, default: object = None) -> object:
+            return self._d.get(k, default)
+
+    entries = [
+        _Entry(published="Mon, 25 Apr 2026 10:00:00 GMT"),
+        _Entry(published="Mon, 26 Apr 2026 14:30:00 GMT"),  # newest
+        _Entry(updated="Mon, 25 Apr 2026 18:00:00 GMT"),
+    ]
+    result = _newest_entry_iso(entries)
+    assert result is not None
+    assert result.startswith("2026-04-26T14:30")

@@ -1151,6 +1151,12 @@ class SourceStatusRow:
     last_alert_sent: str | None
     consecutive_failures: int
     updated_at: str
+    # PR #33 — newest article timestamp from the most recently parsed
+    # feed. NULL until the first successful fetch records one. Used by
+    # source_health_loop to detect feeds that are technically reachable
+    # (no source_failure events) but whose publisher has stopped
+    # emitting new items.
+    newest_feed_item_ts: str | None = None
 
 
 def upsert_source_status(
@@ -1161,20 +1167,29 @@ def upsert_source_status(
     last_successful_poll: str | None = None,
     last_alert_sent: str | None = None,
     consecutive_failures: int = 0,
+    newest_feed_item_ts: str | None = None,
 ) -> None:
     """Upsert one row in ``source_status``. ``COALESCE`` on the
     optional fields preserves prior values if the caller passes
     ``None`` (i.e. a "just record a successful poll" call doesn't
-    clobber ``last_alert_sent``)."""
+    clobber ``last_alert_sent``).
+
+    PR #33 — ``newest_feed_item_ts`` follows the same COALESCE rule:
+    pass it explicitly to update, leave as ``None`` to preserve the
+    prior value (e.g. a 304 Not Modified response advances
+    ``last_successful_poll`` but doesn't change the newest-item
+    timestamp because the feed contents are unchanged).
+    """
     with db.transaction() as conn:
         conn.execute(
             """
             INSERT INTO source_status (
                 source_name, current_status,
                 last_successful_poll, last_alert_sent,
-                consecutive_failures, updated_at
+                consecutive_failures, updated_at,
+                newest_feed_item_ts
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_name) DO UPDATE SET
                 current_status = excluded.current_status,
                 last_successful_poll = COALESCE(
@@ -1184,7 +1199,10 @@ def upsert_source_status(
                     excluded.last_alert_sent, last_alert_sent
                 ),
                 consecutive_failures = excluded.consecutive_failures,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                newest_feed_item_ts = COALESCE(
+                    excluded.newest_feed_item_ts, newest_feed_item_ts
+                )
             """,
             (
                 source_name,
@@ -1193,6 +1211,7 @@ def upsert_source_status(
                 last_alert_sent,
                 consecutive_failures,
                 utcnow_iso(),
+                newest_feed_item_ts,
             ),
         )
 
@@ -1208,6 +1227,7 @@ def list_source_status(db: Database) -> list[SourceStatusRow]:
             last_alert_sent=r["last_alert_sent"],
             consecutive_failures=r["consecutive_failures"],
             updated_at=r["updated_at"],
+            newest_feed_item_ts=r["newest_feed_item_ts"],
         )
         for r in rows
     ]
@@ -1227,6 +1247,7 @@ def get_source_status(db: Database, source_name: str) -> SourceStatusRow | None:
         last_alert_sent=row["last_alert_sent"],
         consecutive_failures=row["consecutive_failures"],
         updated_at=row["updated_at"],
+        newest_feed_item_ts=row["newest_feed_item_ts"],
     )
 
 

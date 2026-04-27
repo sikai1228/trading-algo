@@ -488,6 +488,27 @@ _ALERT_WARNING_SOURCE_DOWN = MessageTemplate(
     ),
 )
 
+# PR #33 — fired when a source returns 200 / 304 normally but the
+# parsed feed's newest item is older than the rotation_paused
+# threshold (default 12 h). Distinct from `alert_warning_source_down`
+# (which fires on absent successful polls); rotation_paused fires on
+# present-but-stale feed contents. Deduped per source per 24 h via
+# the dispatcher's window_seconds_override.
+_ALERT_WARNING_SOURCE_ROTATION_PAUSED = MessageTemplate(
+    category="alert_warning",
+    audible=False,
+    # fields: source_name, newest_item_et, duration_ago,
+    #         active_count, total_count
+    format=(
+        "⚠️ Source rotation paused: {source_name}\n\n"
+        "Last article in feed: {newest_item_et} ({duration_ago} ago)\n"
+        "Feed is returning 200 OK but no new content.\n\n"
+        "Bot continuing with {active_count}/{total_count} active sources.\n"
+        "This source may have been deprioritized by the publisher;\n"
+        "monitor for resumption."
+    ),
+)
+
 _ALERT_WARNING_DB_SLOW = MessageTemplate(
     category="alert_warning",
     audible=False,
@@ -1124,6 +1145,7 @@ TEMPLATE_CATALOG: dict[str, MessageTemplate] = {
     "alert_critical_contract_rules_changed": _ALERT_CRITICAL_CONTRACT_RULES_CHANGED,
     # Warning alerts (silent)
     "alert_warning_source_down": _ALERT_WARNING_SOURCE_DOWN,
+    "alert_warning_source_rotation_paused": _ALERT_WARNING_SOURCE_ROTATION_PAUSED,
     "alert_warning_db_slow": _ALERT_WARNING_DB_SLOW,
     "alert_warning_risk_rejection": _ALERT_WARNING_RISK_REJECTION,
     "alert_warning_event_resolution_rules_missing": _ALERT_WARNING_EVENT_RESOLUTION_RULES_MISSING,

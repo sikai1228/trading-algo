@@ -66,3 +66,4 @@ secrets/
 # Logs
 *.log
 logs/
+.claude/

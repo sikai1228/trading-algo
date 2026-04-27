@@ -68,7 +68,12 @@ news:
     - {name: "abc_politics", type: "rss", url: "https://abcnews.go.com/abcnews/politicsheadlines", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "abc_international", type: "rss", url: "https://abcnews.go.com/abcnews/internationalheadlines", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "politico_wh", type: "rss", url: "https://rss.politico.com/whitehouse.xml", poll_interval_sec: 90, is_kalshi_approved: true}
-    - {name: "the_information", type: "rss", url: "https://www.theinformation.com/feed", poll_interval_sec: 120, is_kalshi_approved: true}
+    # the_information serves 403 to the Safari UA the rest of the
+    # RSS pollers use (PR #30 audit Section 4a verified Chrome works
+    # while Safari/empty UA both 403). Per-source override unblocks
+    # this one source without flipping the global default and
+    # re-breaking Truth Social / Politico.
+    - {name: "the_information", type: "rss", url: "https://www.theinformation.com/feed", poll_interval_sec: 120, is_kalshi_approved: true, user_agent_override: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"}
     - {name: "dod_news", type: "rss", url: "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=945&max=10", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "pr_newswire_gov", type: "rss", url: "https://www.prnewswire.com/rss/policy-public-interest-latest-news/policy-public-interest-latest-news-list.rss", poll_interval_sec: 120, is_kalshi_approved: true}
 

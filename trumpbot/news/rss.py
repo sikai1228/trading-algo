@@ -182,6 +182,16 @@ class RSSPoller(NewsMonitor):
         if (et := self._etag.get(source.name)) is not None:
             request_headers["If-None-Match"] = et
 
+        # PR #30 follow-up — per-source UA override. The httpx client
+        # is shared across all RSS sources and carries the global
+        # Safari UA in its default headers; setting User-Agent on
+        # this request overrides the client default for this one
+        # call. Used for the_information, which serves 403 to the
+        # Safari UA but 200 to a Chrome UA. See
+        # docs/investigations/source_status_audit.md Section 4a.
+        if source.user_agent_override is not None:
+            request_headers["User-Agent"] = source.user_agent_override
+
         response = await self._http.get(source.url, headers=request_headers or None)
         if response.status_code == 304:
             # Nothing new since our last poll. Skip parsing entirely.

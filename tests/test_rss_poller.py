@@ -195,3 +195,93 @@ async def test_304_response_skips_parsing(tmp_db: Database) -> None:
     rows_after_second = list(tmp_db.connect().execute("SELECT id FROM news_events"))
     # No new rows on 304 — the existing two are unchanged.
     assert len(rows_after_second) == 2
+
+
+# ---------------------------------------------------------------------------
+# PR #30 follow-up — per-source User-Agent override
+# ---------------------------------------------------------------------------
+
+
+def test_news_source_config_accepts_user_agent_override() -> None:
+    """Pydantic model validates with the override set."""
+    s = NewsSourceConfig(
+        name="the_information",
+        type="rss",
+        url="https://www.theinformation.com/feed",
+        poll_interval_sec=120,
+        is_kalshi_approved=True,
+        user_agent_override="Mozilla/5.0 ... Chrome/121.0.0.0 Safari/537.36",
+    )
+    assert s.user_agent_override == "Mozilla/5.0 ... Chrome/121.0.0.0 Safari/537.36"
+
+
+def test_news_source_config_default_user_agent_override_is_none() -> None:
+    """Existing source entries without the field default to None,
+    so the global UA continues to apply for them."""
+    s = NewsSourceConfig(
+        name="bloomberg",
+        type="rss",
+        url="https://feeds.bloomberg.com/politics/news.rss",
+        poll_interval_sec=90,
+        is_kalshi_approved=True,
+    )
+    assert s.user_agent_override is None
+
+
+@respx.mock
+async def test_user_agent_override_sent_when_set(tmp_db: Database) -> None:
+    """When a source has user_agent_override set, the per-request
+    User-Agent header takes precedence over the client-default
+    Safari UA. Pins the the_information fix."""
+    bus = EventBus()
+    chrome_ua = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    )
+    source = NewsSourceConfig(
+        name="the_information",
+        type="rss",
+        url="https://example.com/feed.xml",
+        poll_interval_sec=120,
+        is_kalshi_approved=True,
+        user_agent_override=chrome_ua,
+    )
+    respx.get("https://example.com/feed.xml").mock(
+        return_value=httpx.Response(
+            200, text=SAMPLE_RSS, headers={"Content-Type": "application/rss+xml"}
+        )
+    )
+
+    poller = RSSPoller(sources=[source], db=tmp_db, event_bus=bus)
+    await poller._poll_source(source)
+
+    sent_ua = respx.calls[0].request.headers.get("user-agent")
+    assert sent_ua == chrome_ua
+
+
+@respx.mock
+async def test_global_user_agent_used_when_override_unset(tmp_db: Database) -> None:
+    """When user_agent_override is None (the common case), the
+    client's default Safari UA is sent. Pins the no-regression
+    side of the fix."""
+    from trumpbot.news.rss import USER_AGENT as GLOBAL_UA
+
+    bus = EventBus()
+    source = NewsSourceConfig(
+        name="bloomberg",
+        type="rss",
+        url="https://example.com/feed.xml",
+        poll_interval_sec=90,
+        is_kalshi_approved=True,
+    )
+    respx.get("https://example.com/feed.xml").mock(
+        return_value=httpx.Response(
+            200, text=SAMPLE_RSS, headers={"Content-Type": "application/rss+xml"}
+        )
+    )
+
+    poller = RSSPoller(sources=[source], db=tmp_db, event_bus=bus)
+    await poller._poll_source(source)
+
+    sent_ua = respx.calls[0].request.headers.get("user-agent")
+    assert sent_ua == GLOBAL_UA

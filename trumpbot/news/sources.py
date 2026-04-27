@@ -20,6 +20,17 @@ class NewsSourceConfig(BaseModel):
 
     All Kalshi-approved sources are treated equally: a single one
     confirming is enough.
+
+    **Source-status audit follow-up (PR #30, 2026-04-26):**
+    ``user_agent_override`` is an optional per-source User-Agent
+    string that overrides the global UA for one specific source.
+    The PR #29 Safari UA swap unblocked Truth Social and Politico
+    but regressed ``the_information`` (which serves a 403 to Safari
+    UAs but accepts Chrome / feedparser / the old bot UA). Rather
+    than flipping the global default again and re-breaking other
+    sources, set the override on the one source that needs it. The
+    audit at ``docs/investigations/source_status_audit.md`` Section
+    4a documents the per-UA test matrix.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -30,6 +41,7 @@ class NewsSourceConfig(BaseModel):
     handle: str | None = None
     poll_interval_sec: int = Field(default=90, ge=10)
     is_kalshi_approved: bool = False
+    user_agent_override: str | None = None
 
 
 class FetchedItem(BaseModel):

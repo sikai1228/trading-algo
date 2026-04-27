@@ -88,6 +88,13 @@ def _seed_market(db: Database, ticker: str = "KXTRUMPMEET-26APR-VPUT") -> str:
 
 
 def _seed_event(db: Database, headline: str, body: str) -> int:
+    # Phase 4 Part 2.12 — use a CURRENT timestamp so the
+    # freshness-guard in MatcherWorker._classify_and_patch (48h
+    # cutoff) doesn't skip the LLM call. Using a wall-clock now()
+    # keeps the test stable regardless of when it runs.
+    from datetime import UTC, datetime
+
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     return (
         insert_news_event(
             db,
@@ -99,8 +106,8 @@ def _seed_event(db: Database, headline: str, body: str) -> int:
                 url_canonical=f"https://example.com/{abs(hash(headline))}",
                 body_excerpt=body,
                 author=None,
-                raw_published_ts="2026-04-25T12:00:00Z",
-                detected_ts="2026-04-25T12:00:01Z",
+                raw_published_ts=now_iso,
+                detected_ts=now_iso,
                 has_photo=False,
                 has_video=False,
                 raw_data=None,

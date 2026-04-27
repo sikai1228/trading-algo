@@ -9,6 +9,19 @@ Body extraction: the poller pulls the RSS-provided summary; if a body
 is unavailable or empty, the article still lands in the database with
 just the headline. We do not fetch the article HTML in Phase 1 — that
 is a Phase 2 enhancement.
+
+**Phase 4 Part 2.12** added two changes:
+
+- User-Agent switched from the custom bot string to a Safari UA.
+  The investigation found several sources (`politico_picks`,
+  `truthsocial`) returning HTTP 403 to the bot UA but 200 to a
+  real-browser UA. Same request body, only the UA differs. Don't
+  revert without re-verifying.
+- ``If-Modified-Since`` / ``If-None-Match`` conditional headers are
+  sent on every poll after the first. On HTTP 304 the poller skips
+  parsing entirely. Sources that don't honor the headers just
+  return 200 with the full body (no harm done). Cuts real
+  bandwidth ~70-90 % on well-behaved feeds.
 """
 
 from __future__ import annotations
@@ -37,7 +50,15 @@ from trumpbot.utils.url import canonicalize_url
 
 log = get_logger(__name__)
 
-USER_AGENT = "trump-market-bot/1.0 research project"
+# Phase 4 Part 2.12 — switched from "trump-market-bot/1.0 research
+# project" to a real Safari UA. Several sources (politico_picks,
+# truthsocial, others) reject the bot UA with HTTP 403; the browser
+# UA gets a clean 200. Don't revert without re-verifying.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.4 Safari/605.1.15"
+)
 BODY_EXCERPT_CHARS = 1500
 RSS_FETCH_TIMEOUT_SEC = 30
 SOURCE_FAILURE_THRESHOLD = 5
@@ -71,6 +92,15 @@ class RSSPoller(NewsMonitor):
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task[None]] = []
         self._consecutive_failures: dict[str, int] = {}
+        # Phase 4 Part 2.12 — per-source conditional-request state.
+        # The poller stashes the ``Last-Modified`` and ``ETag`` headers
+        # the source returned on its last 200 response and sends them
+        # back as ``If-Modified-Since`` / ``If-None-Match`` on the
+        # next poll. On 304 (Not Modified) the poller skips parsing.
+        # Resets on daemon restart; first poll after restart sends
+        # no conditional header and does a full feed fetch.
+        self._last_modified: dict[str, str] = {}
+        self._etag: dict[str, str] = {}
 
     async def start(self) -> None:
         for source in self._sources:
@@ -141,13 +171,36 @@ class RSSPoller(NewsMonitor):
         if not source.url:
             raise ValueError(f"RSS source {source.name!r} has no url")
         log.debug("rss_poll", source=source.name)
-        response = await self._http.get(source.url)
+
+        # Phase 4 Part 2.12 — send conditional-request headers when
+        # we have prior ones from this source. RSS servers that
+        # honor these return 304 with empty body when nothing has
+        # changed.
+        request_headers: dict[str, str] = {}
+        if (lm := self._last_modified.get(source.name)) is not None:
+            request_headers["If-Modified-Since"] = lm
+        if (et := self._etag.get(source.name)) is not None:
+            request_headers["If-None-Match"] = et
+
+        response = await self._http.get(source.url, headers=request_headers or None)
+        if response.status_code == 304:
+            # Nothing new since our last poll. Skip parsing entirely.
+            log.debug("rss_not_modified", source=source.name)
+            return
         if response.status_code == 429:
             # Honor 429 with extra backoff: pause this source for 5 intervals.
             log.warning("rss_rate_limited", source=source.name)
             await asyncio.sleep(source.poll_interval_sec * 5)
             return
         response.raise_for_status()
+
+        # Stash the validators for the next poll, if the server gave
+        # us any. Servers that don't set these headers just mean we
+        # won't get 304s — no harm.
+        if (lm := response.headers.get("last-modified")) is not None:
+            self._last_modified[source.name] = lm
+        if (et := response.headers.get("etag")) is not None:
+            self._etag[source.name] = et
 
         feed = feedparser.parse(response.content)
         for entry in feed.entries:

@@ -1688,6 +1688,179 @@ explicit acknowledgement.
 
 ---
 
+## Phase 4 Part 2.12 — RSS ingestion fixes + verification
+
+Resolved findings from
+`docs/investigations/rss_ingestion_analysis.md`. Five concrete
+fixes plus three verification documents.
+
+### Active news sources (post-cleanup)
+
+The deployed source list is now 26 entries (down from 38). The
+investigation found 12 sources actively harmful or non-functional;
+this PR removed them.
+
+**Direct RSS feeds (verified working, fresh content within ~2 h):**
+`bloomberg`, `nyt_politics`, `nyt_world`, `wapo_politics` (renamed
+from `wapo_via_gnews` and switched to the direct WaPo feed),
+`wapo_world`, `axios`, `msnbc`, `nbc_politics`, `nbc_world`,
+`cbs_politics`, `cbs_world`, `fox_politics`, `fox_world`,
+`abc_politics`, `abc_international`, `politico_wh`,
+`the_information`, `dod_news`, `pr_newswire_gov`.
+
+**Verified social media:**
+`truth_social:@realDonaldTrump` (newly fixed by the User-Agent
+swap; see below). Six `twitter:*` handles remain configured but
+are silently disabled until `TWITTER_BEARER_TOKEN` is set.
+
+**Removed (with the failure mode that disqualified each):**
+
+- `reuters_via_gnews`, `ap_via_gnews`, `wapo_via_gnews`,
+  `semafor_via_gnews` — Google News proxies surfaced ~99 % stale
+  content (only 1 of 117 ingested Reuters articles in 24 h was
+  actually fresh; the rest were 1+ months old).
+- `wsj_politics` — HTTP 403 (paywalled syndication).
+- `wsj_world` — HTTP 200 but feed content frozen at 2025-01.
+- `cnn_politics`, `cnn_world` — CNN abandoned RSS infrastructure;
+  feeds last updated 2024-06 / 2023-09.
+- `politico_picks` — HTTP 403 in the deployed environment.
+- `whitehouse_press` — HTTP 404, endpoint no longer exists.
+- `whitehouse_news` — Stalled feed, no fresh updates.
+- `state_press`, `state_readouts`, `business_wire` — return HTTP
+  200 with 0 entries; never ingested a single article.
+
+Reuters and AP have **no working free direct RSS** (Reuters
+requires paid Refinitiv subscription; AP retired public RSS in
+2023). The bot does not currently ingest these sources. Their
+content is referenced indirectly when other sources cite Reuters /
+AP reporting. Future option: paid news API integration if 30+ days
+of operational data show consistent Reuters-exclusive missed
+signals.
+
+### User-Agent swap (high-value fix)
+
+The investigation found the previous bot User-Agent
+(`"trump-market-bot/1.0 research project"`) was being rejected by
+Truth Social and Politico with HTTP 403, while a real-Safari UA
+returned 200 with the same request body. **Truth Social ingested
+zero events in its entire deployment lifetime** because of this.
+
+Both `trumpbot/news/rss.py` and `trumpbot/news/truthsocial.py`
+switched to:
+
+```python
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.4 Safari/605.1.15"
+)
+```
+
+Both modules' docstrings warn against reverting without
+re-verifying.
+
+### `If-Modified-Since` / `If-None-Match` conditional requests
+
+`RSSPoller` now stashes the `Last-Modified` and `ETag` response
+headers from each source's last 200, and sends them back as
+`If-Modified-Since` / `If-None-Match` on the next poll. On HTTP
+304 the poller skips parsing entirely. State is in-memory; first
+poll after a daemon restart sends no conditional header (fine,
+gets a normal 200, dedup handles repeats). Cuts real bandwidth
+~70-90 % on well-behaved feeds.
+
+Pinned by:
+- `tests/test_rss_poller.py::test_conditional_request_sent_on_second_poll`
+- `tests/test_rss_poller.py::test_304_response_skips_parsing`
+
+### Freshness guard before LLM cascade
+
+Added `STALE_ARTICLE_HOURS = 48` and `_article_is_stale()` helper
+in `trumpbot/daemon.py`. `MatcherWorker._classify_and_patch` now
+checks `raw_published_ts` at the top of each loop iteration; if
+the article is older than 48 h or its timestamp is missing /
+unparseable, the LLM call is skipped and the match row is patched
+with `classifier_type='keyword_only'` + `match_reason='skipped_stale'`.
+
+48 h is intentionally above the engine's 24 h article-window check
+(rule 4 of `evaluate_news_match`) so an article that just barely
+squeaks inside the engine's window still reaches Stage 2.
+
+This is defense-in-depth — the source-list cleanup already removes
+~99 % of stale-article volume by removing the Google News proxies.
+The guard prevents future regression.
+
+Pinned by `tests/test_rss_freshness_guard.py` (10 tests covering
+the constant, the boundary, None / empty / unparseable inputs,
+Z-suffix and TZ-offset ISO formats).
+
+### Verification documents (read-only)
+
+- `docs/investigations/dedup_verification.md` — confirms zero
+  duplicates across 7 days of `news_events`. The deduplication
+  via `URL canonicalization` + `UNIQUE(url_canonical)` index is
+  working correctly. The 116 stale Reuters articles in 24 h are
+  116 unique articles, not duplicates.
+- `docs/investigations/pipeline_order_verification.md` — traces
+  the news pipeline. Pre-fix, no freshness check existed before
+  the LLM call. Measurable cost impact today: $0 (only because
+  the cascade had just shipped and the daemon kept restarting).
+  Post-fix: freshness guard skips stale articles before the LLM
+  call.
+- `docs/investigations/feed_capacity_verification.md` —
+  measured rotation rates for every working source. The
+  fastest-rotating feed (`bloomberg`) keeps articles in window for
+  19.6 hours; at 90 s polls that's 800x margin. **No source
+  rotates faster than the poll cadence.** Reducing the poll
+  interval would not catch articles the current cadence misses.
+
+### Operator workflow
+
+After redeploy, expect:
+
+- 26 source entries instead of 38; 12 stale-content / broken
+  sources gone from the source list.
+- Truth Social begins producing events for the first time
+  (UA fix; check `news_events` for `source LIKE 'truth_social%'`
+  rows).
+- `politico_picks` may also recover (was getting 403 with bot UA;
+  not in the active list anymore but if re-added it would work).
+- Daemon log shows fewer `source_failure` system_events (the
+  WSJ / CNN / WhiteHouse-press / business_wire sources are no
+  longer being polled).
+- Bandwidth meaningfully lower on bandwidth-aware hosts because
+  of the conditional-request headers.
+
+### Migrated config
+
+The deployed `~/.config/trumpbot/config.yaml` was updated
+in-place to match. A backup at `config.yaml.pre-2.12.bak` lives
+beside it.
+
+### File map for Phase 4 Part 2.12
+
+- `config/config.example.yaml` — source list rebuilt; comments
+  document each removed source's failure mode.
+- `trumpbot/news/rss.py` — UA constant changed; conditional-request
+  headers added to `_poll_source`; `_last_modified` and `_etag`
+  in-memory dicts added to `RSSPoller`.
+- `trumpbot/news/truthsocial.py` — UA constant changed; docstring
+  updated with the why.
+- `trumpbot/daemon.py` — `STALE_ARTICLE_HOURS` constant +
+  `_article_is_stale` helper; freshness guard in
+  `MatcherWorker._classify_and_patch`.
+- `tests/test_rss_poller.py` — two new conditional-request tests.
+- `tests/test_rss_freshness_guard.py` (new) — 10 tests pinning
+  the freshness-guard helper.
+- `tests/test_phase_1_5_pipeline_e2e.py` — fixture timestamps
+  switched to `now_iso` so the freshness guard doesn't skip the
+  LLM in synthetic e2e tests.
+- `docs/investigations/dedup_verification.md` (new)
+- `docs/investigations/pipeline_order_verification.md` (new)
+- `docs/investigations/feed_capacity_verification.md` (new)
+
+---
+
 ## Phase 4 deployment readiness
 
 Phase 4 Part 1 + Part 2.1 are verified end-to-end. The combined

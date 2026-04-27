@@ -38,7 +38,7 @@ news:
     # the Kalshi-approved outlet (the <source> field in the RSS confirms),
     # so is_kalshi_approved stays true. URLs go through a Google
     # redirector; URL canonicalization treats each as unique. See
-    # VERIFICATION_PHASE_1_5.md for the URL-by-URL audit.
+    # docs/VERIFICATION_PHASE_1_5.md for the URL-by-URL audit.
     - {name: "reuters_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:reuters.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "ap_via_gnews", type: "rss", url: "https://news.google.com/rss/search?q=%22Donald+Trump%22+source:apnews.com&hl=en-US&gl=US&ceid=US:en", poll_interval_sec: 90, is_kalshi_approved: true}
     - {name: "bloomberg", type: "rss", url: "https://feeds.bloomberg.com/politics/news.rss", poll_interval_sec: 90, is_kalshi_approved: true}

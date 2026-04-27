@@ -1,4 +1,4 @@
-"""Pre-live fixes regression tests — OPEN_ISSUES.md items #1, #2, #11.
+"""Pre-live fixes regression tests — docs/OPEN_ISSUES.md items #1, #2, #11.
 
 Phase 4 Part 2.2.
 

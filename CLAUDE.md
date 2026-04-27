@@ -771,9 +771,9 @@ tax_tracking:
 
 ---
 
-## Phase 4 Part 2.2 — pre-live fixes (#1, #2, #11 from OPEN_ISSUES.md)
+## Phase 4 Part 2.2 — pre-live fixes (#1, #2, #11 from docs/OPEN_ISSUES.md)
 
-Three open issues documented in `OPEN_ISSUES.md` were resolved before
+Three open issues documented in `docs/OPEN_ISSUES.md` were resolved before
 flipping to live mode:
 
 ### Fix #1 — Live bankroll piped through BankrollState
@@ -1691,7 +1691,7 @@ explicit acknowledgement.
 ## Phase 4 deployment readiness
 
 Phase 4 Part 1 + Part 2.1 are verified end-to-end. The combined
-verification (`VERIFICATION_PHASE_4_FULL.md`) ran 47 checks across
+verification (`docs/VERIFICATION_PHASE_4_FULL.md`) ran 47 checks across
 the 11 spec sections; result was 47/47 PASS with zero critical
 bugs. Six items are deferred to Phase 4 Part 2.2 with documented
 reasoning (none block live trading).
@@ -1851,6 +1851,15 @@ Outputs a summary to stdout and a per-trade CSV to
    executor is the only execution path until Phase 3.
 10. **Migrations are append-only**. Never edit a migration that has been
     applied to a real DB; add a new file with the next number.
+11. **All new markdown files go in `docs/`.** Only `CLAUDE.md` and
+    `README.md` live at the repo root; everything else
+    (`OPEN_ISSUES.md`, verification reports, bugfix notes,
+    investigation reports, deferred-cleanup logs) belongs under
+    `docs/`. Investigation reports go under
+    `docs/investigations/`. The historical files were moved into
+    `docs/` after they originally landed at root, so any older
+    references in the codebase use bare filenames; treat that as a
+    documentation-debt smell to fix when you touch them.
 
 ---
 

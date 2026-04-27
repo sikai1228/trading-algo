@@ -1169,6 +1169,7 @@ class MatcherWorker:
                 body=evt["body_excerpt"],
                 markets=contexts,
                 article_published_ts=evt["raw_published_ts"],
+                source=evt["source"],
             )
             event_passed: list[Any] = []  # list of MatchResult that passed pre-filter
             event_failed: list[Any] = []

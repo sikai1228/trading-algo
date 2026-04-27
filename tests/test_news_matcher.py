@@ -23,9 +23,12 @@ import pytest
 from trumpbot.discovery.subjects import DEFAULT_SUBJECT_ALIASES, SubjectExtractor
 from trumpbot.news.matcher import (
     PASSED_REASON,
+    TRUMP_AUTHOR_KEYWORD,
+    TRUMP_AUTHOR_SOURCES,
     MarketContext,
     MatchResult,
     NewsMatcher,
+    _is_trump_author,
 )
 
 
@@ -275,3 +278,154 @@ class TestArticleTimestampIgnored:
             article_published_ts="2025-12-01T00:00:00Z",  # before window
         )
         assert r.match_reason == PASSED_REASON
+
+
+# ---------------------------------------------------------------------------
+# PR #32 — Trump-as-author rule for Truth Social posts
+#
+# Trump's Truth Social posts are first-person. They typically don't
+# refer to "Trump" by name (he's writing them), so requiring the
+# literal Trump alias in the body would silently reject every
+# meeting/call announcement he posts. The matcher counts the source
+# string as the implicit Trump-mention when it matches one of
+# TRUMP_AUTHOR_SOURCES.
+# ---------------------------------------------------------------------------
+
+
+class TestTrumpAsAuthor:
+    """Pin the Trump-as-author rule for Truth Social posts."""
+
+    def test_truth_social_author_substitutes_for_body_trump(self, matcher: NewsMatcher) -> None:
+        """The audit's canonical synthetic test: Trump posts about a
+        phone call with Putin. Body has subject + verb but no "Trump"."""
+        ctx = MarketContext(ticker="T", subject="putin")
+        body = (
+            "Just got off the phone with my friend Vladimir Putin. "
+            "We had a great conversation about ending the war in Ukraine. "
+            "Many things discussed!"
+        )
+        [r] = matcher.match(
+            headline="(no text)",
+            body=body,
+            markets=[ctx],
+            source="truth_social:@realDonaldTrump",
+        )
+        assert r.match_reason == PASSED_REASON
+        # The author-implicit keyword is recorded for audit.
+        assert TRUMP_AUTHOR_KEYWORD in r.matched_keywords
+        assert "putin" in r.matched_keywords or "vladimir putin" in r.matched_keywords
+        assert "phone" in r.matched_keywords
+
+    def test_truth_social_without_subject_still_fails(self, matcher: NewsMatcher) -> None:
+        """Author-implicit doesn't waive the subject requirement.
+        A Truth Social rant about taxes still fails Stage 1."""
+        ctx = MarketContext(ticker="T", subject="putin")
+        body = "Today I will issue an Executive Order to lower taxes for all Americans."
+        [r] = matcher.match(
+            headline="(no text)",
+            body=body,
+            markets=[ctx],
+            source="truth_social:@realDonaldTrump",
+        )
+        assert r.match_reason.startswith("failed_pre_filter:")
+        assert "no_subject" in r.match_reason
+
+    def test_truth_social_without_interaction_still_fails(self, matcher: NewsMatcher) -> None:
+        """Author-implicit doesn't waive the interaction-term
+        requirement. Mirrors the audit's real-world Hakeem case
+        (Trump rant about a person, no meeting/call verb) using
+        Putin since the default fixture aliases include Putin."""
+        ctx = MarketContext(ticker="T", subject="putin")
+        body = "Putin is weak and overrated. Russia is losing the war. " "America First, always."
+        [r] = matcher.match(
+            headline="(no text)",
+            body=body,
+            markets=[ctx],
+            source="truth_social:@realDonaldTrump",
+        )
+        assert r.match_reason.startswith("failed_pre_filter:")
+        assert "no_interaction_term" in r.match_reason
+
+    def test_truth_social_with_explicit_trump_in_body_unchanged(self, matcher: NewsMatcher) -> None:
+        """When Trump DOES say "Trump" in his post (rare but possible
+        — e.g. quoting press), the literal-match path takes priority.
+        TRUMP_AUTHOR_KEYWORD does not appear in matched_keywords."""
+        ctx = MarketContext(ticker="T", subject="putin")
+        body = "Trump met with Putin today, says the press."
+        [r] = matcher.match(
+            headline="(no text)",
+            body=body,
+            markets=[ctx],
+            source="truth_social:@realDonaldTrump",
+        )
+        assert r.match_reason == PASSED_REASON
+        assert "trump" in r.matched_keywords
+        assert TRUMP_AUTHOR_KEYWORD not in r.matched_keywords
+
+    def test_non_truth_social_source_still_requires_literal_trump(
+        self, matcher: NewsMatcher
+    ) -> None:
+        """The author-implicit rule does not extend to other sources.
+        A Reuters article with subject + verb but no "Trump" still
+        fails Stage 1 — Reuters isn't Trump-authored content."""
+        ctx = MarketContext(ticker="T", subject="putin")
+        [r] = matcher.match(
+            headline="Putin met with Lavrov in Moscow",
+            body="The two discussed Ukraine.",
+            markets=[ctx],
+            source="reuters",
+        )
+        assert r.match_reason.startswith("failed_pre_filter:")
+        assert "no_trump" in r.match_reason
+
+    def test_no_source_argument_falls_back_to_literal_only(self, matcher: NewsMatcher) -> None:
+        """Back-compat: callers that don't pass source get the
+        pre-PR-#32 behavior (literal-match only). Pinned so the
+        default doesn't accidentally become 'always implicit Trump'."""
+        ctx = MarketContext(ticker="T", subject="putin")
+        [r] = matcher.match(
+            headline="Putin met with Lavrov",
+            body="They spoke about Ukraine.",
+            markets=[ctx],
+        )
+        assert r.match_reason.startswith("failed_pre_filter:")
+        assert "no_trump" in r.match_reason
+
+    def test_truth_social_with_explicit_trump_no_subject_no_verb(
+        self, matcher: NewsMatcher
+    ) -> None:
+        """Sanity: a Truth Social post that fails on subject AND verb
+        gets a clean 'no_subject+no_interaction_term' reason. The
+        author-implicit rule satisfies condition A only."""
+        ctx = MarketContext(ticker="T", subject="putin")
+        [r] = matcher.match(
+            headline="(no text)",
+            body="Today is a great day for America!",
+            markets=[ctx],
+            source="truth_social:@realDonaldTrump",
+        )
+        assert r.match_reason == "failed_pre_filter:no_subject+no_interaction_term"
+
+
+class TestIsTrumpAuthorHelper:
+    """Pin the source-prefix helper directly."""
+
+    def test_truth_social_realdonaldtrump_is_author(self) -> None:
+        assert _is_trump_author("truth_social:@realDonaldTrump") is True
+
+    def test_truth_social_other_handle_is_not(self) -> None:
+        assert _is_trump_author("truth_social:@SomeoneElse") is False
+
+    def test_truth_social_prefix_only_is_not(self) -> None:
+        assert _is_trump_author("truth_social") is False
+
+    def test_other_sources_are_not(self) -> None:
+        assert _is_trump_author("reuters") is False
+        assert _is_trump_author("bloomberg") is False
+        assert _is_trump_author("twitter:@WhiteHouse") is False
+        assert _is_trump_author("twitter:@realDonaldTrump") is False  # X is gone
+
+    def test_constant_contains_truth_social_handle(self) -> None:
+        # If you add a new Trump-authored source, append to
+        # TRUMP_AUTHOR_SOURCES; this assertion guards the canonical entry.
+        assert "truth_social:@realDonaldTrump" in TRUMP_AUTHOR_SOURCES

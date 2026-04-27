@@ -1861,6 +1861,88 @@ beside it.
 
 ---
 
+## Source-status audit follow-ups (PR #30 → PR #31, #32, #33)
+
+The per-source status audit
+(`docs/investigations/source_status_audit.md`) drove a small
+sheet of follow-up PRs. None of them changed strategy logic; all
+hardened ingestion and observability.
+
+### PR #31 — Per-source User-Agent override (`the_information` 403)
+
+The PR #29 Safari UA swap unblocked Truth Social and Politico but
+regressed `the_information` (Safari → 403, Chrome / feedparser /
+old bot UA → 200; verified per-UA matrix in audit Section 4a).
+
+`NewsSourceConfig.user_agent_override: str | None = None` now
+exists. When set on a source, `RSSPoller._poll_source` puts it in
+the per-request `User-Agent` header, overriding the client-default
+Safari UA for that one fetch. Only `the_information` uses it
+(Chrome 121); the other 18 RSS sources continue with the global
+Safari UA unchanged. Pinned by 4 tests in `tests/test_rss_poller.py`.
+
+### PR #32 — Truth Social end-to-end verification (Trump-as-author)
+
+Truth Social posts come from `@realDonaldTrump`. They are
+first-person and typically don't contain "Trump" by name — Trump
+is writing them. Pre-PR-#32 the Stage 1 keyword pre-filter
+required the literal string "trump" anywhere in the text, so
+every Trump-meeting announcement on Truth Social silently failed
+Stage 1 with `failed_pre_filter:no_trump`.
+
+**The fix:** `NewsMatcher.match()` accepts an optional
+`source: str | None = None` parameter. When `source` matches one
+of `TRUMP_AUTHOR_SOURCES` (currently just
+`truth_social:@realDonaldTrump`), the "Trump alias appears in
+body" condition is satisfied implicitly via the author. The body
+must still carry a tracked subject AND an interaction term —
+the rule does not waive conditions B or C.
+
+```python
+# trumpbot/news/matcher.py
+TRUMP_AUTHOR_SOURCES: Final[tuple[str, ...]] = ("truth_social:@realDonaldTrump",)
+TRUMP_AUTHOR_KEYWORD: Final[str] = "@realdonaldtrump (author)"
+```
+
+The author-implicit `TRUMP_AUTHOR_KEYWORD` is appended to the
+match row's `matched_keywords` so a future audit can grep for
+which Stage 1 passes were author-implicit vs. literal-text
+matches. `MatcherWorker._process_batch` in `daemon.py` was
+updated to thread `source=evt["source"]` through.
+
+**To extend** (e.g. if Trump's X account ever returns and its
+verified-handle posts qualify under the contract's
+"verified social media accounts" provision): append the new
+source string prefix to `TRUMP_AUTHOR_SOURCES`. Source-string
+convention is `<scraper_kind>:<handle>`, e.g.
+`twitter:@realDonaldTrump`.
+
+**Why not also waive subject or interaction term for Trump
+posts?** Because the contract resolves on a *qualifying
+interaction event*, not on Trump posting. A Trump rant about a
+tracked subject without a meeting verb (the audit's real-world
+Hakeem Jeffries case — `id 1579`) should NOT trigger an LLM
+call; the matcher correctly rejects those with
+`failed_pre_filter:no_interaction_term`.
+
+`docs/investigations/truth_social_verification.md` documents the
+manual review of all 20 Truth Social posts ingested at audit
+time. Every one is correctly handled. Pinned by 12 tests in
+`TestTrumpAsAuthor` and `TestIsTrumpAuthorHelper`.
+
+### PR #33 — Rotation-paused alert
+
+The audit found `fox_politics` and `politico_wh` returning 200
+with a stale newest-item timestamp (~7 h old at probe time);
+`dod_news` worse at 52 h. The pre-existing `source_health_loop`
+only alerts on absence of *ingested* events, not on absence of
+*fresh feed content*, so a feed that keeps returning 200 with
+the same 5 stale articles wouldn't trigger today.
+
+(This section will be filled in when PR #33 lands.)
+
+---
+
 ## Phase 4 deployment readiness
 
 Phase 4 Part 1 + Part 2.1 are verified end-to-end. The combined

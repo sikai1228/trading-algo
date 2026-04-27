@@ -9,7 +9,13 @@ conveyor before the LLM sees it.
 Pre-filter (all word-boundary, case-insensitive, anywhere in
 ``headline + body``):
 
-A. ``"trump"`` (or another alias in :data:`TRUMP_ALIASES`)
+A. ``"trump"`` (or another alias in :data:`TRUMP_ALIASES`) **or, when
+   the source is ``truth_social:@realDonaldTrump``, satisfied
+   implicitly by Trump being the author** (PR #32 follow-up to the
+   per-source status audit — Trump's own posts on his own account
+   typically don't refer to "Trump" in third person, so requiring
+   the literal string in the body would silently reject every
+   first-person post like "Just got off the phone with Putin").
 B. At least one alias of the market's subject (loaded from the
    ``subjects`` table via :class:`SubjectExtractor`)
 C. At least one term from
@@ -73,6 +79,22 @@ PRE_FILTER_CONFIDENCE: Final[float] = 0.0
 PASSED_REASON: Final[str] = "passed_pre_filter"
 """Match-row reason when all three conditions are satisfied."""
 
+TRUMP_AUTHOR_SOURCES: Final[tuple[str, ...]] = ("truth_social:@realDonaldTrump",)
+"""Source-string prefixes whose posts are first-person Trump content.
+
+When the news_event's ``source`` matches one of these prefixes, the
+"Trump alias appears in body" requirement is satisfied implicitly
+via the author. The body must still carry a tracked subject and an
+interaction term to pass Stage 1.
+"""
+
+TRUMP_AUTHOR_KEYWORD: Final[str] = "@realdonaldtrump (author)"
+"""Sentinel keyword recorded on matched_keywords when the
+Trump-as-author rule fires. Distinguishes implicit-author matches
+from posts that explicitly say "Trump" in the body, which matters
+for downstream audit (e.g. confirming the rule fired in a backfill).
+"""
+
 
 @dataclass(frozen=True)
 class MarketContext:
@@ -113,12 +135,27 @@ class NewsMatcher:
         body: str | None,
         markets: list[MarketContext],
         article_published_ts: str | None = None,
+        source: str | None = None,
     ) -> list[MatchResult]:
-        """Return one MatchResult per market context (always populated)."""
+        """Return one MatchResult per market context (always populated).
+
+        ``source`` is the news_event's ``source`` field. When it matches
+        one of :data:`TRUMP_AUTHOR_SOURCES`, the Trump-mentioned
+        condition is satisfied implicitly even if the body doesn't
+        contain a Trump alias — Trump is the author. Defaults to
+        ``None`` for back-compat with callers that don't yet thread
+        the source through (those callers fall back to literal-string
+        matching, which is the pre-PR-#32 behavior).
+        """
         del article_published_ts  # unused; window check lives in DecisionEngine
 
         text = f"{headline} {body or ''}".lower()
         trump_match = _first_word_match(TRUMP_ALIASES, text)
+        # Trump-as-author rule: if the source is one of the Trump-
+        # authored channels, count it as a Trump mention even when the
+        # body doesn't contain his name. See module docstring.
+        if trump_match is None and source is not None and _is_trump_author(source):
+            trump_match = TRUMP_AUTHOR_KEYWORD
         interaction_match = _first_word_match(INTERACTION_TERMS, text)
 
         return [
@@ -177,6 +214,17 @@ class NewsMatcher:
             matched_keywords=keywords,
             match_reason=PASSED_REASON,
         )
+
+
+def _is_trump_author(source: str) -> bool:
+    """True if the news_event source string identifies Trump as author.
+
+    Source-string convention from the pollers:
+    ``truth_social:@realDonaldTrump`` for the Truth Social scraper.
+    Future Trump-authored channels (e.g. a personal X handle if it
+    ever returns) should be added to :data:`TRUMP_AUTHOR_SOURCES`.
+    """
+    return any(source.startswith(prefix) for prefix in TRUMP_AUTHOR_SOURCES)
 
 
 def _first_word_match(needles: Iterable[str], text: str) -> str | None:

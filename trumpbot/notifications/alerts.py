@@ -89,6 +89,7 @@ class AlertDispatcher:
         data: dict[str, Any],
         dedup_key: str | None = None,
         component: str = "alerts",
+        window_seconds_override: int | None = None,
     ) -> RenderedMessage | None:
         """Render the template, dedup, audit-log, and send to Telegram.
 
@@ -97,6 +98,12 @@ class AlertDispatcher:
         logged but do not raise -- the audit row is still written so
         the operational record is preserved even when Telegram is
         down.
+
+        ``window_seconds_override`` (PR #33) lets a single call use a
+        non-default dedup window — e.g. the rotation-paused alert
+        wants per-source per-24h dedup, much wider than the
+        dispatcher's default 1-hour window. Ignored when ``dedup_key``
+        is None (no dedup happens at all).
         """
         rendered = render_template(template_name, data)
         if rendered.category not in _SEVERITY_FOR_CATEGORY:
@@ -106,18 +113,23 @@ class AlertDispatcher:
             )
 
         if dedup_key is not None:
+            window = (
+                window_seconds_override
+                if window_seconds_override is not None
+                else self._dedup_window
+            )
             should_send = claim_alert_send(
                 self._db,
                 dedup_key=dedup_key,
                 category=rendered.category,
-                window_seconds=self._dedup_window,
+                window_seconds=window,
             )
             if not should_send:
                 log.info(
                     "alert_deduped",
                     template=template_name,
                     dedup_key=dedup_key,
-                    window_sec=self._dedup_window,
+                    window_sec=window,
                 )
                 return None
 

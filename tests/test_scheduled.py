@@ -280,6 +280,209 @@ class TestSourceHealth:
 
 
 # ---------------------------------------------------------------------------
+# PR #33 — rotation_paused detection
+# ---------------------------------------------------------------------------
+
+
+class TestRotationPaused:
+    """Pin the rotation_paused detection added in PR #33.
+
+    The audit's `fox_politics` (newest item 7 h old) and `dod_news`
+    (52 h old) cases motivate this signal: feeds that return 200 OK
+    on every poll but whose publishers have stopped emitting new
+    items would silently age out without it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_feed_marked_rotation_paused(self, tmp_path: Path) -> None:
+        db = _db(tmp_path)
+        recent_poll = datetime.now(UTC).isoformat()
+        stale_item = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        upsert_source_status(
+            db,
+            source_name="dod_news",
+            current_status="active",
+            last_successful_poll=recent_poll,
+            newest_feed_item_ts=stale_item,
+        )
+        dispatcher = AlertDispatcher(db=db, send_fn=None)
+        await _check_source_health(
+            db, dispatcher, threshold_minutes=30, rotation_paused_threshold_hours=12
+        )
+        ev = (
+            db.connect()
+            .execute(
+                "SELECT event_type FROM system_events "
+                "WHERE event_type = 'alert_warning_source_rotation_paused'"
+            )
+            .fetchone()
+        )
+        assert ev is not None
+        # And the source_status row was updated to rotation_paused.
+        from trumpbot.db.repositories import get_source_status
+
+        row = get_source_status(db, "dod_news")
+        assert row is not None
+        assert row.current_status == "rotation_paused"
+
+    @pytest.mark.asyncio
+    async def test_fresh_feed_does_not_fire(self, tmp_path: Path) -> None:
+        db = _db(tmp_path)
+        recent_poll = datetime.now(UTC).isoformat()
+        recent_item = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        upsert_source_status(
+            db,
+            source_name="bloomberg",
+            current_status="active",
+            last_successful_poll=recent_poll,
+            newest_feed_item_ts=recent_item,
+        )
+        dispatcher = AlertDispatcher(db=db, send_fn=None)
+        await _check_source_health(
+            db, dispatcher, threshold_minutes=30, rotation_paused_threshold_hours=12
+        )
+        rows = list(
+            db.connect().execute(
+                "SELECT id FROM system_events "
+                "WHERE event_type = 'alert_warning_source_rotation_paused'"
+            )
+        )
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_dedup_24h_suppresses_repeat_alert(self, tmp_path: Path) -> None:
+        """The dispatcher's default dedup window is 1 h. Rotation-
+        paused must use 24 h via the override; pin that the second
+        firing within 24 h is suppressed."""
+        db = _db(tmp_path)
+        recent_poll = datetime.now(UTC).isoformat()
+        stale_item = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        upsert_source_status(
+            db,
+            source_name="fox_politics",
+            current_status="active",
+            last_successful_poll=recent_poll,
+            newest_feed_item_ts=stale_item,
+        )
+        dispatcher = AlertDispatcher(db=db, send_fn=None)
+        await _check_source_health(
+            db, dispatcher, threshold_minutes=30, rotation_paused_threshold_hours=12
+        )
+        # Second tick: source still stale. Reset status to active to
+        # simulate the next loop iteration finding it back-to-active
+        # for the rotation check.
+        upsert_source_status(
+            db,
+            source_name="fox_politics",
+            current_status="active",
+            last_successful_poll=recent_poll,
+            newest_feed_item_ts=stale_item,
+        )
+        await _check_source_health(
+            db, dispatcher, threshold_minutes=30, rotation_paused_threshold_hours=12
+        )
+        rows = list(
+            db.connect().execute(
+                "SELECT id FROM system_events "
+                "WHERE event_type = 'alert_warning_source_rotation_paused'"
+            )
+        )
+        assert len(rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_recovery_silently_restores_active(self, tmp_path: Path) -> None:
+        """When a previously-rotation_paused source publishes a fresh
+        item, source_status flips back to active. No recovery alert
+        fires (silent — the noisy alert was the original pause)."""
+        db = _db(tmp_path)
+        recent_poll = datetime.now(UTC).isoformat()
+        recent_item = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        upsert_source_status(
+            db,
+            source_name="politico_wh",
+            current_status="rotation_paused",
+            last_successful_poll=recent_poll,
+            newest_feed_item_ts=recent_item,
+        )
+        dispatcher = AlertDispatcher(db=db, send_fn=None)
+        await _check_source_health(
+            db, dispatcher, threshold_minutes=30, rotation_paused_threshold_hours=12
+        )
+        from trumpbot.db.repositories import get_source_status
+
+        row = get_source_status(db, "politico_wh")
+        assert row is not None
+        assert row.current_status == "active"
+        # No new system_event fired for recovery (silent).
+        rows = list(
+            db.connect().execute(
+                "SELECT id FROM system_events " "WHERE event_type LIKE 'alert_%_source_recovered'"
+            )
+        )
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_down_source_does_not_double_alert(self, tmp_path: Path) -> None:
+        """A source that's down (last_successful_poll old) must not
+        also fire rotation_paused — source_down already covers it."""
+        db = _db(tmp_path)
+        old_poll = (datetime.now(UTC) - timedelta(minutes=45)).isoformat()
+        stale_item = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+        upsert_source_status(
+            db,
+            source_name="cnn_world",
+            current_status="active",
+            last_successful_poll=old_poll,
+            newest_feed_item_ts=stale_item,
+        )
+        dispatcher = AlertDispatcher(db=db, send_fn=None)
+        await _check_source_health(
+            db, dispatcher, threshold_minutes=30, rotation_paused_threshold_hours=12
+        )
+        # Fired source_down (the failure path); did NOT fire
+        # rotation_paused (the success-but-stale path).
+        down_rows = list(
+            db.connect().execute(
+                "SELECT id FROM system_events " "WHERE event_type = 'alert_warning_source_down'"
+            )
+        )
+        rotation_rows = list(
+            db.connect().execute(
+                "SELECT id FROM system_events "
+                "WHERE event_type = 'alert_warning_source_rotation_paused'"
+            )
+        )
+        assert len(down_rows) == 1
+        assert rotation_rows == []
+
+    @pytest.mark.asyncio
+    async def test_no_newest_feed_item_does_not_fire(self, tmp_path: Path) -> None:
+        """A source that's never had a parseable feed (newest_feed_item_ts
+        is NULL) doesn't fire rotation_paused — needs at least one
+        successful fetch with parseable dates first."""
+        db = _db(tmp_path)
+        recent_poll = datetime.now(UTC).isoformat()
+        upsert_source_status(
+            db,
+            source_name="brand_new_source",
+            current_status="active",
+            last_successful_poll=recent_poll,
+            newest_feed_item_ts=None,
+        )
+        dispatcher = AlertDispatcher(db=db, send_fn=None)
+        await _check_source_health(
+            db, dispatcher, threshold_minutes=30, rotation_paused_threshold_hours=12
+        )
+        rows = list(
+            db.connect().execute(
+                "SELECT id FROM system_events "
+                "WHERE event_type = 'alert_warning_source_rotation_paused'"
+            )
+        )
+        assert rows == []
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

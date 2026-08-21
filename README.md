@@ -1,8 +1,10 @@
 # trading-algo
 
-Algorithmic trading bot for Kalshi prediction markets focused on "Will Trump talk to/meet/mention X this month?" markets. The system observes markets and news in real time, scores each article against the active markets, and persists everything for later analysis. **Phase 1 is observation only — no orders are placed.**
+*I lead growth at VanceAI and study computer science and political science at Duke, and I built and run this system solo.*
 
-See `TRADING.md` (kept outside this repo) for the full architectural spec.
+Algorithmic trading bot for Kalshi prediction markets focused on "Will Trump talk to/meet/mention X this month?" markets. The system observes markets and news in real time, scores each article against the active markets, and persists everything for later analysis. Phases 0 through 4 have shipped, up to a live executor behind a human approval gate. The example config runs in dry-run mode, so no order reaches the exchange until an operator switches the mode and confirms the trade.
+
+`CLAUDE.md` in this repo is the living architectural spec. It holds the locked strategy thresholds, the phase-by-phase build history, and the type-safety conventions the code depends on.
 
 ## Project layout
 
@@ -142,11 +144,11 @@ All four are required to pass in CI. The matcher test suite (`tests/test_news_ma
 
 ## Build order
 
-- **Phase 1 (this scaffold)**: data collection only. Markets, prices, news, matches. No trading.
-- **Phase 2**: DecisionEngine + RiskManager + DryRunExecutor. Backtest against Phase 1 data. Tune thresholds.
-- **Phase 3**: Telegram approval gate, kill switch, monitoring. Continue dry-run.
-- **Phase 4**: Switch to live executor with $500 bankroll and 2% max position size.
+- **Phase 1 (shipped)**: data collection only. Markets, prices, news, matches. No trading.
+- **Phase 2 (shipped)**: DecisionEngine + RiskManager + DryRunExecutor. Backtest against Phase 1 data. Tune thresholds.
+- **Phase 3 (shipped)**: Telegram approval gate, kill switch, monitoring. Continue dry-run.
+- **Phase 4 (shipped)**: Switch to live executor with $500 bankroll and 2% max position size.
 - **Phase 5**: Increase bankroll based on observed Sharpe / drawdown. Consider auto-mode after 60+ days of clean human-approved data.
 - **Future**: Web observability backend reads from the same SQLite database via `bot.queries`. Daemon does not change.
 
-See `TRADING.md` § Build Order for the full sequence.
+`CLAUDE.md` records what shipped in each phase, down to the individual threshold changes.

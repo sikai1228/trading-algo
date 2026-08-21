@@ -54,6 +54,11 @@ secrets/
 *.pem
 *.key
 *.p12
+*.pfx
+*.crt
+keys.toml
+credentials.json
+kalshi_private*
 
 # IDE
 .idea/

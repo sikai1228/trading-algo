@@ -11,7 +11,7 @@ overwriting. These rules were chosen with the user and locked deliberately.
 
 ## Repo overview
 
-Private repo `sikai1228/trading-algo`, default branch `main`. The working tree
+Public repo `sikai1228/trading-algo`, default branch `main`. The working tree
 is at `~/Desktop/Auto Trading/` (note the space). Python 3.11+, `uv` package
 manager, hatchling build, mypy strict, ruff + black, pytest. Phases shipped so
 far:
@@ -1102,8 +1102,7 @@ builders, `weight=` in NewsSourceConfig fixtures). One
 implemented Stage 2: `interaction_occurred` was hardcoded `False` in
 `decision/loops.py:_row_to_snapshot`, so the engine returned `None`
 for every match and the trades table stayed empty. The investigation
-report at `docs/investigations/2026-04-26_reuters_putin_zelensky_miss.md`
-pins the missing pieces.
+into the missed Reuters Putin/Zelensky story pinned the missing pieces.
 
 Phase 4 Part 2.8 ships the cascade. Two architectural changes that
 together unblock all trade firing:
@@ -1863,8 +1862,7 @@ beside it.
 
 ## Source-status audit follow-ups (PR #30 → PR #31, #32, #33)
 
-The per-source status audit
-(`docs/investigations/source_status_audit.md`) drove a small
+The per-source status audit drove a small
 sheet of follow-up PRs. None of them changed strategy logic; all
 hardened ingestion and observability.
 
